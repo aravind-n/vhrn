@@ -12,4 +12,10 @@ if [ -f "$LOCK_FILE" ]; then
   fi
 fi
 
+# A gh token came in from the host: wire git's credential helper to gh so plain
+# `git push`/`fetch` over HTTPS authenticate too (gh itself already honors the env).
+if [ -n "${GH_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
+  gh auth setup-git >/dev/null 2>&1 || true
+fi
+
 exec "$@"

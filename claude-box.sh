@@ -41,9 +41,19 @@ if [ -f "$REAL_CLAUDE.json" ]; then
 fi
 [ -s "$SANDBOX_JSON" ] || printf '{}\n' > "$SANDBOX_JSON"
 
+# gh creds: explicit env wins, else ask host gh — with Keychain storage the token
+# never exists in a mountable file. GH_ENV expands via the ${a[@]+...} guard
+# because empty arrays trip `set -u` on macOS's bash 3.2.
+GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+if [ -z "$GH_TOKEN" ] && command -v gh >/dev/null 2>&1; then
+  GH_TOKEN="$(gh auth token 2>/dev/null || true)"
+fi
+GH_ENV=()
+[ -n "$GH_TOKEN" ] && GH_ENV=(--env "GH_TOKEN=$GH_TOKEN")
+
 container system start >/dev/null 2>&1 || true
 
-exec container run -it --rm \
+container run -it --rm \
   --volume "$PROJECT:$PROJECT" \
   --workdir "$PROJECT" \
   --volume "$SANDBOX:/home/dev/.claude" \
@@ -52,5 +62,6 @@ exec container run -it --rm \
   --env TERM="${TERM:-xterm-256color}" \
   --env COLORTERM=truecolor \
   --env FORCE_COLOR=3 \
+  ${GH_ENV[@]+"${GH_ENV[@]}"} \
   claude-sandbox \
   claude "$@"
