@@ -9,7 +9,7 @@ import (
 )
 
 // DenyLog records denied destinations to the process log and, if configured, to
-// an append-only file the host reads via `berm net denied`.
+// an append-only file the host reads via `vhrn net denied`.
 type DenyLog struct {
 	path string
 	mu   sync.Mutex

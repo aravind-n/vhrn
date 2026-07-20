@@ -85,7 +85,7 @@ func (px *Proxy) doDirect(w http.ResponseWriter, r *http.Request) {
 func (px *Proxy) doConnect(w http.ResponseWriter, r *http.Request) {
 	host := hostOnly(r.Host)
 	if !px.permit(host) {
-		http.Error(w, "blocked by berm egress policy: "+host, http.StatusForbidden)
+		http.Error(w, "blocked by vhrn egress policy: "+host, http.StatusForbidden)
 		return
 	}
 	hij, ok := w.(http.Hijacker)
@@ -113,7 +113,7 @@ func (px *Proxy) doConnect(w http.ResponseWriter, r *http.Request) {
 func (px *Proxy) doHTTP(w http.ResponseWriter, r *http.Request) {
 	host := hostOnly(r.URL.Host)
 	if !px.permit(host) {
-		http.Error(w, "blocked by berm egress policy: "+host, http.StatusForbidden)
+		http.Error(w, "blocked by vhrn egress policy: "+host, http.StatusForbidden)
 		return
 	}
 	r.RequestURI = ""

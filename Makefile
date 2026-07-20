@@ -1,4 +1,4 @@
-# Build the berm sandbox image with Apple `container` or Docker.
+# Build the vhrn sandbox image with Apple `container` or Docker.
 # Override the engine with ENGINE=docker.
 
 ENGINE ?= $(shell if command -v container >/dev/null 2>&1; then echo container; \
@@ -7,21 +7,21 @@ ifeq ($(strip $(ENGINE)),)
   $(error No container engine found; install one or pass ENGINE=docker)
 endif
 
-IMAGE      ?= berm-sandbox
+IMAGE      ?= vhrn-sandbox
 TAG        ?= latest
 IMAGE_REF  := $(IMAGE):$(TAG)
 DOCKERFILE ?= image/Dockerfile
 
 # The egress proxy sidecar image (see proxy/).
-PROXY_IMAGE ?= berm-proxy
+PROXY_IMAGE ?= vhrn-proxy
 PROXY_REF   := $(PROXY_IMAGE):$(TAG)
 PROXY_DIR   ?= proxy
 
 # Where the wrapper installs. PREFIX/BINDIR override the destination.
 PREFIX   ?= /usr/local
 BINDIR   ?= $(PREFIX)/bin
-WRAPPER  ?= berm.sh
-BIN_NAME ?= berm
+WRAPPER  ?= vhrn.sh
+BIN_NAME ?= vhrn
 
 # Match the container user to your host UID/GID (native Linux Docker only).
 BUILD_ARGS :=

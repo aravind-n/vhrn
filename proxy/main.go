@@ -1,4 +1,4 @@
-// Command berm-proxy is the egress guard for berm: an HTTP CONNECT
+// Command vhrn-proxy is the egress guard for vhrn: an HTTP CONNECT
 // (and plain-HTTP) forward proxy that permits outbound connections only to an
 // allowlisted set of domains. The guard logic lives in the egress package; this
 // entrypoint only reads configuration from the environment and wires it up.
@@ -10,7 +10,7 @@ import (
 	"os"
 	"time"
 
-	"berm/proxy/egress"
+	"vhrn/proxy/egress"
 )
 
 func env(k, def string) string {
@@ -21,16 +21,16 @@ func env(k, def string) string {
 }
 
 func main() {
-	allowPath := env("BERM_ALLOWLIST", "/etc/berm/allowlist")
-	modePath := env("BERM_MODE_FILE", "/etc/berm/mode")
-	listen := env("BERM_PROXY_LISTEN", ":8080")
+	allowPath := env("VHRN_ALLOWLIST", "/etc/vhrn/allowlist")
+	modePath := env("VHRN_MODE_FILE", "/etc/vhrn/mode")
+	listen := env("VHRN_PROXY_LISTEN", ":8080")
 
 	policy := egress.NewPolicy(allowPath, modePath)
 	dialer := egress.SafeDialer{Timeout: 10 * time.Second}
-	denyLog := egress.NewDenyLog(env("BERM_DENY_LOG", ""))
+	denyLog := egress.NewDenyLog(env("VHRN_DENY_LOG", ""))
 	proxy := egress.NewProxy(policy, dialer, denyLog)
 
-	log.Printf("berm egress proxy on %s (allowlist=%s mode=%s)", listen, allowPath, modePath)
+	log.Printf("vhrn egress proxy on %s (allowlist=%s mode=%s)", listen, allowPath, modePath)
 	srv := &http.Server{
 		Addr:              listen,
 		Handler:           proxy,

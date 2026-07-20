@@ -1,4 +1,4 @@
-# berm
+# vhrn (Virtual Harness)
 
 Run Claude Code inside a container jailed to the current project directory, with
 **default-deny network egress**. Only the current project is mounted into the box,
@@ -30,10 +30,10 @@ Run in any project directory. Arguments after the wrapper's own flags are passed
 straight through to `claude`:
 
 ```sh
-berm                      # guarded: egress limited to the allowlist
-berm --model opus         # forwards --model opus to claude
-berm --allow docs.rs      # add domains to the allowlist for this session
-berm --open-net           # drop the guard for this session (all egress)
+vhrn                      # guarded: egress limited to the allowlist
+vhrn --model opus         # forwards --model opus to claude
+vhrn --allow docs.rs      # add domains to the allowlist for this session
+vhrn --open-net           # drop the guard for this session (all egress)
 ```
 
 ## Network egress guard
@@ -41,35 +41,35 @@ berm --open-net           # drop the guard for this session (all egress)
 Every run starts a small proxy sidecar. The box's firewall routes every outbound
 connection through that proxy, and the proxy only allows allowlisted domains.
 Everything else, including direct DNS, is refused. A blocked request fails with the
-domain named, like `blocked by berm egress policy: example.com`.
+domain named, like `blocked by vhrn egress policy: example.com`.
 
-The policy lives on the host, under `~/.cache/berm/net/`, and is mounted into
+The policy lives on the host, under `~/.cache/vhrn/net/`, and is mounted into
 the proxy but never into the box. That is what stops an in-box process from
 widening its own egress, even under skip-permissions. Edit it from the host while a
 box is running and the proxy picks up the change on its next request, no restart
 needed:
 
 ```sh
-berm net status                 # current mode + allowlist size
-berm net allow docs.rs api.x.io # add domains (takes effect immediately)
-berm net denied                 # domains blocked this session
-berm net open                   # drop the guard (allow all)
-berm net guard                  # re-enable enforcement
+vhrn net status                 # current mode + allowlist size
+vhrn net allow docs.rs api.x.io # add domains (takes effect immediately)
+vhrn net denied                 # domains blocked this session
+vhrn net open                   # drop the guard (allow all)
+vhrn net guard                  # re-enable enforcement
 ```
 
 The default allowlist covers the Anthropic API, GitHub, and the common package
-registries. Edit `~/.cache/berm/net/allowlist` to change the defaults.
+registries. Edit `~/.cache/vhrn/net/allowlist` to change the defaults.
 
 ### Statusline indicator (optional)
 
 To surface the guard state in your statusline, add to `~/.claude/statusline.sh`:
 
 ```sh
-if [ -n "${BERM_SANDBOX:-}" ]; then          # only inside a box
-  mode="${BERM_NET:-enforce}"            # launch state, cheap fallback
-  if [ -n "${BERM_PROXY_IP:-}" ]; then   # live state from the proxy
+if [ -n "${VHRN_SANDBOX:-}" ]; then          # only inside a box
+  mode="${VHRN_NET:-enforce}"            # launch state, cheap fallback
+  if [ -n "${VHRN_PROXY_IP:-}" ]; then   # live state from the proxy
     live=$(curl -s --max-time 1 --noproxy '*' \
-      "http://$BERM_PROXY_IP:${BERM_PROXY_PORT:-8080}/__status" \
+      "http://$VHRN_PROXY_IP:${VHRN_PROXY_PORT:-8080}/__status" \
       | sed -n 's/.*"mode":"\([a-z]*\)".*/\1/p')
     [ -n "$live" ] && mode="$live"
   fi
@@ -117,7 +117,7 @@ What it doesn't:
 - `gh` auth is forwarded as an env token (`$GH_TOKEN` or `$GITHUB_TOKEN`, else
   `gh auth token`), which covers git-over-HTTPS inside the box. SSH remotes stay
   unauthenticated. Under `--open-net`, the wrapper warns that a token is present.
-- The sandbox copy under `~/.cache/berm/` is re-synced every run, so edits to
+- The sandbox copy under `~/.cache/vhrn/` is re-synced every run, so edits to
   it don't survive. Change your real `~/.claude` on the host instead (skills,
   `settings.json`, and the rest). If you need Claude itself to edit them, use native
   Claude Code rather than the box.
