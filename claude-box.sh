@@ -9,6 +9,48 @@ CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/claude-box"
 SANDBOX="$CACHE/sandbox"
 SANDBOX_JSON="$CACHE/sandbox.json"
 
+usage() {
+  cat <<'USAGE'
+claude-box runs Claude Code in a container jailed to the current project, with
+default-deny network egress.
+
+Usage:
+  claude-box [flags] [claude args...]    run claude inside the box
+  claude-box net <subcommand>            manage the egress policy
+  claude-box help                        show this help
+
+Flags (must come before claude's own flags):
+  --open-net               drop the egress guard for this run (all egress)
+  --allow <domain>...      add allowlist domains (comma-separated or repeated)
+  --                       stop reading flags; forward the rest to claude
+
+Anything not matched above is forwarded to claude untouched. Use `--` to pass a
+flag the wrapper would otherwise read:
+  claude-box --model opus
+  claude-box -- --help     # claude's own help, not this one
+
+net subcommands:
+  net status               current mode and allowlist size
+  net allow <domain>...    add domains to the allowlist (effective now)
+  net denied               domains blocked this session
+  net open                 drop the guard (allow everything)
+  net guard                re-enable enforcement
+  net report               allow everything, but log what would be denied
+
+Environment:
+  CLAUDE_BOX_ENGINE        container engine (default: container, then docker)
+  CLAUDE_BOX_IMAGE         box image name (default: claude-sandbox)
+  CLAUDE_BOX_PROXY_IMAGE   proxy image name (default: claude-box-proxy)
+  CLAUDE_BOX_PROXY_PORT    proxy port (default: 8080)
+USAGE
+}
+
+# Answer help only when it leads the args, so `claude-box -- --help` and a
+# trailing --help still reach claude's own help.
+case "${1:-}" in
+  help|-h|--help) usage; exit 0 ;;
+esac
+
 # `claude-box net ...` mutates the host-side egress policy that running boxes
 # read, then exits. This is the only way to change the policy — the box itself
 # has no path to it — so an in-box process can at most ask the user to run this.

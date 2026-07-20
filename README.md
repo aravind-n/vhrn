@@ -1,16 +1,16 @@
 # claude-box
 
 Run Claude Code inside a container jailed to the current project directory, with
-**default-deny network egress**. The host filesystem is protected by absence
-(only the project is mounted; `~/.ssh`, other projects, etc. never enter the
-box), and outbound network is restricted to an allowlist — so you can run
-`--dangerously-skip-permissions` without a prompt injection being able to reach
-the rest of your machine or exfiltrate the project to an arbitrary host.
+**default-deny network egress**. Only the current project is mounted into the box,
+so `~/.ssh`, your other projects, and the rest of your home directory stay outside
+it. Outbound traffic is limited to an allowlist. Between them, those two things let
+you run `--dangerously-skip-permissions` without a prompt injection being able to
+reach the rest of your machine or push your project somewhere it shouldn't go.
 
-The current project is bind-mounted at its real path; a sandbox copy of
-`~/.claude` is synced in on every run; session history is written straight back
-to your host's `~/.claude/projects/<key>`, so in-box and native history stay
-unified.
+The project is bind-mounted at its real path. A sandbox copy of `~/.claude` is
+synced in on each run, and session history is written back to
+`~/.claude/projects/<key>` on the host, so in-box and native sessions share the
+same history.
 
 ## Requirements
 
@@ -38,15 +38,16 @@ claude-box --open-net           # drop the guard for this session (all egress)
 
 ## Network egress guard
 
-Every run starts a small proxy sidecar. The box's firewall pins **all** egress to
-that proxy, which permits only allowlisted domains; everything else — including
-direct DNS — is refused. Blocked requests fail with the domain named, e.g.
-`blocked by claude-box egress policy: example.com`.
+Every run starts a small proxy sidecar. The box's firewall routes every outbound
+connection through that proxy, and the proxy only allows allowlisted domains.
+Everything else, including direct DNS, is refused. A blocked request fails with the
+domain named, like `blocked by claude-box egress policy: example.com`.
 
-The policy lives on the host (`~/.cache/claude-box/net/`) and is mounted only
-into the proxy, never the box — so an in-box process, even under
-skip-permissions, cannot widen its own egress. Change it from the host while a
-box is running; the proxy picks up edits on the next request, no restart:
+The policy lives on the host, under `~/.cache/claude-box/net/`, and is mounted into
+the proxy but never into the box. That is what stops an in-box process from
+widening its own egress, even under skip-permissions. Edit it from the host while a
+box is running and the proxy picks up the change on its next request, no restart
+needed:
 
 ```sh
 claude-box net status                 # current mode + allowlist size
@@ -57,7 +58,7 @@ claude-box net guard                  # re-enable enforcement
 ```
 
 The default allowlist covers the Anthropic API, GitHub, and the common package
-registries; edit `~/.cache/claude-box/net/allowlist` to change the defaults.
+registries. Edit `~/.cache/claude-box/net/allowlist` to change the defaults.
 
 ### Statusline indicator (optional)
 
@@ -86,39 +87,39 @@ fi
 | `make clean` | Remove both images |
 | `make install` | Install the wrapper to `/usr/local/bin` (needs sudo) |
 | `make uninstall` | Remove the installed wrapper |
-| `make ENGINE=docker …` | Force Docker instead of `container` |
+| `make ENGINE=docker ...` | Force Docker instead of `container` |
 
 ## Threat model
 
-What claude-box protects:
+What it protects:
 
-- **Your host.** Secrets and other projects are never mounted, so the box cannot
-  read or damage them regardless of what runs inside.
-- **Against casual exfiltration.** Default-deny egress means a prompt injection
-  cannot POST your source to an arbitrary server; it can only reach allowlisted
-  domains.
+- Your host filesystem. Secrets and your other projects are never mounted, so
+  nothing inside the box can read or damage them.
+- Against casual exfiltration. Default-deny egress stops a prompt injection from
+  POSTing your source to an outside server; it can only reach the domains you have
+  allowed.
 
-What it does **not** protect against:
+What it doesn't:
 
-- **Exfiltration to an allowlisted host.** The proxy filters by hostname without
-  terminating TLS, so it cannot stop data being pushed to a domain you allow
-  (e.g. a repo on `github.com`) or domain-fronted behind an allowed CDN.
-- **`--open-net` sessions**, which disable the guard entirely.
-- Under **Docker**, the box shares the host kernel (a container escape reaches
-  the host); Apple `container` runs each box in a lightweight VM, a stronger
-  boundary.
+- Exfiltration to a domain you have already allowed. The proxy matches on hostname
+  and doesn't terminate TLS, so it can't stop data being pushed to an allowed
+  domain (a repo on `github.com`, for instance) or domain-fronted behind an allowed
+  CDN.
+- Sessions run with `--open-net`, which turn the guard off entirely.
+- A container escape under Docker, where the box shares the host's kernel. Apple
+  `container` puts each box in its own lightweight VM, a stronger boundary.
 
 ## Notes
 
-- **No sudo inside the box.** Removing it is what makes the egress firewall
+- There is no sudo inside the box; removing it is what keeps the egress firewall
   tamper-proof. Install tools in user space instead: `mise use -g <tool>` for
   runtimes, `uv tool install <pkg>` for Python CLIs.
-- `gh` auth is forwarded as an env token (`$GH_TOKEN`/`$GITHUB_TOKEN`, else
-  `gh auth token`), so git-over-HTTPS works inside the box. SSH remotes stay
-  unauthenticated. With `--open-net`, the wrapper warns that a token is aboard.
-- Edits to the sandbox copy under `~/.cache/claude-box/` are wiped each run. To
-  change your Claude settings (skills, `settings.json`, …), edit your real
-  `~/.claude` on the host; if you need Claude to edit them, use native Claude
-  Code rather than the box.
-- Your host `~/.gitconfig` is copied in, so in-box commits use your name/email
-  (change the host file to persist).
+- `gh` auth is forwarded as an env token (`$GH_TOKEN` or `$GITHUB_TOKEN`, else
+  `gh auth token`), which covers git-over-HTTPS inside the box. SSH remotes stay
+  unauthenticated. Under `--open-net`, the wrapper warns that a token is present.
+- The sandbox copy under `~/.cache/claude-box/` is re-synced every run, so edits to
+  it don't survive. Change your real `~/.claude` on the host instead (skills,
+  `settings.json`, and the rest). If you need Claude itself to edit them, use native
+  Claude Code rather than the box.
+- Your host `~/.gitconfig` is copied in so in-box commits use your name and email.
+  Change the host file if you want a change to stick.
