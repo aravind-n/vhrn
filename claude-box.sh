@@ -75,6 +75,7 @@ done
 container system start >/dev/null 2>&1 || true
 
 container run -it --rm \
+  --env CLAUDE_SANDBOX=1 \
   --volume "$PROJECT:$PROJECT" \
   --workdir "$PROJECT" \
   --volume "$SANDBOX:/home/dev/.claude" \
