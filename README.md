@@ -16,12 +16,19 @@ same history.
 
 - [Apple Container](https://github.com/apple/container) or Docker (auto-detected, `container` first)
 - Claude Code, plus `gh` on the host if you want GitHub auth forwarded
+- Go 1.23+ (only to build from source; the curl installer ships a prebuilt binary)
 
 ## Install
 
 ```sh
 make            # build the box image and the egress proxy image
-make install    # install the wrapper to /usr/local/bin (needs sudo)
+make install    # build and install the vhrn binary to /usr/local/bin (needs sudo)
+```
+
+Or grab a prebuilt binary, then build the images once with `make`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/aravind-n/vhrn/master/install.sh | sh
 ```
 
 ## Usage
@@ -82,11 +89,14 @@ fi
 | Target | Description |
 | --- | --- |
 | `make` / `make build` | Build both images (box + proxy) |
+| `make binary` | Build the static `vhrn` CLI binary |
+| `make release` | Cross-compile release binaries into `dist/` |
+| `make test` | Run the CLI + proxy unit tests |
 | `make build-box` / `make build-proxy` | Build one image |
-| `make rebuild` | Rebuild both with no cache |
-| `make clean` | Remove both images |
-| `make install` | Install the wrapper to `/usr/local/bin` (needs sudo) |
-| `make uninstall` | Remove the installed wrapper |
+| `make rebuild` | Rebuild both images with no cache |
+| `make clean` | Remove both images and the built binary |
+| `make install` | Build and install the `vhrn` binary to `/usr/local/bin` (needs sudo) |
+| `make uninstall` | Remove the installed binary |
 | `make ENGINE=docker ...` | Force Docker instead of `container` |
 
 ## Threat model

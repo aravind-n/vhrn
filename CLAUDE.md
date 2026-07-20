@@ -4,20 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`vhrn` runs Claude Code inside a container jailed to the current project directory, with default-deny network egress, so it runs without exposing the rest of the host or letting a prompt injection exfiltrate to arbitrary hosts. It's a handful of Bash/Go/Docker/Make files — no application code beyond the proxy.
+`vhrn` runs Claude Code inside a container jailed to the current project directory, with default-deny network egress, so it runs without exposing the rest of the host or letting a prompt injection exfiltrate to arbitrary hosts. It's a small Go CLI (the wrapper) plus a Go egress proxy and a few Docker/Make/Bash files.
 
-- `vhrn.sh` — the wrapper: syncs a sandbox copy of `~/.claude`, starts the egress proxy, then runs `claude "$@"` in a container with the project bind-mounted at its real absolute path. Also handles `vhrn net …` and the `--open-net`/`--allow` flags.
+- `main.go` + `internal/vhrn/` — the CLI (Go, package `vhrn`): syncs a sandbox copy of `~/.claude`, starts the egress proxy, then runs `claude "$@"` in a container with the project bind-mounted at its real absolute path. Also handles `vhrn net …` and the `--open-net`/`--allow` flags. It orchestrates but shells out to rsync/cp/gh and the engine to match the original shell behavior.
+- `vhrn.sh` — the previous shell implementation, retained temporarily for side-by-side verification; remove once the Go binary is confirmed against a live box.
 - `image/Dockerfile` + `image/entrypoint.sh` — the `vhrn-sandbox` image (`debian:trixie-slim` + native Claude Code binary, plus python3/uv, mise, gh, ripgrep/fd, zip/unzip; non-root `dev` user, no sudo). The entrypoint installs the egress firewall as root, then drops to `dev`.
 - `proxy/` — a hand-rolled Go CONNECT/HTTP egress proxy (static binary in a `scratch` image) enforcing the domain allowlist. Policy files live host-side, mounted only into the proxy.
-- `Makefile` builds both images and installs the wrapper to `/usr/local/bin` (`make install`).
+- `Makefile` builds both images (`make`), builds/installs the Go binary (`make binary` / `make install`), cross-compiles releases (`make release`), and runs tests (`make test`). `install.sh` is the curl installer that fetches a prebuilt binary from GitHub Releases.
 
 ## Commands
 
-- `make` / `make build` — build both images (box + proxy; default goal). `make build-box`/`make build-proxy` — one image. `make rebuild` — no-cache build of both. `make clean` — remove both.
-- `cd proxy && go test ./...` — the proxy's allowlist-matching and IP-classifier unit tests (the security-critical logic).
+- `make` / `make build` — build both images (box + proxy; default goal). `make build-box`/`make build-proxy` — one image. `make rebuild` — no-cache build of both. `make clean` — remove both images and the built binary.
+- `make binary` — build the static `vhrn` binary; `make release` — cross-compile darwin/linux × arm64/amd64 into `dist/`.
+- `make test` — CLI + proxy unit tests. Equivalently `go test ./...` (CLI) and `cd proxy && go test ./...` (the proxy's allowlist-matching and IP-classifier tests). The CLI tests cover flag parsing, the history-key encoding, terminal env, allowlist add/dedup, and engine-inspect IP parsing.
 - `make ENGINE=docker ...` — force Docker; the engine auto-detects `container` first, then `docker`.
-- `make install` — install `vhrn` to `/usr/local/bin` (needs sudo). `make uninstall` removes it.
-- No tests or CI yet. To verify a change, rebuild the image and run `vhrn` in a throwaway project directory.
+- `make install` — build and install `vhrn` to `/usr/local/bin` (needs sudo). `make uninstall` removes it.
+- No CI yet, and the unit tests don't exercise a live container. To verify the full run path, build the images and run `vhrn` in a throwaway project directory.
 
 ## Must-know invariants
 
@@ -34,5 +36,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Conventions
 
-- Bash scripts use `#!/usr/bin/env bash` and `set -euo pipefail`; comments explain *why*, not *what*, and stay terse — one line where possible, never a multi-line essay. Helper functions early-`return 0` when a source path is absent.
+- The CLI is Go (`main.go` + `internal/vhrn/`, package `vhrn`); it orchestrates and shells out to rsync/cp/gh and the container engine to preserve the shell wrapper's exact behavior. Comments explain *why*, terse; prefer small single-file helpers over new packages.
+- Bash/sh scripts (entrypoint, install.sh) use `#!/usr/bin/env bash`/`sh` and `set -euo pipefail`; comments explain *why*, not *what*, and stay terse — one line where possible, never a multi-line essay. Helper functions early-`return 0` when a source path is absent.
 - Commit messages: concise and imperative ("Fix claude dir mount mangling").
