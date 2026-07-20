@@ -26,7 +26,7 @@ func TestLoadAllow(t *testing.T) {
 }
 
 func TestLoadAllowMissingFile(t *testing.T) {
-	if got := loadAllow("/nonexistent/berm/allowlist"); got != nil {
+	if got := loadAllow("/nonexistent/vhrn/allowlist"); got != nil {
 		t.Errorf("loadAllow(missing) = %v, want nil (fail closed)", got)
 	}
 }
@@ -66,7 +66,7 @@ func TestPolicyCheck(t *testing.T) {
 }
 
 // TestPolicyHotReload confirms an allowlist edit is picked up without a restart
-// once its mtime advances, the property `berm net allow` relies on.
+// once its mtime advances, the property `vhrn net allow` relies on.
 func TestPolicyHotReload(t *testing.T) {
 	dir := t.TempDir()
 	ap := filepath.Join(dir, "allow")

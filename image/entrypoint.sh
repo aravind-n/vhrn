@@ -6,23 +6,23 @@ set -euo pipefail
 # capabilities, so once we hand off it cannot reach or alter these rules — the
 # firewall is enforced from outside dev's reach even though we share the box.
 if [ "$(id -u)" = 0 ]; then
-  if [ -n "${BERM_PROXY_IP:-}" ]; then
-    port="${BERM_PROXY_PORT:-8080}"
+  if [ -n "${VHRN_PROXY_IP:-}" ]; then
+    port="${VHRN_PROXY_PORT:-8080}"
     # Default-drop egress; permit only loopback, return traffic, and TCP to the
     # proxy. DNS (and everything else) is blocked, so all name resolution and
     # every connection must go through the proxy, which resolves proxy-side.
     if ! nft -f - <<EOF
-table inet berm {
+table inet vhrn {
 	chain output {
 		type filter hook output priority 0; policy drop;
 		oifname "lo" accept
 		ct state established,related accept
-		ip daddr ${BERM_PROXY_IP} tcp dport ${port} accept
+		ip daddr ${VHRN_PROXY_IP} tcp dport ${port} accept
 	}
 }
 EOF
     then
-      echo "[berm] FATAL: could not install egress firewall (missing NET_ADMIN?)." >&2
+      echo "[vhrn] FATAL: could not install egress firewall (missing NET_ADMIN?)." >&2
       exit 1
     fi
   fi
@@ -36,10 +36,10 @@ export HOME=/home/dev
 LOCK_FILE="$PWD/.git/index.lock"
 if [ -f "$LOCK_FILE" ]; then
   if ! pgrep -x git >/dev/null 2>&1; then
-    echo "[berm] Removing orphaned $LOCK_FILE from a previous crash." >&2
+    echo "[vhrn] Removing orphaned $LOCK_FILE from a previous crash." >&2
     rm -f "$LOCK_FILE"
   else
-    echo "[berm] Warning: a git process is holding the index lock." >&2
+    echo "[vhrn] Warning: a git process is holding the index lock." >&2
   fi
 fi
 

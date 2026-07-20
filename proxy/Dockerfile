@@ -6,11 +6,11 @@ WORKDIR /src
 COPY go.mod ./
 COPY main.go ./
 COPY egress ./egress
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /berm-proxy .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /vhrn-proxy .
 
 FROM scratch
-COPY --from=build /berm-proxy /berm-proxy
+COPY --from=build /vhrn-proxy /vhrn-proxy
 # Unprivileged; the proxy binds :8080 and needs no root.
 USER 65532:65532
 EXPOSE 8080
-ENTRYPOINT ["/berm-proxy"]
+ENTRYPOINT ["/vhrn-proxy"]

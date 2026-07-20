@@ -1,4 +1,4 @@
-// Package egress implements berm's default-deny egress guard: an HTTP
+// Package egress implements vhrn's default-deny egress guard: an HTTP
 // CONNECT and plain-HTTP forward proxy that permits outbound connections only to
 // allowlisted domains.
 //

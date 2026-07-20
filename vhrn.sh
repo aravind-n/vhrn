@@ -5,19 +5,19 @@ set -euo pipefail
 
 REAL_CLAUDE="$HOME/.claude"
 # Sandbox copies live under the XDG cache dir, not $HOME, so they don't clutter it.
-CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/berm"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/vhrn"
 SANDBOX="$CACHE/sandbox"
 SANDBOX_JSON="$CACHE/sandbox.json"
 
 usage() {
   cat <<'USAGE'
-berm runs Claude Code in a container jailed to the current project, with
+vhrn runs Claude Code in a container jailed to the current project, with
 default-deny network egress.
 
 Usage:
-  berm [flags] [claude args...]    run claude inside the box
-  berm net <subcommand>            manage the egress policy
-  berm help                        show this help
+  vhrn [flags] [claude args...]    run claude inside the box
+  vhrn net <subcommand>            manage the egress policy
+  vhrn help                        show this help
 
 Flags (must come before claude's own flags):
   --open-net               drop the egress guard for this run (all egress)
@@ -26,8 +26,8 @@ Flags (must come before claude's own flags):
 
 Anything not matched above is forwarded to claude untouched. Use `--` to pass a
 flag the wrapper would otherwise read:
-  berm --model opus
-  berm -- --help     # claude's own help, not this one
+  vhrn --model opus
+  vhrn -- --help     # claude's own help, not this one
 
 net subcommands:
   net status               current mode and allowlist size
@@ -38,20 +38,20 @@ net subcommands:
   net report               allow everything, but log what would be denied
 
 Environment:
-  BERM_ENGINE        container engine (default: container, then docker)
-  BERM_IMAGE         box image name (default: berm-sandbox)
-  BERM_PROXY_IMAGE   proxy image name (default: berm-proxy)
-  BERM_PROXY_PORT    proxy port (default: 8080)
+  VHRN_ENGINE        container engine (default: container, then docker)
+  VHRN_IMAGE         box image name (default: vhrn-sandbox)
+  VHRN_PROXY_IMAGE   proxy image name (default: vhrn-proxy)
+  VHRN_PROXY_PORT    proxy port (default: 8080)
 USAGE
 }
 
-# Answer help only when it leads the args, so `berm -- --help` and a
+# Answer help only when it leads the args, so `vhrn -- --help` and a
 # trailing --help still reach claude's own help.
 case "${1:-}" in
   help|-h|--help) usage; exit 0 ;;
 esac
 
-# `berm net ...` mutates the host-side egress policy that running boxes
+# `vhrn net ...` mutates the host-side egress policy that running boxes
 # read, then exits. This is the only way to change the policy — the box itself
 # has no path to it — so an in-box process can at most ask the user to run this.
 if [ "${1:-}" = net ]; then
@@ -70,7 +70,7 @@ if [ "${1:-}" = net ]; then
       if [ -s "$DENY_LOG" ]; then awk '{print $2}' "$DENY_LOG" | sort -u
       else echo "no denials recorded this session"; fi ;;
     allow)
-      [ $# -gt 0 ] || { echo "usage: berm net allow <domain>..." >&2; exit 2; }
+      [ $# -gt 0 ] || { echo "usage: vhrn net allow <domain>..." >&2; exit 2; }
       tmp="$(mktemp "$NET_STATE/allowlist.XXXXXX")"
       [ -f "$ALLOWLIST" ] && cat "$ALLOWLIST" > "$tmp"
       for dom in "$@"; do grep -qxF "$dom" "$tmp" 2>/dev/null || printf '%s\n' "$dom" >> "$tmp"; done
@@ -80,19 +80,19 @@ if [ "${1:-}" = net ]; then
     open)   echo open   > "$MODE_FILE"; echo "egress guard OFF (open) — all public hosts allowed" ;;
     guard)  echo enforce > "$MODE_FILE"; echo "egress guard ON (enforce) — allowlist enforced" ;;
     report) echo report > "$MODE_FILE"; echo "egress guard REPORT — all allowed, denials logged" ;;
-    *) echo "usage: berm net {status|denied|allow <domain>...|open|guard|report}" >&2; exit 2 ;;
+    *) echo "usage: vhrn net {status|denied|allow <domain>...|open|guard|report}" >&2; exit 2 ;;
   esac
   exit 0
 fi
 
 # Consume wrapper-owned flags up front, then forward the rest to claude verbatim.
-# These must precede claude's own flags (e.g. `berm --open-net -- --model x`).
+# These must precede claude's own flags (e.g. `vhrn --open-net -- --model x`).
 OPEN_NET=0
 EXTRA_ALLOW=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --open-net) OPEN_NET=1; shift ;;
-    --allow) shift; [ $# -gt 0 ] || { echo "berm: --allow needs a domain" >&2; exit 2; }
+    --allow) shift; [ $# -gt 0 ] || { echo "vhrn: --allow needs a domain" >&2; exit 2; }
              IFS=',' read -ra _a <<< "$1"; EXTRA_ALLOW+=("${_a[@]}"); shift ;;
     --allow=*) IFS=',' read -ra _a <<< "${1#--allow=}"; EXTRA_ALLOW+=("${_a[@]}"); shift ;;
     --) shift; break ;;
@@ -108,15 +108,15 @@ HISTORY="$REAL_CLAUDE/projects/$KEY"
 
 # Container engine: explicit override wins, else auto-detect (container first, then
 # docker) to match the Makefile so build and run agree on the same engine.
-ENGINE="${BERM_ENGINE:-${ENGINE:-}}"
+ENGINE="${VHRN_ENGINE:-${ENGINE:-}}"
 if [ -z "$ENGINE" ]; then
   if command -v container >/dev/null 2>&1; then ENGINE=container
   elif command -v docker >/dev/null 2>&1; then ENGINE=docker
-  else echo "berm: no container engine found; install Apple container or Docker" >&2; exit 1
+  else echo "vhrn: no container engine found; install Apple container or Docker" >&2; exit 1
   fi
 fi
-command -v "$ENGINE" >/dev/null 2>&1 || { echo "berm: engine '$ENGINE' not found" >&2; exit 1; }
-IMAGE="${BERM_IMAGE:-berm-sandbox}"
+command -v "$ENGINE" >/dev/null 2>&1 || { echo "vhrn: engine '$ENGINE' not found" >&2; exit 1; }
+IMAGE="${VHRN_IMAGE:-vhrn-sandbox}"
 
 mkdir -p "$SANDBOX" "$HISTORY"
 
@@ -125,17 +125,17 @@ copy_dir() {
   [ -d "$REAL_CLAUDE/$1" ] || return 0
   if command -v rsync >/dev/null 2>&1; then
     rsync -aL --delete "$REAL_CLAUDE/$1/" "$SANDBOX/$1/" \
-      || echo "berm: warning: some '$1' entries were skipped (broken symlink?)" >&2
+      || echo "vhrn: warning: some '$1' entries were skipped (broken symlink?)" >&2
   else
     rm -rf "${SANDBOX:?}/$1"
     cp -RL "$REAL_CLAUDE/$1" "$SANDBOX/$1" \
-      || echo "berm: warning: some '$1' entries were skipped (broken symlink?)" >&2
+      || echo "vhrn: warning: some '$1' entries were skipped (broken symlink?)" >&2
   fi
 }
 copy_file() {
   [ -f "$REAL_CLAUDE/$1" ] || return 0
   cp -L "$REAL_CLAUDE/$1" "$SANDBOX/$1" 2>/dev/null \
-    || echo "berm: warning: could not copy '$1'" >&2
+    || echo "vhrn: warning: could not copy '$1'" >&2
 }
 for d in skills commands agents; do copy_dir "$d"; done
 for f in settings.json statusline.sh; do copy_file "$f"; done
@@ -143,7 +143,7 @@ for f in settings.json statusline.sh; do copy_file "$f"; done
 # Copy the config file
 if [ -f "$REAL_CLAUDE.json" ]; then
   cp -L "$REAL_CLAUDE.json" "$SANDBOX_JSON" 2>/dev/null \
-    || echo "berm: warning: could not copy .claude.json" >&2
+    || echo "vhrn: warning: could not copy .claude.json" >&2
 fi
 [ -s "$SANDBOX_JSON" ] || printf '{}\n' > "$SANDBOX_JSON"
 
@@ -153,7 +153,7 @@ GIT_MOUNT=()
 if [ -f "$HOME/.gitconfig" ]; then
   cp -L "$HOME/.gitconfig" "$CACHE/gitconfig" 2>/dev/null \
     && GIT_MOUNT=(--volume "$CACHE/gitconfig:/home/dev/.gitconfig") \
-    || echo "berm: warning: could not copy .gitconfig" >&2
+    || echo "vhrn: warning: could not copy .gitconfig" >&2
 else
   rm -f "$CACHE/gitconfig"
 fi
@@ -184,13 +184,13 @@ fi
 # --- Egress guard: policy state + proxy sidecar -------------------------------
 # The proxy enforces a domain allowlist; the box's in-container firewall pins all
 # egress to the proxy. Policy files live host-side (mounted into the proxy only),
-# so the box can never widen its own egress. See `berm net` for mutation.
+# so the box can never widen its own egress. See `vhrn net` for mutation.
 NET_STATE="$CACHE/net"
 ALLOWLIST="$NET_STATE/allowlist"
 MODE_FILE="$NET_STATE/mode"
 DENY_LOG="$NET_STATE/denied.log"
-PROXY_IMAGE="${BERM_PROXY_IMAGE:-berm-proxy}"
-PROXY_PORT="${BERM_PROXY_PORT:-8080}"
+PROXY_IMAGE="${VHRN_PROXY_IMAGE:-vhrn-proxy}"
+PROXY_PORT="${VHRN_PROXY_PORT:-8080}"
 NET_MODE=enforce
 [ "$OPEN_NET" = 1 ] && NET_MODE=open
 
@@ -198,8 +198,8 @@ mkdir -p "$NET_STATE"; chmod 777 "$NET_STATE" 2>/dev/null || true
 # Seed a default allowlist on first run; never clobber later edits.
 if [ ! -f "$ALLOWLIST" ]; then
   cat > "$ALLOWLIST" <<'ALLOW'
-# berm egress allowlist — one domain per line, matching the domain and its
-# subdomains. Edit freely, or run `berm net allow <domain>` while a box runs.
+# vhrn egress allowlist — one domain per line, matching the domain and its
+# subdomains. Edit freely, or run `vhrn net allow <domain>` while a box runs.
 api.anthropic.com
 claude.ai
 platform.claude.com
@@ -230,9 +230,9 @@ printf '%s\n' "$NET_MODE" > "$MODE_FILE"
   [ -f "$REAL_CLAUDE/CLAUDE.md" ] && cat "$REAL_CLAUDE/CLAUDE.md"
   cat <<'BOXMD'
 
-# berm environment
+# vhrn environment
 
-You are running inside berm: a container jailed to this project with a
+You are running inside vhrn: a container jailed to this project with a
 network egress guard. Adapt as follows:
 
 - **No sudo, no apt.** Install tools in user space: `mise use -g <tool>` for
@@ -248,20 +248,20 @@ BOXMD
 - **Network egress is allowlisted (default-deny).** A blocked request fails with
   an error naming the domain. You cannot change the allowlist from inside the
   box; tell the user the exact host(s) and ask them to run
-  `berm net allow <host>` on the host, then retry — no restart is needed.
+  `vhrn net allow <host>` on the host, then retry — no restart is needed.
 BOXMD
   fi
 } > "$SANDBOX/CLAUDE.md"
 
 # Start the proxy sidecar (detached). The box and proxy share the default
 # network; the box's firewall restricts its egress to the proxy alone.
-PROXY_NAME="berm-proxy-$$"
+PROXY_NAME="vhrn-proxy-$$"
 "$ENGINE" run -d --rm --name "$PROXY_NAME" \
-  --volume "$NET_STATE:/etc/berm" \
-  --env BERM_ALLOWLIST=/etc/berm/allowlist \
-  --env BERM_MODE_FILE=/etc/berm/mode \
-  --env BERM_DENY_LOG=/etc/berm/denied.log \
-  --env "BERM_PROXY_LISTEN=:$PROXY_PORT" \
+  --volume "$NET_STATE:/etc/vhrn" \
+  --env VHRN_ALLOWLIST=/etc/vhrn/allowlist \
+  --env VHRN_MODE_FILE=/etc/vhrn/mode \
+  --env VHRN_DENY_LOG=/etc/vhrn/denied.log \
+  --env "VHRN_PROXY_LISTEN=:$PROXY_PORT" \
   "$PROXY_IMAGE" >/dev/null
 
 # Tear the proxy down when the box exits.
@@ -280,21 +280,21 @@ proxy_ip() {
 }
 PROXY_IP=""
 for _ in $(seq 1 30); do PROXY_IP="$(proxy_ip)"; [ -n "$PROXY_IP" ] && break; sleep 0.3; done
-[ -n "$PROXY_IP" ] || { echo "berm: proxy failed to start (is the '$PROXY_IMAGE' image built?)" >&2; exit 1; }
+[ -n "$PROXY_IP" ] || { echo "vhrn: proxy failed to start (is the '$PROXY_IMAGE' image built?)" >&2; exit 1; }
 PROXY_URL="http://$PROXY_IP:$PROXY_PORT"
 
 if [ "$NET_MODE" = open ]; then
-  echo "berm: network guard OFF (open) — all public egress allowed this session." >&2
-  [ -n "$GH_TOKEN" ] && echo "berm: a GitHub token is present in the box with the guard off." >&2
+  echo "vhrn: network guard OFF (open) — all public egress allowed this session." >&2
+  [ -n "$GH_TOKEN" ] && echo "vhrn: a GitHub token is present in the box with the guard off." >&2
 fi
 
 # NET_ADMIN lets the entrypoint install the egress firewall (dropped before dev runs).
 "$ENGINE" run -it --rm \
   --cap-add CAP_NET_ADMIN \
-  --env BERM_SANDBOX=1 \
-  --env "BERM_NET=$NET_MODE" \
-  --env "BERM_PROXY_IP=$PROXY_IP" \
-  --env "BERM_PROXY_PORT=$PROXY_PORT" \
+  --env VHRN_SANDBOX=1 \
+  --env "VHRN_NET=$NET_MODE" \
+  --env "VHRN_PROXY_IP=$PROXY_IP" \
+  --env "VHRN_PROXY_PORT=$PROXY_PORT" \
   --env "HTTP_PROXY=$PROXY_URL" \
   --env "HTTPS_PROXY=$PROXY_URL" \
   --env "http_proxy=$PROXY_URL" \
