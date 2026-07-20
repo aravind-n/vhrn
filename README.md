@@ -39,5 +39,6 @@ claude-box --model opus
 ## Notes
 
 - `gh` auth is forwarded as an env token (`$GH_TOKEN`/`$GITHUB_TOKEN`, else `gh auth token`), so git-over-HTTPS works inside the box. SSH remotes stay unauthenticated.
-- Edits to `~/.claude-sandbox` are wiped each run — change `~/.claude` instead.
-- The "trust this folder?" prompt may reappear each run; This is a known issue. Open the folder once in native `claude` to persist trust. See `CLAUDE.md` for details.
+- Edits to the sandbox copy under `~/.cache/claude-box/` are wiped each run. If you want to edit your claude settings (add skills, change settings.json, etc), either to it manually in your `~/.claude` directory.
+  - If you need claude to edit it, use the native claude-code instead of the sandbox
+- Your host `~/.gitconfig` is copied in, so in-box commits use your name/email (change the host file to persist).

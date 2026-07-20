@@ -22,18 +22,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Both Apple `container` and Docker must work, for build *and* run.** The Makefile already honors `ENGINE`, but `claude-box.sh` hardcodes `container run` and the image name `claude-sandbox` — treat that as a gap to parameterize, not a pattern to copy. The CLIs also differ (`container image delete` vs `docker image rm`), so an engine switch isn't a pure string swap.
 - **The wrapper is a thin pass-through.** It forwards `claude "$@"` verbatim and injects no flags of its own — the user supplies whatever claude flags they want. Don't bake flags in.
 - **Terminal env crosses verbatim.** `TERM`/`COLORTERM`/`TERM_PROGRAM`/`TERM_PROGRAM_VERSION` are forwarded as-is, never forced: claude branches per-terminal rendering on them (with `TERM_PROGRAM` stripped it draws the block-glyph welcome mascot instead of the native bg-painted one). Don't reintroduce `COLORTERM=truecolor`/`FORCE_COLOR` — that lies to claude about terminals that never claimed those capabilities.
-- **`~/.claude-sandbox` is re-synced from `~/.claude` on every run** (`rsync -aL --delete`, `cp -RL` fallback), so edits made there are wiped each run — change `~/.claude` instead. Session history is written straight to the host's `~/.claude/projects/<key>`.
+- **The sandbox copy (`~/.cache/claude-box/sandbox`) is re-synced from `~/.claude` on every run** (`rsync -aL --delete`, `cp -RL` fallback), so edits made there are wiped each run — change `~/.claude` instead. Session history is written straight to the host's `~/.claude/projects/<key>`.
 - **The history key must match Claude's own `projects/<key>` encoding** (`sed 's/[^A-Za-z0-9]/-/g'` on the absolute project path). If that encoding drifts, in-box history stops unifying with native history — keep it in lockstep.
 - **gh auth is env-injected, never file-mounted.** The wrapper resolves a token (`$GH_TOKEN`/`$GITHUB_TOKEN`, else `gh auth token` — the only route that works with macOS Keychain storage, where no file contains the token) and passes it in as `GH_TOKEN`; the entrypoint runs `gh auth setup-git` so plain git-over-HTTPS authenticates too. Skips silently when the host has no gh login. SSH remotes stay unauthenticated by design.
+- **The host `~/.gitconfig` is copied into the cache and bind-mounted at `/home/dev/.gitconfig`** (skipped if the host has none), so in-box commits use the user's identity. It's a disposable copy — in-box edits don't persist; change the host file.
 - The Dockerfile deletes the base image's `node` user to free uid 1000 for `dev`, and the entrypoint clears a stale `$PWD/.git/index.lock` on boot (needs `procps`). Both are intentional — don't "clean them up".
-
-## Known issues
-
-- **The "do you trust this folder?" prompt reappears every run.** Trust lives in `~/.claude.json` at `.projects["<abs path>"].hasTrustDialogAccepted`. Two compounding causes:
-  1. `~/.claude-sandbox.json` is re-seeded from the real `~/.claude.json` on every run (`claude-box.sh`), so accepting the prompt inside the box is wiped on the next launch.
-  2. Even within a run the box can't persist the acceptance: Claude writes `.claude.json` atomically (staging file + `rename`), and a `rename` *onto* the single-file bind mount fails with `EBUSY` (its rename helper only falls back for `EXDEV`). So **no** `.claude.json` change made inside the box survives — trust, MCP approvals, dismissed dialogs, etc. In-place writes propagate; only the atomic rename fails.
-  - Workaround: open the folder once in native `claude`, which writes trust to the real `~/.claude.json` so the re-seed copies it in.
-  - Fix direction (not yet done): pre-seed `.projects["$PWD"].hasTrustDialogAccepted = true` in the sandbox JSON on each run — best in `entrypoint.sh`, where `jq` is present and writes are in-place (`cat >`, not `mv`), sidestepping both causes. The container is the trust boundary, so auto-trusting the workdir is aligned with the tool's purpose — but it does silently trust whatever dir claude-box is pointed at, so gate it behind a clear comment.
 
 ## Conventions
 
