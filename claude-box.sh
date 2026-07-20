@@ -4,8 +4,10 @@ set -euo pipefail
 # Run Claude Code in dangerous mode, jailed to the current project.
 
 REAL_CLAUDE="$HOME/.claude"
-SANDBOX="$HOME/.claude-sandbox"
-SANDBOX_JSON="$HOME/.claude-sandbox.json"
+# Sandbox copies live under the XDG cache dir, not $HOME, so they don't clutter it.
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/claude-box"
+SANDBOX="$CACHE/sandbox"
+SANDBOX_JSON="$CACHE/sandbox.json"
 PROJECT="$(pwd -P)"
 
 # Reproduce Claude's projects/<key> encoding so history unifies with native.
@@ -41,6 +43,17 @@ if [ -f "$REAL_CLAUDE.json" ]; then
 fi
 [ -s "$SANDBOX_JSON" ] || printf '{}\n' > "$SANDBOX_JSON"
 
+# Host git config, dereferenced into the cache so the box inherits the user's identity
+# and settings. Disposable copy (re-synced each run) — edit ~/.gitconfig to persist.
+GIT_MOUNT=()
+if [ -f "$HOME/.gitconfig" ]; then
+  cp -L "$HOME/.gitconfig" "$CACHE/gitconfig" 2>/dev/null \
+    && GIT_MOUNT=(--volume "$CACHE/gitconfig:/home/dev/.gitconfig") \
+    || echo "claude-box: warning: could not copy .gitconfig" >&2
+else
+  rm -f "$CACHE/gitconfig"
+fi
+
 # gh creds: explicit env wins, else ask host gh — with Keychain storage the token
 # never exists in a mountable file. GH_ENV expands via the ${a[@]+...} guard
 # because empty arrays trip `set -u` on macOS's bash 3.2.
@@ -67,6 +80,7 @@ container run -it --rm \
   --volume "$SANDBOX:/home/dev/.claude" \
   --volume "$SANDBOX_JSON:/home/dev/.claude.json" \
   --volume "$HISTORY:/home/dev/.claude/projects/$KEY" \
+  ${GIT_MOUNT[@]+"${GIT_MOUNT[@]}"} \
   "${TERM_ENV[@]}" \
   ${GH_ENV[@]+"${GH_ENV[@]}"} \
   claude-sandbox \
