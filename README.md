@@ -1,46 +1,117 @@
 # vhrn (Virtual Harness)
 
-Run Claude Code inside a container jailed to the current project directory, with
-**default-deny network egress**. Only the current project is mounted into the box,
-so `~/.ssh`, your other projects, and the rest of your home directory stay outside
-it. Outbound traffic is limited to an allowlist. Between them, those two things let
-you run `--dangerously-skip-permissions` without a prompt injection being able to
-reach the rest of your machine or push your project somewhere it shouldn't go.
+Run coding agents inside a container jailed to the current project directory, with
+**default-deny network egress**. Claude Code is the harness that ships today; the CLI
+is harness-agnostic (`vhrn install <harness>` / `vhrn <harness> …`), so more agents
+can be added as thin images.
 
-The project is bind-mounted at its real path. A sandbox copy of `~/.claude` is
-synced in on each run, and session history is written back to
-`~/.claude/projects/<key>` on the host, so in-box and native sessions share the
-same history.
+Only the current project is mounted into the box, so `~/.ssh`, your other projects,
+and the rest of your home directory stay outside it. Outbound traffic is limited to
+an allowlist. Between them, those two things let you run
+`--dangerously-skip-permissions` without a prompt injection being able to reach the
+rest of your machine or push your project somewhere it shouldn't go.
+
+The project is bind-mounted at its real path. Each harness keeps a persistent,
+box-owned state store (login, credentials, trust) so an in-box login sticks across
+runs; a disposable copy of your `~/.claude` config (skills, commands, agents,
+settings) is synced in on each run and layered on top, and session history is written
+back to `~/.claude/projects/<key>` so in-box and native sessions share history.
 
 ## Requirements
 
 - [Apple Container](https://github.com/apple/container) or Docker (auto-detected, `container` first)
-- Claude Code, plus `gh` on the host if you want GitHub auth forwarded
+- `gh` on the host if you want GitHub auth forwarded (optional)
 - Go 1.23+ (only to build from source; the curl installer ships a prebuilt binary)
+
+Claude Code does **not** need to be installed on the host — the agent binary is baked
+into the box image.
 
 ## Install
 
-```sh
-make            # build the box image and the egress proxy image
-make install    # build and install the vhrn binary to /usr/local/bin (needs sudo)
-```
-
-Or grab a prebuilt binary, then build the images once with `make`:
+Install the CLI, then install a harness (which pulls its images and adds a shell
+alias):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/aravind-n/vhrn/master/install.sh | sh
+make install          # build and install the vhrn binary to /usr/local/bin (needs sudo)
+vhrn install claude   # pull the claude + proxy images, seed egress, add a `claude` alias
 ```
+
+Or grab a prebuilt binary, then install the harness:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/aravind-n/vhrn/master/scripts/install.sh | sh
+vhrn install claude
+```
+
+`vhrn install` pulls prebuilt, versioned images from ghcr — no repo checkout and no
+local image build. Pin or roll back a version with `@`:
+
+```sh
+vhrn install claude           # the latest release
+vhrn install claude@v0.2.0    # a specific release (rollback works the same way)
+```
+
+For development, build the images locally and install from those instead of pulling:
+
+```sh
+make build                    # build base/proxy/claude locally
+vhrn install claude --local   # register the make-built images
+```
+
+Restart your shell (or source your rc file) afterward to pick up the alias.
 
 ## Usage
 
-Run in any project directory. Arguments after the wrapper's own flags are passed
-straight through to `claude`:
+vhrn is subcommand-first. After `vhrn install claude`, a shell alias lets you run
+`claude` directly; `command claude` or `\claude` still reaches the real binary.
 
 ```sh
-vhrn                      # guarded: egress limited to the allowlist
-vhrn --model opus         # forwards --model opus to claude
-vhrn --allow docs.rs      # add domains to the allowlist for this session
-vhrn --open-net           # drop the guard for this session (all egress)
+vhrn claude                   # guarded: egress limited to the allowlist
+vhrn claude --model opus      # forwards --model opus to claude
+claude --model opus           # same, via the installed alias
+vhrn claude --allow docs.rs   # add domains to the allowlist for this session
+vhrn claude --open-net        # drop the guard for this session (all egress)
+vhrn claude -- --help         # claude's own help (-- stops wrapper flag parsing)
+
+vhrn list                     # known + installed harnesses
+vhrn uninstall claude         # drop the alias/registry entry (add --image to delete the image)
+vhrn help
+```
+
+Wrapper flags (`--open-net`, `--allow`) go after the harness name and before the
+agent's own flags.
+
+## Login and state persistence
+
+Each harness has a persistent store at `~/.cache/vhrn/state/<harness>/`, mounted as
+the agent's config dir inside the box (Claude via `CLAUDE_CONFIG_DIR`). A login,
+refreshed credentials, and trust state live there and survive across runs — one login
+serves every project. The store is authoritative once populated: your host login is
+copied in **only** to bootstrap an empty store, so an in-box login is never
+overwritten.
+
+The container stays ephemeral (`--rm`) — a fresh, tamper-proof firewall is installed
+on every boot. Persistence is a property of what's mounted, not of container lifetime.
+(Caveat: an in-box token refresh doesn't flow back to the host.)
+
+## Configuration
+
+Optional TOML config, global under per-project. Precedence: CLI flags > `./.vhrn.toml`
+> `~/.config/vhrn/config.toml` > built-in defaults.
+
+```toml
+[run]
+# Refuse to launch when the cwd is exactly one of these (guards against jailing
+# $HOME or /). Matched exactly, so projects *under* $HOME still run.
+blocked_dirs = ["~", "/"]
+
+[toolchains]
+# Provisioned into the box with mise, as a derived image cached by tool set.
+tools = ["go@1.26", "node@22"]
+
+[net]
+allow = ["docs.rs"]   # extra allowlist domains
+mode  = "enforce"     # enforce | report | open
 ```
 
 ## Network egress guard
@@ -50,11 +121,10 @@ connection through that proxy, and the proxy only allows allowlisted domains.
 Everything else, including direct DNS, is refused. A blocked request fails with the
 domain named, like `blocked by vhrn egress policy: example.com`.
 
-The policy lives on the host, under `~/.cache/vhrn/net/`, and is mounted into
-the proxy but never into the box. That is what stops an in-box process from
-widening its own egress, even under skip-permissions. Edit it from the host while a
-box is running and the proxy picks up the change on its next request, no restart
-needed:
+The policy lives on the host, under `~/.cache/vhrn/net/`, and is mounted into the
+proxy but never into the box. That is what stops an in-box process from widening its
+own egress, even under skip-permissions. Edit it from the host while a box is running
+and the proxy picks up the change on its next request, no restart needed:
 
 ```sh
 vhrn net status                 # current mode + allowlist size
@@ -64,58 +134,53 @@ vhrn net open                   # drop the guard (allow all)
 vhrn net guard                  # re-enable enforcement
 ```
 
-The default allowlist covers the Anthropic API, GitHub, and the common package
-registries. Edit `~/.cache/vhrn/net/allowlist` to change the defaults.
+`vhrn install` seeds the allowlist with the base defaults plus the harness's own
+domains. Edit `~/.cache/vhrn/net/allowlist` to change it.
 
-### Statusline indicator (optional)
+## Adding a harness
 
-To surface the guard state in your statusline, add to `~/.claude/statusline.sh`:
-
-```sh
-if [ -n "${VHRN_SANDBOX:-}" ]; then          # only inside a box
-  mode="${VHRN_NET:-enforce}"            # launch state, cheap fallback
-  if [ -n "${VHRN_PROXY_IP:-}" ]; then   # live state from the proxy
-    live=$(curl -s --max-time 1 --noproxy '*' \
-      "http://$VHRN_PROXY_IP:${VHRN_PROXY_PORT:-8080}/__status" \
-      | sed -n 's/.*"mode":"\([a-z]*\)".*/\1/p')
-    [ -n "$live" ] && mode="$live"
-  fi
-  [ "$mode" = enforce ] && printf '🔒 net:guard' || printf '⚠ net:%s' "$mode"
-fi
-```
+A harness is a spec (`internal/vhrn/harness.go`) plus a thin `FROM vhrn-base`
+Dockerfile under `image/<harness>/`, and an entry in the CI publish matrix
+(`.github/workflows/publish-images.yml`) so its image lands on ghcr. The spec carries
+the image name, in-box command, shell alias, default egress domains, and the
+persistence descriptors (state dir, synced config, bootstrap credentials). No fork of
+the CLI is required.
 
 ## Make targets
 
 | Target | Description |
 | --- | --- |
-| `make` / `make build` | Build both images (box + proxy) |
+| `make` / `make build` | Build all images (base + proxy + claude) |
 | `make binary` | Build the static `vhrn` CLI binary |
-| `make release` | Cross-compile release binaries into `dist/` |
-| `make test` | Run the CLI + proxy unit tests |
-| `make build-box` / `make build-proxy` | Build one image |
-| `make rebuild` | Rebuild both images with no cache |
-| `make clean` | Remove both images and the built binary |
+| `make release` | Cross-compile release binaries into `out/dist/` |
+| `make test` | Run the unit tests (CLI + proxy) |
+| `make build-base` / `make build-claude` / `make build-proxy` | Build one image |
+| `make clean` | Remove the images and the built binary |
 | `make install` | Build and install the `vhrn` binary to `/usr/local/bin` (needs sudo) |
 | `make uninstall` | Remove the installed binary |
 | `make ENGINE=docker ...` | Force Docker instead of `container` |
+
+Day to day you don't need `make` — `vhrn install <harness>` pulls prebuilt images from
+ghcr. `make` builds them locally for development (`vhrn install <harness> --local` then
+uses those). CI (`.github/workflows/publish-images.yml`) builds and pushes the release
+images on a git tag; `VHRN_REGISTRY` overrides the registry the CLI pulls from.
 
 ## Threat model
 
 What it protects:
 
-- Your host filesystem. Secrets and your other projects are never mounted, so
-  nothing inside the box can read or damage them.
+- Your host filesystem. Secrets and your other projects are never mounted, so nothing
+  inside the box can read or damage them.
 - Against casual exfiltration. Default-deny egress stops a prompt injection from
   POSTing your source to an outside server; it can only reach the domains you have
   allowed.
 
 What it doesn't:
 
-- Exfiltration to a domain you have already allowed. The proxy matches on hostname
-  and doesn't terminate TLS, so it can't stop data being pushed to an allowed
-  domain (a repo on `github.com`, for instance) or domain-fronted behind an allowed
-  CDN.
-- Sessions run with `--open-net`, which turn the guard off entirely.
+- Exfiltration to a domain you have already allowed. The proxy matches on hostname and
+  doesn't terminate TLS, so it can't stop data being pushed to an allowed domain (a
+  repo on `github.com`, for instance) or domain-fronted behind an allowed CDN.
+- Sessions run with `--open-net` (or `net.mode = "open"`), which turn the guard off.
 - A container escape under Docker, where the box shares the host's kernel. Apple
   `container` puts each box in its own lightweight VM, a stronger boundary.
 
@@ -123,13 +188,14 @@ What it doesn't:
 
 - There is no sudo inside the box; removing it is what keeps the egress firewall
   tamper-proof. Install tools in user space instead: `mise use -g <tool>` for
-  runtimes, `uv tool install <pkg>` for Python CLIs.
+  runtimes, `uv tool install <pkg>` for Python CLIs — or declare them under
+  `[toolchains]` in your config.
 - `gh` auth is forwarded as an env token (`$GH_TOKEN` or `$GITHUB_TOKEN`, else
   `gh auth token`), which covers git-over-HTTPS inside the box. SSH remotes stay
-  unauthenticated. Under `--open-net`, the wrapper warns that a token is present.
-- The sandbox copy under `~/.cache/vhrn/` is re-synced every run, so edits to
-  it don't survive. Change your real `~/.claude` on the host instead (skills,
-  `settings.json`, and the rest). If you need Claude itself to edit them, use native
-  Claude Code rather than the box.
+  unauthenticated. Under an open guard, the wrapper warns that a token is present.
+- The disposable config copy under `~/.cache/vhrn/sandbox/` is re-synced every run, so
+  edits to it don't survive — change your real `~/.claude` on the host instead. The
+  persistent store under `~/.cache/vhrn/state/` is separate and is never touched by the
+  sync.
 - Your host `~/.gitconfig` is copied in so in-box commits use your name and email.
   Change the host file if you want a change to stick.
