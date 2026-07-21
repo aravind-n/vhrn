@@ -1,5 +1,8 @@
-# Build the vhrn CLI (a static Go binary) and the container images it drives,
-# with Apple `container` or Docker. Override the engine with ENGINE=docker.
+# Build the container images the vhrn CLI drives, with Apple `container` or Docker.
+# The CLI itself is built and tested by cargo (`cargo build --release`, `cargo test`)
+# and released by .github/workflows/release.yml; this Makefile owns only the image
+# recipes plus a `test` convenience that runs both the Rust and proxy suites.
+# Override the engine with ENGINE=docker.
 
 ENGINE ?= $(shell if command -v container >/dev/null 2>&1; then echo container; \
 		  elif command -v docker >/dev/null 2>&1; then echo docker; fi)
@@ -24,19 +27,6 @@ PROXY_IMAGE ?= vhrn-proxy
 PROXY_REF   := $(PROXY_IMAGE):$(TAG)
 PROXY_DIR   ?= proxy
 
-# Where the CLI installs. PREFIX/BINDIR override the destination.
-PREFIX   ?= /usr/local
-BINDIR   ?= $(PREFIX)/bin
-BIN_NAME ?= vhrn
-
-# Go CLI build. Static (CGO off) so the binary is self-contained for curl-install.
-# All build artifacts (the binary and cross-compiled releases) live under $(OUT).
-GO        ?= go
-CMD       ?= ./cmd/vhrn
-PLATFORMS ?= darwin/arm64 darwin/amd64 linux/arm64 linux/amd64
-OUT       ?= out
-DIST      ?= $(OUT)/dist
-
 # Match the container user to your host UID/GID (native Linux Docker only). Applied
 # to the base build, where the dev user is created.
 BUILD_ARGS :=
@@ -53,30 +43,15 @@ RM_IMAGE := $(ENGINE) image delete
 endif
 
 .DEFAULT_GOAL := build
-.PHONY: build binary release test build-base build-claude build-proxy clean install uninstall
+.PHONY: build test build-base build-claude build-proxy clean
 
 # Build every image the CLI needs: shared base, its egress proxy, and the claude harness.
 build: build-base build-proxy build-claude
 
-# The vhrn CLI: a single static binary (host arch), written under $(OUT).
-binary:
-	@mkdir -p $(OUT)
-	CGO_ENABLED=0 $(GO) build -o $(OUT)/$(BIN_NAME) $(CMD)
-
-# Cross-compile release binaries into $(DIST) for curl-install distribution.
-release:
-	@mkdir -p $(DIST)
-	@for p in $(PLATFORMS); do \
-	  os=$${p%/*}; arch=$${p#*/}; \
-	  out=$(DIST)/$(BIN_NAME)-$$os-$$arch; \
-	  echo "building $$out"; \
-	  CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -o $$out $(CMD) || exit 1; \
-	done
-
-# CLI + proxy unit tests (the proxy is its own dependency-free module).
+# CLI (cargo) + proxy (its own dependency-free module) unit tests.
 test:
-	$(GO) test ./...
-	cd $(PROXY_DIR) && $(GO) test ./...
+	cargo test
+	cd $(PROXY_DIR) && go test ./...
 
 build-base:
 	$(ENGINE) build $(BUILD_ARGS) --tag $(BASE_REF) --file $(BASE_DIR)/Dockerfile $(BASE_DIR)
@@ -92,12 +67,3 @@ clean:
 	-$(RM_IMAGE) $(CLAUDE_REF)
 	-$(RM_IMAGE) $(BASE_REF)
 	-$(RM_IMAGE) $(PROXY_REF)
-	-rm -rf $(OUT)
-
-# Build the CLI and install it into $(BINDIR) (needs sudo for /usr/local/bin).
-install: binary
-	sudo install -m 0755 $(OUT)/$(BIN_NAME) $(BINDIR)/$(BIN_NAME)
-	@echo "Installed $(BINDIR)/$(BIN_NAME) — run '$(BIN_NAME) install <harness>' to build images."
-
-uninstall:
-	sudo rm -f $(BINDIR)/$(BIN_NAME)
