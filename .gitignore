@@ -59,5 +59,4 @@ MobileBackups.trash
 tmbootpicker.efi
 
 # vhrn build artifacts (the CLI binary and cross-compiled releases)
-/vhrn
-/dist/
+/out/

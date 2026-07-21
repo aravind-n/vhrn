@@ -1,3 +1,6 @@
+# vhrn-base: the shared box image — debian + CLI tooling + the tamper-proof egress
+# entrypoint, but no agent. Each harness image is `FROM vhrn-base` plus its own CLI,
+# so the heavy, slow-changing layers are built and cached once.
 FROM debian:trixie-slim
 
 # Baked-in CLI tooling. Installed at build time as root, so the box ships fully
@@ -42,13 +45,8 @@ ARG USER_GID=1000
 RUN groupadd -g "$USER_GID" dev 2>/dev/null || true; \
     useradd -u "$USER_UID" -g "$USER_GID" -ms /bin/bash dev
 
-# Claude Code as the self-contained native binary (no Node runtime). Installed as
-# dev into ~/.local, which the runtime bind-mount over ~/.claude does not shadow.
-USER dev
-RUN HOME=/home/dev curl -fsSL https://claude.ai/install.sh | bash
-USER root
-
-# dev's user-space bins: the claude launcher and mise's tool shims.
+# dev's user-space bins: the agent launcher (installed by the harness image) and
+# mise's tool shims. Set here so every harness image inherits it.
 ENV PATH=/home/dev/.local/bin:/home/dev/.local/share/mise/shims:$PATH
 
 # Entrypoint installs the egress firewall then drops to dev; needs procps for the lock check.
@@ -58,4 +56,5 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 # Stay root: the entrypoint sets nftables rules, then drops to the dev user itself.
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["claude"]
+# Overridden by each harness image and by the command vhrn appends at run time.
+CMD ["bash"]
