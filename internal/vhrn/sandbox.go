@@ -40,21 +40,6 @@ func copyFileInto(real, sandbox, name string) {
 	}
 }
 
-// copyClaudeJSON mirrors ~/.claude.json into the sandbox copy, seeding {} when the
-// host has none, so the box always has a valid config file.
-func copyClaudeJSON(realJSON, sandboxJSON string) {
-	if fileExists(realJSON) {
-		if err := copyFile(realJSON, sandboxJSON); err != nil {
-			fmt.Fprintf(os.Stderr, "vhrn: warning: could not copy .claude.json\n")
-		}
-	}
-	if !fileNonEmpty(sandboxJSON) {
-		if err := os.WriteFile(sandboxJSON, []byte("{}\n"), 0o644); err != nil {
-			fmt.Fprintf(os.Stderr, "vhrn: warning: could not seed .claude.json\n")
-		}
-	}
-}
-
 // copyFile copies src to dst, following symlinks in src (like cp -L).
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
@@ -88,9 +73,4 @@ func fileExists(p string) bool {
 func dirExists(p string) bool {
 	fi, err := os.Stat(p)
 	return err == nil && fi.IsDir()
-}
-
-func fileNonEmpty(p string) bool {
-	fi, err := os.Stat(p)
-	return err == nil && !fi.IsDir() && fi.Size() > 0
 }
