@@ -60,3 +60,8 @@ tmbootpicker.efi
 
 # vhrn build artifacts (the CLI binary and cross-compiled releases)
 /out/
+
+
+# Added by cargo
+
+/target
