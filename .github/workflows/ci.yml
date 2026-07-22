@@ -1,0 +1,92 @@
+# Pull-request gate. Only the changed component (src / proxy / images / scripts) is
+# exercised; ci-gate is the single required status check, so a skipped component never
+# blocks the merge. master runs the full suite unfiltered (see nightly.yml).
+name: ci
+
+on:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      src: ${{ steps.filter.outputs.src }}
+      proxy: ${{ steps.filter.outputs.proxy }}
+      images: ${{ steps.filter.outputs.images }}
+      scripts: ${{ steps.filter.outputs.scripts }}
+      workflows: ${{ steps.filter.outputs.workflows }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            src:
+              - 'src/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'Cross.toml'
+            proxy:
+              - 'proxy/**'
+            images:
+              - 'image/**'
+            scripts:
+              - 'pages/**'
+              - 'image/base/entrypoint.sh'
+            workflows:
+              - '.github/workflows/**'
+
+  test:
+    needs: changes
+    uses: ./.github/workflows/_test.yml
+    with:
+      run_rust: ${{ needs.changes.outputs.src == 'true' }}
+      run_proxy: ${{ needs.changes.outputs.proxy == 'true' }}
+      run_scripts: ${{ needs.changes.outputs.scripts == 'true' }}
+
+  images:
+    needs: changes
+    if: ${{ needs.changes.outputs.images == 'true' || needs.changes.outputs.proxy == 'true' }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/_build-images.yml
+    with:
+      flavor: pr
+      push: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+
+  # Lint the workflows themselves (shellcheck runs on their inline scripts too).
+  actionlint:
+    needs: changes
+    if: ${{ needs.changes.outputs.workflows == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download actionlint
+        id: get
+        run: bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+        shell: bash
+      - run: ${{ steps.get.outputs.executable }} -color
+        shell: bash
+
+  # The one required status check: green iff every job above passed or was skipped.
+  ci-gate:
+    needs: [changes, test, images, actionlint]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require green or skipped
+        run: |
+          for r in "${{ needs.changes.result }}" "${{ needs.test.result }}" "${{ needs.images.result }}" "${{ needs.actionlint.result }}"; do
+            case "$r" in
+              success | skipped) ;;
+              *) echo "a required job did not pass: $r"; exit 1 ;;
+            esac
+          done

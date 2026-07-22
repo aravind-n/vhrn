@@ -1,0 +1,55 @@
+# Reusable lint + test for the three code components. Callers pick which run via
+# run_*: CI filters by changed paths; nightly and release run all three.
+name: test
+
+on:
+  workflow_call:
+    inputs:
+      run_rust:
+        type: boolean
+        default: true
+      run_proxy:
+        type: boolean
+        default: true
+      run_scripts:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    if: ${{ inputs.run_rust }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust (latest stable)
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add clippy
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  proxy:
+    if: ${{ inputs.run_proxy }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: proxy/go.mod
+      - name: Vet and test
+        working-directory: proxy
+        run: |
+          test -z "$(gofmt -l .)" || { echo 'gofmt needed:'; gofmt -l .; exit 1; }
+          go vet ./...
+          go test ./...
+
+  scripts:
+    if: ${{ inputs.run_scripts }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck pages/install.sh image/base/entrypoint.sh

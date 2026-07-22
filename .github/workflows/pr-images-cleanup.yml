@@ -1,0 +1,34 @@
+name: pr-images-cleanup
+
+# When a PR closes, delete the pr-<n> image tags it pushed to ghcr so they don't pile up.
+# Best-effort: a missing package or a delete error is logged, never fatal.
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  packages: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: [vhrn-base, vhrn-proxy, vhrn-claude]
+    steps:
+      - name: Delete pr-${{ github.event.number }} tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          IMAGE: ${{ matrix.image }}
+          PR: ${{ github.event.number }}
+        run: |
+          ids=$(gh api --paginate \
+            "/users/${OWNER}/packages/container/${IMAGE}/versions" \
+            --jq '.[] | select(any(.metadata.container.tags[]?; test("^pr-\(env.PR)(-|$)"))) | .id' \
+            2>/dev/null) || { echo "no ${IMAGE} package; nothing to clean"; exit 0; }
+          for id in $ids; do
+            gh api -X DELETE "/users/${OWNER}/packages/container/${IMAGE}/versions/${id}" \
+              && echo "deleted ${IMAGE} version ${id}" \
+              || echo "could not delete ${IMAGE} version ${id}"
+          done
