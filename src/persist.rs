@@ -3,7 +3,7 @@
 //! bootstrap-only (an in-box login is never clobbered), and `.claude.json` is merged
 //! in place to complete onboarding + trust this project without touching
 //! `oauthAccount`/other projects. The sandbox sync + box guide are re-derived each
-//! run and layered on top as nested mounts. Ports state.go + sandbox.go + guide.go.
+//! run and layered on top as nested mounts.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

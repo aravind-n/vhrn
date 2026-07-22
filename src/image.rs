@@ -1,6 +1,5 @@
-//! Registry image references and the toolchain content-hash helpers. `VHRN_REGISTRY`
-//! overrides the default registry. Ports the pure parts of images.go + toolchain.go;
-//! the image pull and the derived toolchain build land in later phases.
+//! Registry image references, image pulls, and the content-addressed toolchain build.
+//! `VHRN_REGISTRY` overrides the default registry.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};

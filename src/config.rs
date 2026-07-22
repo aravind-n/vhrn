@@ -1,8 +1,7 @@
 //! Merged vhrn configuration. Precedence is project `.vhrn.toml` over global
 //! `config.toml` over built-in defaults (CLI flags win over all of it, applied in
 //! the run path). Each optional field is an `Option` so an unset key falls through
-//! to a lower-precedence layer. Ports config.go's pure parts (structs + merge +
-//! blocked-dir check); the TOML load chain lands in a later phase.
+//! to a lower-precedence layer.
 
 use std::path::Path;
 
@@ -127,7 +126,7 @@ fn resolve_dir(p: &str, home: &str) -> String {
     }
 }
 
-/// Lexically clean a path the way Go's `filepath.Clean` does: collapse redundant
+/// Lexically clean a path: collapse redundant
 /// separators, drop `.`, resolve `..` against the preceding element, and never let
 /// `..` climb above a rooted path. Only the fallback for a non-existent path.
 fn clean_path(p: &str) -> String {
@@ -229,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_path_matches_filepath_clean() {
+    fn clean_path_normalizes() {
         assert_eq!(clean_path("/a/../b"), "/b");
         assert_eq!(clean_path("/.."), "/");
         assert_eq!(clean_path("/"), "/");

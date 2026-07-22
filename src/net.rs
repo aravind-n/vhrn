@@ -2,7 +2,7 @@
 //! deny-log) lives under `<cache>/net` and is mounted only into the proxy, never the
 //! box, so an in-box process can never widen its own egress; `vhrn net …` is the only
 //! path that mutates it. The mode string is a byte-level contract (mode file +
-//! `VHRN_NET`), so it round-trips through `as_str/from_str` unchanged. Ports net.go.
+//! `VHRN_NET`), so it round-trips through `as_str/from_str` unchanged.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

@@ -1,8 +1,6 @@
 //! vhrn runs coding agents ("harnesses") in a container jailed to the current
-//! project, with default-deny network egress. This crate is the Rust port of the
-//! Go CLI (`cmd/vhrn` + `internal/vhrn`); it is built alongside the Go binary
-//! until the port completes. Logic lives here (testable); `src/main.rs` is a thin
-//! shim. Comments explain why, not what, and stay terse.
+//! project, with default-deny network egress. Logic lives here (testable);
+//! `src/main.rs` is a thin shim. Comments explain why, not what, and stay terse.
 #![forbid(unsafe_code)]
 
 mod cli;

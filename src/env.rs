@@ -1,7 +1,7 @@
 //! Terminal, GitHub-token, and gitconfig env for the box run. Terminal identity
 //! crosses verbatim (Claude branches rendering on it, so it is never forced); the gh
 //! token is env-injected, never file-mounted; ~/.gitconfig is a disposable copy
-//! bind-mounted in. Ports env.go.
+//! bind-mounted in.
 
 use std::path::Path;
 use std::process::Command;
@@ -11,7 +11,7 @@ use tracing::warn;
 use crate::run::look_path;
 
 /// Build the terminal `--env` args: TERM falls back to xterm-256color; the rest cross
-/// only when set (an empty value counts as unset, like Go's `getenv == ""`). Split
+/// only when set (an empty value counts as unset). Split
 /// from the env read so it is testable without touching process env.
 fn terminal_env_from(
     term: Option<&str>,
@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn terminal_env_defaults_to_xterm() {
         assert_eq!(terminal_env_from(None, None, None, None), ["--env", "TERM=xterm-256color"]);
-        // Empty strings are treated as unset, like Go's getenv == "".
+        // Empty strings are treated as unset.
         assert_eq!(
             terminal_env_from(Some(""), Some(""), Some(""), Some("")),
             ["--env", "TERM=xterm-256color"]

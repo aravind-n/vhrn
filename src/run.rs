@@ -1,6 +1,5 @@
 //! The run path — box preparation, engine selection, the proxy sidecar, and the
-//! small host-side path/exec helpers the run and subcommand handlers share. Ports
-//! `history_key` + these helpers now; the engine and box launch arrive in a later phase.
+//! small host-side path/exec helpers the run and subcommand handlers share.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -26,7 +25,7 @@ fn history_key(project: &str) -> String {
         .collect()
 }
 
-/// The user's home directory from `$HOME` (Go's os.UserHomeDir on unix). Errors when
+/// The user's home directory from `$HOME`. Errors when
 /// unset rather than guessing.
 pub(crate) fn home_dir() -> Result<PathBuf> {
     match std::env::var_os("HOME") {
@@ -184,9 +183,9 @@ pub(crate) fn start_proxy(engine: &str, image: &str, policy_dir: &Path, port: &s
     Ok((proxy, ip))
 }
 
-/// The first dotted quad on the first line mentioning `ipv4Address`, matching Go's
-/// `grep -m1 ipv4Address | grep -oE <quad>`. Apple's inspect JSON escapes the CIDR
-/// slash (192.168.64.73\/24), so we match only the quad. No regex crate.
+/// The first dotted quad on the first line mentioning `ipv4Address` in the engine's
+/// inspect output. Apple's inspect JSON escapes the CIDR slash (192.168.64.73\/24),
+/// so we match only the quad. No regex crate.
 fn first_ipv4(inspect_output: &str) -> String {
     for line in inspect_output.split('\n') {
         if line.contains("ipv4Address") {
@@ -229,7 +228,7 @@ fn match_quad(b: &[u8], start: usize) -> Option<usize> {
 /// alive to wait and clean up on exit.
 pub(crate) fn stop_on_signal(proxy: Proxy) {
     let Ok(mut signals) = Signals::new([SIGINT, SIGTERM]) else {
-        return; // best-effort, like Go
+        return; // best-effort
     };
     std::thread::spawn(move || {
         for sig in signals.forever() {
@@ -417,7 +416,7 @@ fn box_run_args(cfg: &BoxConfig, f: &RunFlags, mode: Mode, ip: &str, port: &str)
     args
 }
 
-/// Stop the sidecar on any normal/error return (Go's `defer p.stop()`).
+/// Stop the sidecar on any normal/error return.
 struct ProxyGuard(Proxy);
 impl Drop for ProxyGuard {
     fn drop(&mut self) {
@@ -507,7 +506,7 @@ mod tests {
     fn vhrn_cache_resolution() {
         let home = Path::new("/home/u");
         assert_eq!(vhrn_cache_from(home, Some("/x/cache")), Path::new("/x/cache/vhrn"));
-        // Empty or unset falls back to ~/.cache, like Go's getenv == "".
+        // Empty or unset falls back to ~/.cache.
         assert_eq!(vhrn_cache_from(home, Some("")), Path::new("/home/u/.cache/vhrn"));
         assert_eq!(vhrn_cache_from(home, None), Path::new("/home/u/.cache/vhrn"));
     }

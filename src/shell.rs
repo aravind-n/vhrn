@@ -1,14 +1,14 @@
 //! Host state: the installed registry (`name version` per line, the source of truth
 //! for the run-path image ref and the aliases) and the reversible, marker-delimited
 //! shell-alias blocks regenerated from it. `command <name>` / `\<name>` still reach
-//! the real binary. Ports registry.go + alias.go.
+//! the real binary.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::harness::{Harness, lookup_harness};
 
-// ---- installed registry (registry.go) -------------------------------------------
+// ---- installed registry ---------------------------------------------------------
 
 /// A registry entry: a harness name and the image version it was installed at
 /// (a tag like "v0.2.0" or "latest", or "local" for a make-built image).
@@ -107,7 +107,7 @@ fn next_tmp_id() -> u64 {
     CTR.fetch_add(1, Ordering::Relaxed)
 }
 
-// ---- shell aliases (alias.go) ---------------------------------------------------
+// ---- shell aliases --------------------------------------------------------------
 
 const ALIAS_START: &str = "# >>> vhrn managed aliases >>>";
 const ALIAS_END: &str = "# <<< vhrn managed aliases <<<";

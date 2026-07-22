@@ -1,6 +1,6 @@
 //! The harness registry — the single source of truth a subcommand, install, run,
 //! and persistence all read from. Adding an agent (codex, aider, …) is a spec here
-//! plus a thin `FROM vhrn-base` Dockerfile, not a fork of the CLI. Ports harness.go.
+//! plus a thin `FROM vhrn-base` Dockerfile, not a fork of the CLI.
 
 /// Describes one coding agent vhrn can run in the box.
 #[derive(Clone, Debug, Default)]
@@ -13,7 +13,7 @@ pub(crate) struct Harness {
     /// Default egress domains unioned into the host allowlist at install time.
     pub allow_domains: Vec<String>,
 
-    // Persistence — the three home-dir buckets (see persist.rs / state.go): a
+    // Persistence — the three home-dir buckets (see persist.rs): a
     // box-owned state dir, bootstrap-only forwarded credentials, and disposable
     // synced config layered back on top each run.
     pub state_dir: String,        // box-home-relative persistent dir, e.g. ".claude"

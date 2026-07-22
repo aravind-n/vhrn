@@ -3,8 +3,7 @@
 use anyhow::{Result, bail};
 use tracing::{error, info, warn};
 
-// Subcommand-first help. Bare `vhrn` prints it; a harness runs as `vhrn <harness>
-// …`. Transcribed from the Go usageText (internal/vhrn/usage.go).
+// Subcommand-first help. Bare `vhrn` prints it; a harness runs as `vhrn <harness> …`.
 const USAGE: &str = r"vhrn runs coding agents in a container jailed to the current project, with
 default-deny network egress.
 
@@ -84,7 +83,7 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
-/// Show every known harness and whether `vhrn install` has set it up (list.go).
+/// Show every known harness and whether `vhrn install` has set it up.
 fn run_list(_args: &[String]) -> i32 {
     let home = match crate::run::home_dir() {
         Ok(h) => h,
@@ -108,7 +107,7 @@ fn run_list(_args: &[String]) -> i32 {
 /// Pull a harness's image and the matching-version proxy from the registry, union its
 /// egress domains into the allowlist, record the harness+version in the installed
 /// registry, and write shell aliases. `--local` uses images already built by `make`
-/// instead of pulling (for development/offline). Mirrors Go's runInstall (install.go).
+/// instead of pulling (for development/offline).
 fn run_install(args: &[String]) -> i32 {
     let mut arg = String::new();
     let mut local = false;
@@ -179,7 +178,7 @@ fn run_install(args: &[String]) -> i32 {
 
 /// Drop a harness from the installed registry and regenerate the shell aliases so its
 /// alias disappears. With `--image` it also deletes the harness image (the shared base
-/// and proxy are left in place for other harnesses). Mirrors Go's runUninstall.
+/// and proxy are left in place for other harnesses).
 fn run_uninstall(args: &[String]) -> i32 {
     let mut name = String::new();
     let mut rm_image = false;
@@ -253,10 +252,9 @@ pub(crate) struct RunFlags {
     pub rest: Vec<String>,        // everything forwarded to the agent verbatim
 }
 
-/// Consume wrapper flags up front then forward the rest verbatim, mirroring
-/// vhrn.sh's loop: `--open-net` / `--allow[=]<d,d>` are read, `--` stops flag
-/// reading, and the first unrecognized token ends parsing (so agent flags pass
-/// through untouched).
+/// Consume wrapper flags up front then forward the rest verbatim: `--open-net` /
+/// `--allow[=]<d,d>` are read, `--` stops flag reading, and the first unrecognized
+/// token ends parsing (so agent flags pass through untouched).
 fn parse_run_flags(args: &[String]) -> Result<RunFlags> {
     let mut f = RunFlags::default();
     let mut i = 0;
