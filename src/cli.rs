@@ -49,11 +49,42 @@ Environment:
 /// Entry point: dispatch argv (already stripped of the program name) and return a
 /// process exit code, matching the Go `vhrn.Run`.
 ///
-/// Port in progress — real subcommand dispatch (help/net/install/uninstall/list/
-/// harness) is wired up in a later phase. For now every invocation prints the usage
-/// text and exits 0; the Go binary remains the behavioural oracle meanwhile.
-pub fn run(_args: Vec<String>) -> i32 {
-    print!("{USAGE}");
+/// Port in progress — `help`/`net`/`list` are wired now; `install`/`uninstall` and
+/// running a harness land at the cutover phase and until then fall through to usage.
+pub fn run(args: Vec<String>) -> i32 {
+    match args.first().map(String::as_str) {
+        None | Some("help" | "-h" | "--help") => {
+            print!("{USAGE}");
+            0
+        }
+        Some("net") => crate::net::run_net(&args[1..]),
+        Some("list") => run_list(&args[1..]),
+        _ => {
+            // install/uninstall/harness-run dispatch arrives at the cutover phase.
+            print!("{USAGE}");
+            0
+        }
+    }
+}
+
+/// Show every known harness and whether `vhrn install` has set it up (list.go).
+fn run_list(_args: &[String]) -> i32 {
+    let home = match crate::run::home_dir() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("vhrn: {e}");
+            return 1;
+        }
+    };
+    let config_dir = crate::shell::vhrn_config_dir(&home);
+    let installed: std::collections::HashMap<String, String> =
+        crate::shell::read_installed(&config_dir).into_iter().map(|ih| (ih.name, ih.version)).collect();
+    for name in crate::harness::harness_names() {
+        match installed.get(&name) {
+            Some(v) => println!("  {name:<12} installed ({v})"),
+            None => println!("  {name:<12} available"),
+        }
+    }
     0
 }
 
