@@ -39,7 +39,7 @@ vhrn install claude      # pull the claude + proxy images, seed egress, add a `c
 Or grab a prebuilt binary, then install the harness:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/aravind-n/vhrn/master/scripts/install.sh | sh
+curl -fsSL https://aravind-n.github.io/vhrn/install.sh | sh
 vhrn install claude
 ```
 
@@ -49,12 +49,16 @@ local image build. Pin or roll back a version with `@`:
 ```sh
 vhrn install claude           # the latest release
 vhrn install claude@v0.2.0    # a specific release (rollback works the same way)
+vhrn install claude@nightly   # the latest master build
 ```
+
+For the CLI itself, `VHRN_VERSION` pins the installer to a tag (`VHRN_VERSION=nightly`
+or `VHRN_VERSION=v0.2.0`); the default is the latest stable release.
 
 For development, build the images locally and install from those instead of pulling:
 
 ```sh
-make build                    # build base/proxy/claude locally
+make -C image                 # build base/proxy/claude locally
 vhrn install claude --local   # register the make-built images
 ```
 
@@ -141,28 +145,29 @@ domains. Edit `~/.cache/vhrn/net/allowlist` to change it.
 
 A harness is a spec (`src/harness.rs`) plus a thin `FROM vhrn-base`
 Dockerfile under `image/<harness>/`, and an entry in the CI publish matrix
-(`.github/workflows/publish-images.yml`) so its image lands on ghcr. The spec carries
+(`.github/workflows/_build-images.yml`) so its image lands on ghcr. The spec carries
 the image name, in-container command, shell alias, default egress domains, and the
 persistence descriptors (state dir, synced config, bootstrap credentials). No fork of
 the CLI is required.
 
 ## Make targets
 
-The Makefile owns the container images and the test suite; the CLI binary itself is
-built by cargo (`cargo build --release`, `cargo install --path .`).
+`image/Makefile` builds the container images (run it from the repo root as `make -C
+image`); it only builds images. The CLI is built and tested by cargo (`cargo build
+--release`, `cargo test`) and the proxy by `cd proxy && go test ./...`.
 
 | Target | Description |
 | --- | --- |
-| `make` / `make build` | Build all images (base + proxy + claude) |
-| `make build-base` / `make build-claude` / `make build-proxy` | Build one image |
-| `make test` | clippy + the unit tests (CLI + proxy) |
-| `make clean` | Remove the images |
-| `make ENGINE=docker ...` | Force Docker instead of `container` |
+| `make -C image` / `make -C image build` | Build all images (base + proxy + claude) |
+| `make -C image build-base` / `build-claude` / `build-proxy` | Build one image |
+| `make -C image clean` | Remove the images |
+| `make -C image ENGINE=docker ...` | Force Docker instead of `container` |
 
 Day to day you don't need `make` — `vhrn install <harness>` pulls prebuilt images from
-ghcr. `make` builds them locally for development (`vhrn install <harness> --local` then
-uses those). CI (`.github/workflows/publish-images.yml`) builds and pushes the release
-images on a git tag; `VHRN_REGISTRY` overrides the registry the CLI pulls from.
+ghcr. `make -C image` builds them locally for development (`vhrn install <harness>
+--local` then uses those). CI builds and pushes the images (`nightly` on master,
+`vX.Y.Z` + `latest` on a tag); `VHRN_REGISTRY` overrides the registry the CLI pulls from.
+See [docs/RELEASING.md](docs/RELEASING.md) for the CI/CD flow.
 
 ## Threat model
 
@@ -188,7 +193,8 @@ What it doesn't:
 - There is no sudo inside the container; removing it is what keeps the egress firewall
   tamper-proof. Install tools in user space instead: `mise use -g <tool>` for
   runtimes, `uv tool install <pkg>` for Python CLIs — or declare them under
-  `[toolchains]` in your config.
+  `[toolchains]` in your config. A basic C toolchain (clang, libc headers) is baked into
+  the base image, since native builds can't fetch one under the egress guard.
 - `gh` auth is forwarded as an env token (`$GH_TOKEN` or `$GITHUB_TOKEN`, else
   `gh auth token`), which covers git-over-HTTPS inside the container. SSH remotes stay
   unauthenticated. Under an open guard, the wrapper warns that a token is present.
