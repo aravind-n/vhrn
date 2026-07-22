@@ -11,10 +11,14 @@
 
 mod cli;
 mod config;
+mod env;
 mod harness;
 mod image;
 mod net;
 mod run;
 mod shell;
+
+#[cfg(test)]
+mod testutil;
 
 pub use cli::run;
