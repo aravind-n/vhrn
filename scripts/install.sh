@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # vhrn installer: fetch the right prebuilt CLI from GitHub Releases and drop it on
-# PATH. The container images are built separately with `make` (see README).
+# PATH. The container images are pulled on demand by `vhrn install <harness>`.
 #
 #   curl -fsSL https://raw.githubusercontent.com/aravind-n/vhrn/master/install.sh | sh
 #
@@ -47,4 +47,4 @@ fi
 trap - EXIT
 
 echo "vhrn: installed ${dest}"
-echo "Next: build the container images once with 'make', then run 'vhrn' in any project."
+echo "Next: run 'vhrn install claude' to pull the images and add a shell alias, then 'vhrn claude' in any project."
