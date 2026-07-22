@@ -1,6 +1,6 @@
-# Build the container images the vhrn CLI drives, with Apple `container` or Docker.
-# Run from the repo root as `make -C image` (or `cd image && make`).
-# Override the engine with ENGINE=docker.
+# Build the base and harness images the vhrn CLI drives, with Apple `container` or
+# Docker. Run from the repo root as `make -C image` (or `cd image && make`); the proxy
+# image builds separately (proxy/Makefile). Override the engine with ENGINE=docker.
 
 ENGINE ?= $(shell if command -v container >/dev/null 2>&1; then echo container; \
 		  elif command -v docker >/dev/null 2>&1; then echo docker; fi)
@@ -20,11 +20,6 @@ CLAUDE_IMAGE ?= vhrn-claude
 CLAUDE_REF   := $(CLAUDE_IMAGE):$(TAG)
 CLAUDE_DIR   ?= claude
 
-# The egress proxy sidecar image; its source is one level up (see ../proxy).
-PROXY_IMAGE ?= vhrn-proxy
-PROXY_REF   := $(PROXY_IMAGE):$(TAG)
-PROXY_DIR   ?= ../proxy
-
 # Match the container user to your host UID/GID (native Linux Docker only). Applied
 # to the base build, where the dev user is created.
 BUILD_ARGS :=
@@ -41,10 +36,10 @@ RM_IMAGE := $(ENGINE) image delete
 endif
 
 .DEFAULT_GOAL := build
-.PHONY: build build-base build-claude build-proxy clean
+.PHONY: build build-base build-claude clean
 
-# Build every image the CLI needs: shared base, its egress proxy, and the claude harness.
-build: build-base build-proxy build-claude
+# Build the base image and its harnesses (the proxy image builds separately).
+build: build-base build-claude
 
 build-base:
 	$(ENGINE) build $(BUILD_ARGS) --tag $(BASE_REF) --file $(BASE_DIR)/Dockerfile $(BASE_DIR)
@@ -53,10 +48,6 @@ build-base:
 build-claude: build-base
 	$(ENGINE) build --build-arg BASE=$(BASE_REF) --tag $(CLAUDE_REF) --file $(CLAUDE_DIR)/Dockerfile $(CLAUDE_DIR)
 
-build-proxy:
-	$(ENGINE) build --tag $(PROXY_REF) --file $(PROXY_DIR)/Dockerfile $(PROXY_DIR)
-
 clean:
 	-$(RM_IMAGE) $(CLAUDE_REF)
 	-$(RM_IMAGE) $(BASE_REF)
-	-$(RM_IMAGE) $(PROXY_REF)

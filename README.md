@@ -58,8 +58,8 @@ or `VHRN_VERSION=v0.2.0`); the default is the latest stable release.
 For development, build the images locally and install from those instead of pulling:
 
 ```sh
-make -C image                 # build base/proxy/claude locally
-vhrn install claude --local   # register the make-built images
+make -C image && make -C proxy   # build base/claude + proxy locally
+vhrn install claude --local      # register the make-built images
 ```
 
 Restart your shell (or source your rc file) afterward to pick up the alias.
@@ -152,19 +152,21 @@ the CLI is required.
 
 ## Make targets
 
-`image/Makefile` builds the container images (run it from the repo root as `make -C
-image`); it only builds images. The CLI is built and tested by cargo (`cargo build
---release`, `cargo test`) and the proxy by `cd proxy && go test ./...`.
+`image/Makefile` builds the base and harness images (run it from the repo root as `make
+-C image`); `proxy/Makefile` builds the proxy image (`make -C proxy`) — each module owns
+its own image. The CLI is built and tested by cargo (`cargo build --release`, `cargo
+test`) and the proxy by `cd proxy && go test ./...`.
 
 | Target | Description |
 | --- | --- |
-| `make -C image` / `make -C image build` | Build all images (base + proxy + claude) |
-| `make -C image build-base` / `build-claude` / `build-proxy` | Build one image |
-| `make -C image clean` | Remove the images |
+| `make -C image` | Build the base + harness images (base + claude) |
+| `make -C proxy` | Build the proxy image |
+| `make -C image build-base` / `build-claude` | Build one harness image |
+| `make -C image clean` / `make -C proxy clean` | Remove the images |
 | `make -C image ENGINE=docker ...` | Force Docker instead of `container` |
 
 Day to day you don't need `make` — `vhrn install <harness>` pulls prebuilt images from
-ghcr. `make -C image` builds them locally for development (`vhrn install <harness>
+ghcr. `make -C image && make -C proxy` builds them locally for development (`vhrn install <harness>
 --local` then uses those). CI builds and pushes the images (`nightly` on master,
 `vX.Y.Z` + `latest` on a tag); `VHRN_REGISTRY` overrides the registry the CLI pulls from.
 See [docs/RELEASING.md](docs/RELEASING.md) for the CI/CD flow.
