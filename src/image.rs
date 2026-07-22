@@ -3,7 +3,10 @@
 //! the image pull and the derived toolchain build land in later phases.
 
 use crate::harness::Harness;
+use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 const BASE_IMAGE_NAME: &str = "vhrn-base";
 const PROXY_IMAGE_NAME: &str = "vhrn-proxy";
@@ -94,6 +97,95 @@ fn toolchain_dockerfile(base_image: &str, tools: &[String]) -> String {
     )
 }
 
+// ---- toolchain local build (only the derived toolchain image is built locally;
+// user-facing images are pulled) --------------------------------------------------
+
+/// Whether the engine already has `image` locally.
+fn image_exists(engine: &str, image: &str) -> bool {
+    Command::new(engine)
+        .args(["image", "inspect", image])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// The engine build command line (pure, for testing).
+fn build_argv(image: &str, dockerfile: &str, context: &str, extra: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "build".to_string(),
+        "--tag".into(),
+        image.into(),
+        "--file".into(),
+        dockerfile.into(),
+    ];
+    args.extend(extra.iter().cloned());
+    args.push(context.into());
+    args
+}
+
+/// A build-context temp dir under the vhrn cache. It must live in the home tree, not
+/// the system temp: Apple container's build cannot read a context under macOS's
+/// /var/folders and silently drops files from it (invariant #13).
+fn build_temp_dir() -> Result<PathBuf> {
+    let home = crate::run::home_dir()?;
+    let root = crate::run::vhrn_cache(&home).join("build");
+    std::fs::create_dir_all(&root)?;
+    let dir = root.join(format!("ctx-{}-{}", std::process::id(), next_ctx_id()));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn next_ctx_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    CTR.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Run the engine build, streaming output so the user sees progress. Build chatter
+/// goes to our stderr (both streams), keeping vhrn's stdout clean.
+fn build_image(engine: &str, image: &str, dockerfile: &str, context: &str, extra: &[String]) -> Result<()> {
+    use std::os::fd::AsFd;
+    let err_out = Stdio::from(std::io::stderr().as_fd().try_clone_to_owned()?);
+    let status = Command::new(engine)
+        .args(build_argv(image, dockerfile, context, extra))
+        .stdout(err_out)
+        .stderr(Stdio::inherit())
+        .status()?;
+    if !status.success() {
+        bail!("{engine} build failed for {image}");
+    }
+    Ok(())
+}
+
+/// The image to run: `from_image` unchanged when no tools are declared, else a
+/// content-addressed derived image (FROM `from_image`, tagged from the clean
+/// `tag_base`), built once and cached by its tag. `from_image` is the pulled ref (the
+/// FROM); `tag_base` is the clean image name — a ref with a colon can't prefix a tag.
+pub(crate) fn ensure_toolchain_image(
+    engine: &str,
+    from_image: &str,
+    tag_base: &str,
+    tools: &[String],
+) -> Result<String> {
+    let norm = normalize_tools(tools);
+    if norm.is_empty() {
+        return Ok(from_image.to_string());
+    }
+    let tag = toolchain_tag(tag_base, &norm);
+    if image_exists(engine, &tag) {
+        return Ok(tag);
+    }
+    let tmp = build_temp_dir()?;
+    let dockerfile = tmp.join("Dockerfile");
+    std::fs::write(&dockerfile, toolchain_dockerfile(from_image, &norm))?;
+    eprintln!("vhrn: provisioning toolchain ({}) into {tag}...", norm.join(", "));
+    let result = build_image(engine, &tag, &dockerfile.to_string_lossy(), &tmp.to_string_lossy(), &[]);
+    let _ = std::fs::remove_dir_all(&tmp);
+    result?;
+    Ok(tag)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +235,20 @@ mod tests {
         assert!(df.contains("FROM vhrn-claude"), "missing FROM:\n{df}");
         assert!(df.contains("mise use -g go@1.26 node@22"), "tools not in sorted order:\n{df}");
         assert!(df.contains("USER dev") && df.contains("USER root"), "provision as dev then root:\n{df}");
+    }
+
+    #[test]
+    fn ensure_toolchain_image_no_tools_passes_through() {
+        // No tools must pass the harness image through untouched, without touching the engine.
+        let img = ensure_toolchain_image("container", "ghcr.io/x/vhrn-claude:v1", "vhrn-claude", &[]).unwrap();
+        assert_eq!(img, "ghcr.io/x/vhrn-claude:v1");
+    }
+
+    #[test]
+    fn build_argv_layout() {
+        assert_eq!(
+            build_argv("img:tag", "/ctx/Dockerfile", "/ctx", &["--build-arg".into(), "K=V".into()]),
+            ["build", "--tag", "img:tag", "--file", "/ctx/Dockerfile", "--build-arg", "K=V", "/ctx"]
+        );
     }
 }
