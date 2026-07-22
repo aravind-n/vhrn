@@ -157,7 +157,10 @@ impl NetPolicy {
             return;
         }
         let mut set: HashSet<String> = self.lines().into_iter().collect();
-        let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(&self.allowlist)
+        let Ok(mut f) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.allowlist)
         else {
             return;
         };
@@ -188,7 +191,11 @@ impl NetPolicy {
                 buf.push('\n');
             }
         }
-        let tmp = self.dir.join(format!("allowlist.{}.{}", std::process::id(), next_tmp_id()));
+        let tmp = self.dir.join(format!(
+            "allowlist.{}.{}",
+            std::process::id(),
+            next_tmp_id()
+        ));
         std::fs::write(&tmp, &buf)?;
         set_mode(&tmp, 0o666)?;
         std::fs::rename(&tmp, &self.allowlist) // atomic on the same fs; proxy re-reads
@@ -255,7 +262,11 @@ pub(crate) fn run_net(args: &[String]) -> i32 {
             let mode = std::fs::read_to_string(&np.mode_file)
                 .map_or_else(|_| "enforce".to_string(), |s| s.trim().to_string());
             println!("mode:    {mode}");
-            println!("allowed: {} domain(s) ({})", np.count_domains(), np.allowlist.display());
+            println!(
+                "allowed: {} domain(s) ({})",
+                np.count_domains(),
+                np.allowlist.display()
+            );
         }
         "denied" => {
             let domains = np.denied_domains();
@@ -314,7 +325,11 @@ mod tests {
             ("", true, "open"),
         ];
         for (cfg, open, want) in cases {
-            assert_eq!(resolve_mode(cfg, open).as_str(), want, "resolve_mode({cfg:?}, {open})");
+            assert_eq!(
+                resolve_mode(cfg, open).as_str(),
+                want,
+                "resolve_mode({cfg:?}, {open})"
+            );
         }
     }
 
@@ -334,8 +349,12 @@ mod tests {
         let base = np.count_domains();
         assert_eq!(base, 12, "default domain count");
         // Adds a new domain; ignores duplicates (incl. one already present).
-        np.append_missing_atomic(&["docs.rs".into(), "api.anthropic.com".into(), "docs.rs".into()])
-            .unwrap();
+        np.append_missing_atomic(&[
+            "docs.rs".into(),
+            "api.anthropic.com".into(),
+            "docs.rs".into(),
+        ])
+        .unwrap();
         assert_eq!(np.count_domains(), base + 1);
         // Idempotent re-add.
         np.append_missing_atomic(&["docs.rs".into()]).unwrap();
@@ -359,8 +378,15 @@ mod tests {
     fn denied_domains_unique_sorted() {
         let np = NetPolicy::new(&crate::testutil::temp_dir());
         np.ensure().unwrap();
-        std::fs::write(&np.deny_log, "t1 evil.com GET\nt2 evil.com GET\nt3 tracker.io POST\n").unwrap();
-        assert_eq!(np.denied_domains(), vec!["evil.com".to_string(), "tracker.io".to_string()]);
+        std::fs::write(
+            &np.deny_log,
+            "t1 evil.com GET\nt2 evil.com GET\nt3 tracker.io POST\n",
+        )
+        .unwrap();
+        assert_eq!(
+            np.denied_domains(),
+            vec!["evil.com".to_string(), "tracker.io".to_string()]
+        );
 
         let empty = NetPolicy::new(&crate::testutil::temp_dir());
         empty.ensure().unwrap();

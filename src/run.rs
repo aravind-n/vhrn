@@ -114,7 +114,9 @@ pub(crate) struct Proxy {
 
 impl Proxy {
     fn stop(&self) {
-        let _ = Command::new(&self.engine).args(["stop", &self.name]).status();
+        let _ = Command::new(&self.engine)
+            .args(["stop", &self.name])
+            .status();
     }
 
     fn inspect_ip(&self) -> String {
@@ -128,12 +130,17 @@ impl Proxy {
                 ])
                 .output();
             return match out {
-                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                Ok(o) if o.status.success() => {
+                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+                }
                 _ => String::new(),
             };
         }
         // Apple `container inspect` prints JSON; scan it for the first dotted quad.
-        match Command::new("container").args(["inspect", &self.name]).output() {
+        match Command::new("container")
+            .args(["inspect", &self.name])
+            .output()
+        {
             Ok(o) if o.status.success() => first_ipv4(&String::from_utf8_lossy(&o.stdout)),
             _ => String::new(),
         }
@@ -143,7 +150,12 @@ impl Proxy {
 /// Launch the detached proxy sidecar and resolve its IP (engines differ; retry until
 /// it has one). `policy_dir` is the host-side net policy dir, mounted into the proxy
 /// only — never the container.
-pub(crate) fn start_proxy(engine: &str, image: &str, policy_dir: &Path, port: &str) -> Result<(Proxy, String)> {
+pub(crate) fn start_proxy(
+    engine: &str,
+    image: &str,
+    policy_dir: &Path,
+    port: &str,
+) -> Result<(Proxy, String)> {
     let name = format!("vhrn-proxy-{}", std::process::id());
     let status = Command::new(engine)
         .args(["run", "-d", "--rm", "--name", &name])
@@ -166,7 +178,10 @@ pub(crate) fn start_proxy(engine: &str, image: &str, policy_dir: &Path, port: &s
     if !matches!(status, Ok(s) if s.success()) {
         bail!("proxy failed to start (is the {image:?} image built?)");
     }
-    let proxy = Proxy { engine: engine.to_string(), name };
+    let proxy = Proxy {
+        engine: engine.to_string(),
+        name,
+    };
 
     let mut ip = String::new();
     for _ in 0..30 {
@@ -250,17 +265,17 @@ const CONTAINER_HOME: &str = "/home/dev";
 pub(crate) struct ContainerConfig {
     pub engine: String,
     pub harness: Harness,
-    pub image: String,       // resolved container image ref (registry ref, or bare local name)
-    pub version: String,     // installed image version (a tag, or "local")
-    pub project: String,     // physical cwd (pwd -P)
-    pub key: String,         // history key: [^A-Za-z0-9] -> '-'
-    pub cache: String,       // ~/.cache/vhrn
-    pub state: String,       // <cache>/state/<harness> -> the container's persistent config dir
-    pub sandbox: String,     // <cache>/sandbox -> disposable synced config
-    pub config_dir: String,  // container config dir, e.g. /home/dev/.claude
+    pub image: String, // resolved container image ref (registry ref, or bare local name)
+    pub version: String, // installed image version (a tag, or "local")
+    pub project: String, // physical cwd (pwd -P)
+    pub key: String,   // history key: [^A-Za-z0-9] -> '-'
+    pub cache: String, // ~/.cache/vhrn
+    pub state: String, // <cache>/state/<harness> -> the container's persistent config dir
+    pub sandbox: String, // <cache>/sandbox -> disposable synced config
+    pub config_dir: String, // container config dir, e.g. /home/dev/.claude
     pub host_config: String, // host config dir, e.g. ~/.claude
-    pub history: String,     // <host_config>/projects/<key>
-    pub config: Config,      // merged defaults + global + project config
+    pub history: String, // <host_config>/projects/<key>
+    pub config: Config, // merged defaults + global + project config
     pub git_mount: Vec<String>,
     pub gh_env: Vec<String>,
     pub term_env: Vec<String>,
@@ -293,7 +308,10 @@ impl ContainerConfig {
             m.push(format!("{}:{}/CLAUDE.md", guide.display(), self.config_dir));
         }
         m.push("--volume".to_string());
-        m.push(format!("{}:{}/projects/{}", self.history, self.config_dir, self.key));
+        m.push(format!(
+            "{}:{}/projects/{}",
+            self.history, self.config_dir, self.key
+        ));
         m
     }
 }
@@ -319,7 +337,11 @@ fn prepare_container(h: &Harness) -> Result<ContainerConfig> {
     let installed = crate::shell::installed_version(&config_dir_host, &h.name);
     let img_override = std::env::var("VHRN_IMAGE").unwrap_or_default();
     if installed.is_none() && img_override.is_empty() {
-        bail!("{} is not installed — run `vhrn install {}`", h.name, h.name);
+        bail!(
+            "{} is not installed — run `vhrn install {}`",
+            h.name,
+            h.name
+        );
     }
     let version = installed.unwrap_or_else(|| crate::image::LOCAL_VERSION.to_string());
     let image = if img_override.is_empty() {
@@ -371,7 +393,13 @@ fn prepare_container(h: &Harness) -> Result<ContainerConfig> {
 /// Assemble the full engine run argv (pure; the golden test snapshots it). Point the
 /// agent at its config dir, mount the persistent state there, then layer the
 /// disposable synced config + history on top as nested mounts.
-fn container_run_args(cfg: &ContainerConfig, f: &RunFlags, mode: Mode, ip: &str, port: &str) -> Vec<String> {
+fn container_run_args(
+    cfg: &ContainerConfig,
+    f: &RunFlags,
+    mode: Mode,
+    ip: &str,
+    port: &str,
+) -> Vec<String> {
     let proxy_url = format!("http://{ip}:{port}");
     let mut args = vec![
         "run".to_string(),
@@ -436,7 +464,8 @@ fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
     }
 
     let config_allow = cfg.config.net.allow.clone().unwrap_or_default();
-    let policy_dir = crate::net::prepare_policy(Path::new(&cfg.cache), mode, &config_allow, &f.extra_allow)?;
+    let policy_dir =
+        crate::net::prepare_policy(Path::new(&cfg.cache), mode, &config_allow, &f.extra_allow)?;
 
     if let Err(e) = crate::persist::write_container_guide(
         Path::new(&cfg.host_config),
@@ -454,7 +483,12 @@ fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
     // A declared toolchain resolves to a derived, content-addressed image.
     let tools = cfg.config.toolchains.tools.clone().unwrap_or_default();
     if !tools.is_empty() {
-        cfg.image = crate::image::ensure_toolchain_image(&cfg.engine, &cfg.image, &cfg.harness.image, &tools)?;
+        cfg.image = crate::image::ensure_toolchain_image(
+            &cfg.engine,
+            &cfg.image,
+            &cfg.harness.image,
+            &tools,
+        )?;
     }
 
     let proxy_image = env_or(
@@ -492,6 +526,7 @@ mod tests {
 
     #[test]
     fn history_key_encoding() {
+        #[rustfmt::skip]
         let cases = [
             ("/Users/aravind/projects/vhrn", "-Users-aravind-projects-vhrn"),
             ("/a/b_c.d", "-a-b-c-d"),
@@ -505,10 +540,19 @@ mod tests {
     #[test]
     fn vhrn_cache_resolution() {
         let home = Path::new("/home/u");
-        assert_eq!(vhrn_cache_from(home, Some("/x/cache")), Path::new("/x/cache/vhrn"));
+        assert_eq!(
+            vhrn_cache_from(home, Some("/x/cache")),
+            Path::new("/x/cache/vhrn")
+        );
         // Empty or unset falls back to ~/.cache.
-        assert_eq!(vhrn_cache_from(home, Some("")), Path::new("/home/u/.cache/vhrn"));
-        assert_eq!(vhrn_cache_from(home, None), Path::new("/home/u/.cache/vhrn"));
+        assert_eq!(
+            vhrn_cache_from(home, Some("")),
+            Path::new("/home/u/.cache/vhrn")
+        );
+        assert_eq!(
+            vhrn_cache_from(home, None),
+            Path::new("/home/u/.cache/vhrn")
+        );
     }
 
     #[test]
@@ -560,12 +604,25 @@ mod tests {
     fn nested_mounts_guard_on_existence() {
         let (cfg, sandbox) = fixture_with_sandbox();
         let got = cfg.nested_mounts();
-        assert_eq!(got.len() % 2, 0, "mount args must pair --volume with a value: {got:?}");
+        assert_eq!(
+            got.len() % 2,
+            0,
+            "mount args must pair --volume with a value: {got:?}"
+        );
         let joined = got.join(" ");
         for want in [
-            format!("{}:/home/dev/.claude/skills", sandbox.join("skills").display()),
-            format!("{}:/home/dev/.claude/settings.json", sandbox.join("settings.json").display()),
-            format!("{}:/home/dev/.claude/CLAUDE.md", sandbox.join("CLAUDE.md").display()),
+            format!(
+                "{}:/home/dev/.claude/skills",
+                sandbox.join("skills").display()
+            ),
+            format!(
+                "{}:/home/dev/.claude/settings.json",
+                sandbox.join("settings.json").display()
+            ),
+            format!(
+                "{}:/home/dev/.claude/CLAUDE.md",
+                sandbox.join("CLAUDE.md").display()
+            ),
             "/host/history:/home/dev/.claude/projects/-proj".to_string(),
         ] {
             assert!(joined.contains(&want), "missing mount {want:?} in {got:?}");
@@ -601,43 +658,82 @@ mod tests {
             sandbox: sandbox.to_string_lossy().into_owned(),
             config_dir: "/home/dev/.claude".into(),
             history: "/hist".into(),
-            git_mount: vec!["--volume".into(), "/c/gitconfig:/home/dev/.gitconfig".into()],
+            git_mount: vec![
+                "--volume".into(),
+                "/c/gitconfig:/home/dev/.gitconfig".into(),
+            ],
             term_env: vec!["--env".into(), "TERM=xterm-256color".into()],
             gh_env: vec!["--env".into(), "GH_TOKEN=tok".into()],
             ..Default::default()
         };
-        let f = RunFlags { open_net: false, extra_allow: vec![], rest: vec!["--model".into(), "opus".into()] };
+        let f = RunFlags {
+            open_net: false,
+            extra_allow: vec![],
+            rest: vec!["--model".into(), "opus".into()],
+        };
 
         let args = container_run_args(&cfg, &f, Mode::Enforce, "10.0.0.2", "8080");
 
-        let skills = format!("{}:/home/dev/.claude/skills", sandbox.join("skills").display());
-        let settings = format!("{}:/home/dev/.claude/settings.json", sandbox.join("settings.json").display());
-        let guide = format!("{}:/home/dev/.claude/CLAUDE.md", sandbox.join("CLAUDE.md").display());
+        let skills = format!(
+            "{}:/home/dev/.claude/skills",
+            sandbox.join("skills").display()
+        );
+        let settings = format!(
+            "{}:/home/dev/.claude/settings.json",
+            sandbox.join("settings.json").display()
+        );
+        let guide = format!(
+            "{}:/home/dev/.claude/CLAUDE.md",
+            sandbox.join("CLAUDE.md").display()
+        );
         let expected: Vec<String> = [
-            "run", "-it", "--rm",
-            "--cap-add", "CAP_NET_ADMIN",
-            "--env", "VHRN_SANDBOX=1",
-            "--env", "VHRN_NET=enforce",
-            "--env", "VHRN_PROXY_IP=10.0.0.2",
-            "--env", "VHRN_PROXY_PORT=8080",
-            "--env", "HTTP_PROXY=http://10.0.0.2:8080",
-            "--env", "HTTPS_PROXY=http://10.0.0.2:8080",
-            "--env", "http_proxy=http://10.0.0.2:8080",
-            "--env", "https_proxy=http://10.0.0.2:8080",
-            "--volume", "/proj:/proj",
-            "--workdir", "/proj",
-            "--env", "CLAUDE_CONFIG_DIR=/home/dev/.claude",
-            "--volume", "/state:/home/dev/.claude",
-            "--volume", skills.as_str(),
-            "--volume", settings.as_str(),
-            "--volume", guide.as_str(),
-            "--volume", "/hist:/home/dev/.claude/projects/-proj",
-            "--volume", "/c/gitconfig:/home/dev/.gitconfig",
-            "--env", "TERM=xterm-256color",
-            "--env", "GH_TOKEN=tok",
+            "run",
+            "-it",
+            "--rm",
+            "--cap-add",
+            "CAP_NET_ADMIN",
+            "--env",
+            "VHRN_SANDBOX=1",
+            "--env",
+            "VHRN_NET=enforce",
+            "--env",
+            "VHRN_PROXY_IP=10.0.0.2",
+            "--env",
+            "VHRN_PROXY_PORT=8080",
+            "--env",
+            "HTTP_PROXY=http://10.0.0.2:8080",
+            "--env",
+            "HTTPS_PROXY=http://10.0.0.2:8080",
+            "--env",
+            "http_proxy=http://10.0.0.2:8080",
+            "--env",
+            "https_proxy=http://10.0.0.2:8080",
+            "--volume",
+            "/proj:/proj",
+            "--workdir",
+            "/proj",
+            "--env",
+            "CLAUDE_CONFIG_DIR=/home/dev/.claude",
+            "--volume",
+            "/state:/home/dev/.claude",
+            "--volume",
+            skills.as_str(),
+            "--volume",
+            settings.as_str(),
+            "--volume",
+            guide.as_str(),
+            "--volume",
+            "/hist:/home/dev/.claude/projects/-proj",
+            "--volume",
+            "/c/gitconfig:/home/dev/.gitconfig",
+            "--env",
+            "TERM=xterm-256color",
+            "--env",
+            "GH_TOKEN=tok",
             "vhrn-claude:latest",
             "claude",
-            "--model", "opus",
+            "--model",
+            "opus",
         ]
         .iter()
         .map(std::string::ToString::to_string)

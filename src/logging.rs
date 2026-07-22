@@ -37,7 +37,11 @@ pub(crate) struct LogConfig {
 
 impl Default for LogConfig {
     fn default() -> Self {
-        Self { format: LogFormat::Compact, with_time: false, with_ansi: true }
+        Self {
+            format: LogFormat::Compact,
+            with_time: false,
+            with_ansi: true,
+        }
     }
 }
 

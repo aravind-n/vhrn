@@ -104,7 +104,10 @@ fn run_list(_args: &[String]) -> i32 {
     };
     let config_dir = crate::shell::vhrn_config_dir(&home);
     let installed: std::collections::HashMap<String, String> =
-        crate::shell::read_installed(&config_dir).into_iter().map(|ih| (ih.name, ih.version)).collect();
+        crate::shell::read_installed(&config_dir)
+            .into_iter()
+            .map(|ih| (ih.name, ih.version))
+            .collect();
     for name in crate::harness::harness_names() {
         match installed.get(&name) {
             Some(v) => println!("  {name:<12} installed ({v})"),
@@ -158,7 +161,9 @@ fn run_install(args: &[String]) -> i32 {
         }
     };
 
-    if let Err(e) = crate::image::provision_images(&engine, &crate::image::registry_base(), &h, &version) {
+    if let Err(e) =
+        crate::image::provision_images(&engine, &crate::image::registry_base(), &h, &version)
+    {
         error!("{e}");
         return 1;
     }
@@ -175,7 +180,9 @@ fn run_install(args: &[String]) -> i32 {
         error!("{e}");
         return 1;
     }
-    if let Err(e) = crate::shell::sync_aliases(&config_dir, &home, crate::shell::current_shell().as_deref()) {
+    if let Err(e) =
+        crate::shell::sync_aliases(&config_dir, &home, crate::shell::current_shell().as_deref())
+    {
         warn!("could not update shell aliases: {e}");
     }
 
@@ -220,7 +227,9 @@ fn run_uninstall(args: &[String]) -> i32 {
         error!("{e}");
         return 1;
     }
-    if let Err(e) = crate::shell::sync_aliases(&config_dir, &home, crate::shell::current_shell().as_deref()) {
+    if let Err(e) =
+        crate::shell::sync_aliases(&config_dir, &home, crate::shell::current_shell().as_deref())
+    {
         warn!("could not update shell aliases: {e}");
     }
 
@@ -296,7 +305,10 @@ fn parse_run_flags(args: &[String]) -> Result<RunFlags> {
 
 /// Split a comma-separated `--allow` value, dropping empty fields.
 fn split_domains(s: &str) -> Vec<String> {
-    s.split(',').filter(|p| !p.is_empty()).map(String::from).collect()
+    s.split(',')
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 #[cfg(test)]
@@ -342,6 +354,8 @@ mod tests {
             rest: &'a [&'a str],
             want_err: bool,
         }
+        // Keep the case table aligned one-per-row; rustfmt would explode each into 8 lines.
+        #[rustfmt::skip]
         let cases = [
             Case { name: "empty", args: &[], open_net: false, allow: &[], rest: &[], want_err: false },
             Case { name: "agent flags pass through", args: &["--model", "opus"], open_net: false, allow: &[], rest: &["--model", "opus"], want_err: false },

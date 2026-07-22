@@ -36,7 +36,11 @@ pub(crate) fn registry_base() -> String {
 pub(crate) fn parse_harness_arg(arg: &str) -> (String, String) {
     match arg.split_once('@') {
         Some((name, version)) => {
-            let version = if version.is_empty() { "latest" } else { version };
+            let version = if version.is_empty() {
+                "latest"
+            } else {
+                version
+            };
             (name.to_string(), version.to_string())
         }
         None => (arg.to_string(), "latest".to_string()),
@@ -79,7 +83,12 @@ fn image_exists(engine: &str, image: &str) -> bool {
 /// Make the harness and its matching proxy available at `version`: pull both from the
 /// registry, or (for `--local`) verify the make-built images exist. The container and its
 /// proxy are always the same version — a matched set. `registry` is the resolved base.
-pub(crate) fn provision_images(engine: &str, registry: &str, h: &Harness, version: &str) -> Result<()> {
+pub(crate) fn provision_images(
+    engine: &str,
+    registry: &str,
+    h: &Harness,
+    version: &str,
+) -> Result<()> {
     if engine == "container" {
         // Apple engine needs its background service up before any image op.
         let _ = Command::new("container").args(["system", "start"]).status();
@@ -217,7 +226,13 @@ fn next_ctx_id() -> u64 {
 
 /// Run the engine build, streaming output so the user sees progress. Build chatter
 /// goes to our stderr (both streams), keeping vhrn's stdout clean.
-fn build_image(engine: &str, image: &str, dockerfile: &str, context: &str, extra: &[String]) -> Result<()> {
+fn build_image(
+    engine: &str,
+    image: &str,
+    dockerfile: &str,
+    context: &str,
+    extra: &[String],
+) -> Result<()> {
     use std::os::fd::AsFd;
     let err_out = Stdio::from(std::io::stderr().as_fd().try_clone_to_owned()?);
     let status = Command::new(engine)
@@ -253,7 +268,13 @@ pub(crate) fn ensure_toolchain_image(
     let dockerfile = tmp.join("Dockerfile");
     std::fs::write(&dockerfile, toolchain_dockerfile(from_image, &norm))?;
     info!("provisioning toolchain ({}) into {tag}...", norm.join(", "));
-    let result = build_image(engine, &tag, &dockerfile.to_string_lossy(), &tmp.to_string_lossy(), &[]);
+    let result = build_image(
+        engine,
+        &tag,
+        &dockerfile.to_string_lossy(),
+        &tmp.to_string_lossy(),
+        &[],
+    );
     let _ = std::fs::remove_dir_all(&tmp);
     result?;
     Ok(tag)
@@ -267,7 +288,10 @@ mod tests {
     fn resolve_registry_default_and_override() {
         assert_eq!(resolve_registry(None), "ghcr.io/aravind-n");
         assert_eq!(resolve_registry(Some("")), "ghcr.io/aravind-n"); // empty == unset
-        assert_eq!(resolve_registry(Some("example.com/team")), "example.com/team");
+        assert_eq!(
+            resolve_registry(Some("example.com/team")),
+            "example.com/team"
+        );
     }
 
     #[test]
@@ -275,53 +299,98 @@ mod tests {
         let want = |n: &str, v: &str| (n.to_string(), v.to_string());
         assert_eq!(parse_harness_arg("claude"), want("claude", "latest"));
         assert_eq!(parse_harness_arg("claude@v0.2.0"), want("claude", "v0.2.0"));
-        assert_eq!(parse_harness_arg("claude@sha-abc123"), want("claude", "sha-abc123"));
+        assert_eq!(
+            parse_harness_arg("claude@sha-abc123"),
+            want("claude", "sha-abc123")
+        );
         assert_eq!(parse_harness_arg("claude@"), want("claude", "latest")); // trailing @ is latest
     }
 
     #[test]
     fn image_refs_format() {
-        let h = Harness { name: "claude".into(), image: "vhrn-claude".into(), ..Default::default() };
+        let h = Harness {
+            name: "claude".into(),
+            image: "vhrn-claude".into(),
+            ..Default::default()
+        };
         let reg = "ghcr.io/aravind-n";
-        assert_eq!(harness_image_ref(reg, &h, "v0.2.0"), "ghcr.io/aravind-n/vhrn-claude:v0.2.0");
-        assert_eq!(proxy_image_ref(reg, "v0.2.0"), "ghcr.io/aravind-n/vhrn-proxy:v0.2.0");
+        assert_eq!(
+            harness_image_ref(reg, &h, "v0.2.0"),
+            "ghcr.io/aravind-n/vhrn-claude:v0.2.0"
+        );
+        assert_eq!(
+            proxy_image_ref(reg, "v0.2.0"),
+            "ghcr.io/aravind-n/vhrn-proxy:v0.2.0"
+        );
         // A local install uses the bare, make-built image names (registry ignored).
         assert_eq!(harness_image_ref(reg, &h, LOCAL_VERSION), "vhrn-claude");
         assert_eq!(proxy_image_ref(reg, LOCAL_VERSION), "vhrn-proxy");
         // An override registry is used verbatim.
-        assert_eq!(harness_image_ref("example.com/team", &h, "latest"), "example.com/team/vhrn-claude:latest");
+        assert_eq!(
+            harness_image_ref("example.com/team", &h, "latest"),
+            "example.com/team/vhrn-claude:latest"
+        );
     }
 
     #[test]
     fn toolchain_tag_stable() {
         let a = toolchain_tag("vhrn-claude", &["go@1.26".into(), "node@22".into()]);
         // reorder + whitespace + dup must not change the tag.
-        let b = toolchain_tag("vhrn-claude", &["node@22".into(), " go@1.26 ".into(), "node@22".into()]);
+        let b = toolchain_tag(
+            "vhrn-claude",
+            &["node@22".into(), " go@1.26 ".into(), "node@22".into()],
+        );
         assert_eq!(a, b, "tag must be order/whitespace/dup independent");
         assert!(a.starts_with("vhrn-claude-tc-"), "unexpected tag {a}");
-        assert_ne!(toolchain_tag("vhrn-claude", &["go@1.26".into()]), a, "different tool sets should differ");
+        assert_ne!(
+            toolchain_tag("vhrn-claude", &["go@1.26".into()]),
+            a,
+            "different tool sets should differ"
+        );
     }
 
     #[test]
     fn toolchain_dockerfile_contents() {
         let df = toolchain_dockerfile("vhrn-claude", &["node@22".into(), "go@1.26".into()]);
         assert!(df.contains("FROM vhrn-claude"), "missing FROM:\n{df}");
-        assert!(df.contains("mise use -g go@1.26 node@22"), "tools not in sorted order:\n{df}");
-        assert!(df.contains("USER dev") && df.contains("USER root"), "provision as dev then root:\n{df}");
+        assert!(
+            df.contains("mise use -g go@1.26 node@22"),
+            "tools not in sorted order:\n{df}"
+        );
+        assert!(
+            df.contains("USER dev") && df.contains("USER root"),
+            "provision as dev then root:\n{df}"
+        );
     }
 
     #[test]
     fn ensure_toolchain_image_no_tools_passes_through() {
         // No tools must pass the harness image through untouched, without touching the engine.
-        let img = ensure_toolchain_image("container", "ghcr.io/x/vhrn-claude:v1", "vhrn-claude", &[]).unwrap();
+        let img =
+            ensure_toolchain_image("container", "ghcr.io/x/vhrn-claude:v1", "vhrn-claude", &[])
+                .unwrap();
         assert_eq!(img, "ghcr.io/x/vhrn-claude:v1");
     }
 
     #[test]
     fn build_argv_layout() {
         assert_eq!(
-            build_argv("img:tag", "/ctx/Dockerfile", "/ctx", &["--build-arg".into(), "K=V".into()]),
-            ["build", "--tag", "img:tag", "--file", "/ctx/Dockerfile", "--build-arg", "K=V", "/ctx"]
+            build_argv(
+                "img:tag",
+                "/ctx/Dockerfile",
+                "/ctx",
+                &["--build-arg".into(), "K=V".into()]
+            ),
+            [
+                "build",
+                "--tag",
+                "img:tag",
+                "--file",
+                "/ctx/Dockerfile",
+                "--build-arg",
+                "K=V",
+                "/ctx"
+            ]
         );
     }
 
@@ -338,7 +407,13 @@ mod tests {
     #[test]
     fn remove_image_argv_per_engine() {
         // Docker deletes with `image rm`; Apple container with `image delete`.
-        assert_eq!(remove_image_argv("docker", "vhrn-claude"), ["image", "rm", "vhrn-claude"]);
-        assert_eq!(remove_image_argv("container", "vhrn-claude"), ["image", "delete", "vhrn-claude"]);
+        assert_eq!(
+            remove_image_argv("docker", "vhrn-claude"),
+            ["image", "rm", "vhrn-claude"]
+        );
+        assert_eq!(
+            remove_image_argv("container", "vhrn-claude"),
+            ["image", "delete", "vhrn-claude"]
+        );
     }
 }

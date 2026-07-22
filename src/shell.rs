@@ -54,12 +54,18 @@ pub(crate) fn read_installed(config_dir: &Path) -> Vec<InstalledHarness> {
         let version = fields.next().unwrap_or("latest");
         by_name.insert(name.to_string(), version.to_string());
     }
-    by_name.into_iter().map(|(name, version)| InstalledHarness { name, version }).collect()
+    by_name
+        .into_iter()
+        .map(|(name, version)| InstalledHarness { name, version })
+        .collect()
 }
 
 /// The version a harness is installed at, or `None` if it is not installed.
 pub(crate) fn installed_version(config_dir: &Path, name: &str) -> Option<String> {
-    read_installed(config_dir).into_iter().find(|h| h.name == name).map(|h| h.version)
+    read_installed(config_dir)
+        .into_iter()
+        .find(|h| h.name == name)
+        .map(|h| h.version)
 }
 
 /// Write the registry atomically (same-dir temp + rename), sorted and de-duplicated
@@ -69,16 +75,25 @@ pub(crate) fn write_installed(config_dir: &Path, hs: &[InstalledHarness]) -> std
     std::fs::create_dir_all(config_dir)?;
     let mut sorted: Vec<&InstalledHarness> = hs.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut buf = String::from("# vhrn installed harnesses — managed by `vhrn install`/`uninstall`.\n");
+    let mut buf =
+        String::from("# vhrn installed harnesses — managed by `vhrn install`/`uninstall`.\n");
     let mut seen = std::collections::HashSet::new();
     for h in sorted {
         if h.name.is_empty() || !seen.insert(h.name.clone()) {
             continue;
         }
-        let version = if h.version.is_empty() { "latest" } else { h.version.as_str() };
+        let version = if h.version.is_empty() {
+            "latest"
+        } else {
+            h.version.as_str()
+        };
         let _ = writeln!(buf, "{} {version}", h.name);
     }
-    let tmp = config_dir.join(format!("installed.{}.{}", std::process::id(), next_tmp_id()));
+    let tmp = config_dir.join(format!(
+        "installed.{}.{}",
+        std::process::id(),
+        next_tmp_id()
+    ));
     std::fs::write(&tmp, &buf)?;
     std::fs::rename(&tmp, installed_registry_path(config_dir))
 }
@@ -89,14 +104,19 @@ pub(crate) fn add_installed(config_dir: &Path, name: &str, version: &str) -> std
     if let Some(h) = hs.iter_mut().find(|h| h.name == name) {
         h.version = version.to_string();
     } else {
-        hs.push(InstalledHarness { name: name.to_string(), version: version.to_string() });
+        hs.push(InstalledHarness {
+            name: name.to_string(),
+            version: version.to_string(),
+        });
     }
     write_installed(config_dir, &hs)
 }
 
 pub(crate) fn remove_installed(config_dir: &Path, name: &str) -> std::io::Result<()> {
-    let hs: Vec<InstalledHarness> =
-        read_installed(config_dir).into_iter().filter(|h| h.name != name).collect();
+    let hs: Vec<InstalledHarness> = read_installed(config_dir)
+        .into_iter()
+        .filter(|h| h.name != name)
+        .collect();
     write_installed(config_dir, &hs)
 }
 
@@ -198,7 +218,9 @@ pub(crate) fn current_shell() -> Option<String> {
     if sh.is_empty() {
         return None;
     }
-    Path::new(&sh).file_name().map(|n| n.to_string_lossy().into_owned())
+    Path::new(&sh)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
 }
 
 /// The rc files to manage: the known-shell rc files that already exist, plus the
@@ -228,7 +250,11 @@ fn rc_targets(home: &Path, shell: Option<&str>) -> BTreeMap<String, PathBuf> {
 
 /// Regenerate every managed alias block from the installed registry — the single call
 /// install and uninstall both make so the aliases always match the installed set.
-pub(crate) fn sync_aliases(config_dir: &Path, home: &Path, shell: Option<&str>) -> std::io::Result<()> {
+pub(crate) fn sync_aliases(
+    config_dir: &Path,
+    home: &Path,
+    shell: Option<&str>,
+) -> std::io::Result<()> {
     let hs: Vec<Harness> = read_installed(config_dir)
         .into_iter()
         .filter_map(|ih| lookup_harness(&ih.name))
@@ -245,27 +271,50 @@ mod tests {
     use crate::testutil::temp_dir;
 
     fn claude() -> Harness {
-        Harness { name: "claude".into(), alias: "claude".into(), ..Default::default() }
+        Harness {
+            name: "claude".into(),
+            alias: "claude".into(),
+            ..Default::default()
+        }
     }
 
     #[test]
     fn alias_line_syntax() {
-        assert_eq!(alias_line("zsh", "claude", "vhrn claude"), "alias claude='vhrn claude'");
-        assert_eq!(alias_line("fish", "claude", "vhrn claude"), "alias claude 'vhrn claude'");
+        assert_eq!(
+            alias_line("zsh", "claude", "vhrn claude"),
+            "alias claude='vhrn claude'"
+        );
+        assert_eq!(
+            alias_line("fish", "claude", "vhrn claude"),
+            "alias claude 'vhrn claude'"
+        );
     }
 
     #[test]
     fn alias_block_markers_and_lines() {
-        assert_eq!(alias_block(&[], "zsh"), "", "empty harness set yields no block");
+        assert_eq!(
+            alias_block(&[], "zsh"),
+            "",
+            "empty harness set yields no block"
+        );
         let b = alias_block(std::slice::from_ref(&claude()), "bash");
-        assert!(b.contains(ALIAS_START) && b.contains(ALIAS_END), "block missing markers:\n{b}");
-        assert!(b.contains("alias claude='vhrn claude'"), "block missing alias line:\n{b}");
+        assert!(
+            b.contains(ALIAS_START) && b.contains(ALIAS_END),
+            "block missing markers:\n{b}"
+        );
+        assert!(
+            b.contains("alias claude='vhrn claude'"),
+            "block missing alias line:\n{b}"
+        );
     }
 
     #[test]
     fn installed_registry_add_update_remove() {
         let dir = temp_dir();
-        assert!(read_installed(&dir).is_empty(), "fresh registry should be empty");
+        assert!(
+            read_installed(&dir).is_empty(),
+            "fresh registry should be empty"
+        );
         assert!(installed_version(&dir, "claude").is_none());
 
         add_installed(&dir, "claude", "v0.2.0").unwrap();
@@ -275,8 +324,14 @@ mod tests {
         assert_eq!(
             read_installed(&dir),
             vec![
-                InstalledHarness { name: "claude".into(), version: "v0.3.0".into() },
-                InstalledHarness { name: "codex".into(), version: "latest".into() },
+                InstalledHarness {
+                    name: "claude".into(),
+                    version: "v0.3.0".into()
+                },
+                InstalledHarness {
+                    name: "codex".into(),
+                    version: "latest".into()
+                },
             ]
         );
         assert_eq!(installed_version(&dir, "claude").as_deref(), Some("v0.3.0"));
@@ -284,7 +339,10 @@ mod tests {
         remove_installed(&dir, "claude").unwrap();
         assert_eq!(
             read_installed(&dir),
-            vec![InstalledHarness { name: "codex".into(), version: "latest".into() }]
+            vec![InstalledHarness {
+                name: "codex".into(),
+                version: "latest".into()
+            }]
         );
     }
 
@@ -303,13 +361,20 @@ mod tests {
         let block = alias_block(std::slice::from_ref(&claude()), "zsh");
         write_alias_block(&path, &block).unwrap();
         let after = std::fs::read_to_string(&path).unwrap();
-        assert!(after.starts_with("export FOO=1\n"), "surrounding content not preserved:\n{after}");
+        assert!(
+            after.starts_with("export FOO=1\n"),
+            "surrounding content not preserved:\n{after}"
+        );
         assert!(after.contains("alias claude='vhrn claude'"));
 
         // Regenerating with the same block must not duplicate it.
         write_alias_block(&path, &block).unwrap();
         let regen = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(regen.matches(ALIAS_START).count(), 1, "block duplicated:\n{regen}");
+        assert_eq!(
+            regen.matches(ALIAS_START).count(),
+            1,
+            "block duplicated:\n{regen}"
+        );
 
         // Empty block removes it and restores the original exactly.
         write_alias_block(&path, "").unwrap();
@@ -320,7 +385,10 @@ mod tests {
     fn write_alias_block_no_spurious_file() {
         let path = temp_dir().join(".bashrc"); // temp_dir exists; this file does not
         write_alias_block(&path, "").unwrap();
-        assert!(!path.exists(), "removing a block from an absent file should not create it");
+        assert!(
+            !path.exists(),
+            "removing a block from an absent file should not create it"
+        );
     }
 
     #[test]
@@ -337,15 +405,23 @@ mod tests {
 
         for p in [&bashrc, &zshrc] {
             let data = std::fs::read_to_string(p).unwrap_or_default();
-            assert!(data.contains("alias claude="), "{p:?} should carry the alias");
+            assert!(
+                data.contains("alias claude="),
+                "{p:?} should carry the alias"
+            );
         }
-        assert!(!fishrc.exists(), "fish rc neither existing nor current shell; leave alone");
+        assert!(
+            !fishrc.exists(),
+            "fish rc neither existing nor current shell; leave alone"
+        );
 
         // Uninstalling clears the blocks.
         remove_installed(&config_dir, "claude").unwrap();
         sync_aliases(&config_dir, &home, Some("zsh")).unwrap();
         assert!(
-            !std::fs::read_to_string(&zshrc).unwrap().contains(ALIAS_START),
+            !std::fs::read_to_string(&zshrc)
+                .unwrap()
+                .contains(ALIAS_START),
             "alias block should be gone after uninstall"
         );
     }

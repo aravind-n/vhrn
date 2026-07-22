@@ -23,7 +23,12 @@ fn host_state_dir(cache: &Path, harness: &str) -> PathBuf {
 /// Ready the persistent store before launch and return its path: ensure the dir,
 /// bootstrap credentials from the host once, and seed onboarding + this project's
 /// trust into the config JSON.
-pub(crate) fn prepare_state(home: &Path, cache: &Path, h: &Harness, project: &str) -> Result<PathBuf> {
+pub(crate) fn prepare_state(
+    home: &Path,
+    cache: &Path,
+    h: &Harness,
+    project: &str,
+) -> Result<PathBuf> {
     let state = host_state_dir(cache, &h.name);
     std::fs::create_dir_all(&state)?;
     set_mode(&state, 0o700)?;
@@ -73,21 +78,29 @@ fn seed_claude_config_json(path: &Path, project: &str) -> Result<()> {
         _ => Map::new(), // absent or empty: fresh
     };
 
-    m.entry("hasCompletedOnboarding").or_insert(Value::Bool(true));
+    m.entry("hasCompletedOnboarding")
+        .or_insert(Value::Bool(true));
 
-    let projects = m.entry("projects").or_insert_with(|| Value::Object(Map::new()));
+    let projects = m
+        .entry("projects")
+        .or_insert_with(|| Value::Object(Map::new()));
     if !projects.is_object() {
         *projects = Value::Object(Map::new());
     }
     let projects = projects.as_object_mut().unwrap();
 
-    let proj = projects.entry(project).or_insert_with(|| Value::Object(Map::new()));
+    let proj = projects
+        .entry(project)
+        .or_insert_with(|| Value::Object(Map::new()));
     if !proj.is_object() {
         *proj = Value::Object(Map::new());
     }
     let proj = proj.as_object_mut().unwrap();
     proj.insert("hasTrustDialogAccepted".to_string(), Value::Bool(true));
-    proj.insert("hasCompletedProjectOnboarding".to_string(), Value::Bool(true));
+    proj.insert(
+        "hasCompletedProjectOnboarding".to_string(),
+        Value::Bool(true),
+    );
 
     let mut out = serde_json::to_string_pretty(&Value::Object(m))?;
     out.push('\n');
@@ -156,13 +169,24 @@ fn warn_skipped(name: &str) {
 /// Rebuild the sandbox CLAUDE.md fresh each run: the host global CLAUDE.md (if any)
 /// followed by a guard-aware section that tracks the net mode, so it never
 /// accumulates across runs.
-pub(crate) fn write_container_guide(real_claude: &Path, sandbox: &Path, open_net: bool) -> std::io::Result<()> {
+pub(crate) fn write_container_guide(
+    real_claude: &Path,
+    sandbox: &Path,
+    open_net: bool,
+) -> std::io::Result<()> {
     let mut b: Vec<u8> = Vec::new();
     if let Ok(data) = std::fs::read(real_claude.join("CLAUDE.md")) {
         b.extend_from_slice(&data);
     }
     b.extend_from_slice(CONTAINER_GUIDE_HEADER.as_bytes());
-    b.extend_from_slice(if open_net { CONTAINER_GUIDE_OPEN } else { CONTAINER_GUIDE_GUARD }.as_bytes());
+    b.extend_from_slice(
+        if open_net {
+            CONTAINER_GUIDE_OPEN
+        } else {
+            CONTAINER_GUIDE_GUARD
+        }
+        .as_bytes(),
+    );
     std::fs::write(sandbox.join("CLAUDE.md"), b)
 }
 
@@ -204,18 +228,27 @@ mod tests {
 
         // No host creds: nothing seeded.
         bootstrap_credentials(&home, &state, &h);
-        assert!(!state.join(".credentials.json").is_file(), "seeded creds without a host source");
+        assert!(
+            !state.join(".credentials.json").is_file(),
+            "seeded creds without a host source"
+        );
 
         // Host login present + empty store: inherited.
         std::fs::create_dir_all(home.join(".claude")).unwrap();
         std::fs::write(home.join(".claude").join(".credentials.json"), "HOST").unwrap();
         bootstrap_credentials(&home, &state, &h);
-        assert_eq!(std::fs::read_to_string(state.join(".credentials.json")).unwrap(), "HOST");
+        assert_eq!(
+            std::fs::read_to_string(state.join(".credentials.json")).unwrap(),
+            "HOST"
+        );
 
         // Container has since logged in: the host seed must not clobber it.
         std::fs::write(state.join(".credentials.json"), "existing").unwrap();
         bootstrap_credentials(&home, &state, &h);
-        assert_eq!(std::fs::read_to_string(state.join(".credentials.json")).unwrap(), "existing");
+        assert_eq!(
+            std::fs::read_to_string(state.join(".credentials.json")).unwrap(),
+            "existing"
+        );
     }
 
     #[test]
@@ -230,14 +263,29 @@ mod tests {
         seed_claude_config_json(&path, "/proj").unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         // Big integers survive without float mangling.
-        assert!(raw.contains("1784592922215"), "large number not preserved:\n{raw}");
+        assert!(
+            raw.contains("1784592922215"),
+            "large number not preserved:\n{raw}"
+        );
 
         let m: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert!(m.get("oauthAccount").is_some(), "oauthAccount (login) dropped");
-        assert_eq!(m["hasCompletedOnboarding"], false, "existing onboarding overwritten");
-        assert!(m["projects"].get("/other").is_some(), "existing project trust dropped");
+        assert!(
+            m.get("oauthAccount").is_some(),
+            "oauthAccount (login) dropped"
+        );
+        assert_eq!(
+            m["hasCompletedOnboarding"], false,
+            "existing onboarding overwritten"
+        );
+        assert!(
+            m["projects"].get("/other").is_some(),
+            "existing project trust dropped"
+        );
         assert_eq!(m["projects"]["/proj"]["hasTrustDialogAccepted"], true);
-        assert_eq!(m["projects"]["/proj"]["hasCompletedProjectOnboarding"], true);
+        assert_eq!(
+            m["projects"]["/proj"]["hasCompletedProjectOnboarding"],
+            true
+        );
     }
 
     #[test]

@@ -96,7 +96,10 @@ mod tests {
 
     #[test]
     fn terminal_env_defaults_to_xterm() {
-        assert_eq!(terminal_env_from(None, None, None, None), ["--env", "TERM=xterm-256color"]);
+        assert_eq!(
+            terminal_env_from(None, None, None, None),
+            ["--env", "TERM=xterm-256color"]
+        );
         // Empty strings are treated as unset.
         assert_eq!(
             terminal_env_from(Some(""), Some(""), Some(""), Some("")),
@@ -106,11 +109,19 @@ mod tests {
 
     #[test]
     fn terminal_env_forwards_set_vars() {
-        let got = terminal_env_from(Some("screen-256color"), Some("truecolor"), Some("Apple_Terminal"), None);
+        let got = terminal_env_from(
+            Some("screen-256color"),
+            Some("truecolor"),
+            Some("Apple_Terminal"),
+            None,
+        );
         let want = [
-            "--env", "TERM=screen-256color",
-            "--env", "COLORTERM=truecolor",
-            "--env", "TERM_PROGRAM=Apple_Terminal",
+            "--env",
+            "TERM=screen-256color",
+            "--env",
+            "COLORTERM=truecolor",
+            "--env",
+            "TERM_PROGRAM=Apple_Terminal",
         ];
         assert_eq!(got, want);
     }
@@ -131,8 +142,14 @@ mod tests {
         let m = git_config_mount(&home, &cache);
         assert_eq!(
             m,
-            vec!["--volume".to_string(), format!("{}:/home/dev/.gitconfig", dst.display())]
+            vec![
+                "--volume".to_string(),
+                format!("{}:/home/dev/.gitconfig", dst.display())
+            ]
         );
-        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "[user]\n\tname = X\n");
+        assert_eq!(
+            std::fs::read_to_string(&dst).unwrap(),
+            "[user]\n\tname = X\n"
+        );
     }
 }

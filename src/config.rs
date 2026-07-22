@@ -45,9 +45,14 @@ pub(crate) struct NetConfig {
 /// The lowest-precedence layer.
 fn default_config() -> Config {
     Config {
-        run: RunConfig { blocked_dirs: Some(vec!["~".into(), "/".into()]) },
+        run: RunConfig {
+            blocked_dirs: Some(vec!["~".into(), "/".into()]),
+        },
         toolchains: ToolchainsConfig::default(),
-        net: NetConfig { allow: None, mode: Some("enforce".into()) },
+        net: NetConfig {
+            allow: None,
+            mode: Some("enforce".into()),
+        },
     }
 }
 
@@ -178,13 +183,20 @@ mod tests {
         )
         .unwrap();
         let project = temp_dir();
-        std::fs::write(project.join(".vhrn.toml"), "[net]\nallow = [\"project.example\"]\n").unwrap();
+        std::fs::write(
+            project.join(".vhrn.toml"),
+            "[net]\nallow = [\"project.example\"]\n",
+        )
+        .unwrap();
 
         let cfg = load_config(&config_dir, &project).unwrap();
         assert_eq!(cfg.net.allow, Some(vec!["project.example".to_string()])); // project overrides
         assert_eq!(cfg.net.mode, Some("report".to_string())); // inherited from global
         assert_eq!(cfg.toolchains.tools, Some(vec!["go@1.26".to_string()]));
-        assert_eq!(cfg.run.blocked_dirs, Some(vec!["~".to_string(), "/".to_string()])); // default
+        assert_eq!(
+            cfg.run.blocked_dirs,
+            Some(vec!["~".to_string(), "/".to_string()])
+        ); // default
     }
 
     #[test]
@@ -201,29 +213,47 @@ mod tests {
         let blocked = vec!["~".to_string(), "/".to_string()];
 
         // Exact $HOME and exact / are refused.
-        assert!(check_blocked_dir(home, home, &blocked).is_err(), "cwd == $HOME should be blocked");
-        assert!(check_blocked_dir("/", home, &["/".to_string()]).is_err(), "cwd == / should be blocked");
+        assert!(
+            check_blocked_dir(home, home, &blocked).is_err(),
+            "cwd == $HOME should be blocked"
+        );
+        assert!(
+            check_blocked_dir("/", home, &["/".to_string()]).is_err(),
+            "cwd == / should be blocked"
+        );
 
         // A subdirectory of home is allowed — exact-match, not subtree.
         let sub = Path::new(home).join("projects").join("x");
         std::fs::create_dir_all(&sub).unwrap();
         let sub = sub.to_str().unwrap();
-        assert!(check_blocked_dir(sub, home, &blocked).is_ok(), "a project under $HOME must run");
+        assert!(
+            check_blocked_dir(sub, home, &blocked).is_ok(),
+            "a project under $HOME must run"
+        );
 
         // No blocked dirs -> nothing refused.
-        assert!(check_blocked_dir(home, home, &[]).is_ok(), "empty blocked list should allow anything");
+        assert!(
+            check_blocked_dir(home, home, &[]).is_ok(),
+            "empty blocked list should allow anything"
+        );
     }
 
     #[test]
     fn merge_overlays_only_set_fields() {
         let over = Config {
-            net: NetConfig { allow: Some(vec!["x".into()]), mode: None },
+            net: NetConfig {
+                allow: Some(vec!["x".into()]),
+                mode: None,
+            },
             ..Config::default()
         };
         let merged = merge_config(default_config(), over);
         assert_eq!(merged.net.allow, Some(vec!["x".to_string()])); // set in over
         assert_eq!(merged.net.mode.as_deref(), Some("enforce")); // inherited from default
-        assert_eq!(merged.run.blocked_dirs, Some(vec!["~".to_string(), "/".to_string()])); // inherited
+        assert_eq!(
+            merged.run.blocked_dirs,
+            Some(vec!["~".to_string(), "/".to_string()])
+        ); // inherited
         assert_eq!(merged.toolchains.tools, None); // set nowhere
     }
 
