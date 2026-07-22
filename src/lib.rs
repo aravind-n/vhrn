@@ -15,6 +15,7 @@ mod env;
 mod harness;
 mod image;
 mod net;
+mod persist;
 mod run;
 mod shell;
 
