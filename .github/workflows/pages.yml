@@ -1,0 +1,38 @@
+name: Pages
+
+# Publishes pages/ (the installer + landing page) to GitHub Pages on master.
+# Never from a PR or branch; the job-level `if` is defence-in-depth so a future
+# trigger addition can't accidentally publish from somewhere else.
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'pages/**'
+      - '.github/workflows/pages.yml'
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    name: Deploy
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages
+      - id: deployment
+        uses: actions/deploy-pages@v4
