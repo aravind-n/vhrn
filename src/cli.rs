@@ -90,10 +90,10 @@ fn run_list(_args: &[String]) -> i32 {
 
 /// The wrapper-owned flags consumed before the agent's own args.
 #[derive(Debug, Default, PartialEq)]
-struct RunFlags {
-    open_net: bool,           // --open-net: drop the egress guard this run
-    extra_allow: Vec<String>, // --allow: session additions to the allowlist
-    rest: Vec<String>,        // everything forwarded to the agent verbatim
+pub(crate) struct RunFlags {
+    pub open_net: bool,           // --open-net: drop the egress guard this run
+    pub extra_allow: Vec<String>, // --allow: session additions to the allowlist
+    pub rest: Vec<String>,        // everything forwarded to the agent verbatim
 }
 
 /// Consume wrapper flags up front then forward the rest verbatim, mirroring

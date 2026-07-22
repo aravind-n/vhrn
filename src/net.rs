@@ -18,7 +18,7 @@ pub(crate) enum Mode {
 
 impl Mode {
     /// The wire string written to the mode file and VHRN_NET.
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Mode::Enforce => "enforce",
             Mode::Report => "report",
@@ -39,11 +39,30 @@ impl Mode {
 
 /// Pick the egress mode for a run: `--open-net` wins, else the config's net.mode,
 /// else enforce. An unrecognized config value falls back to enforce.
-fn resolve_mode(config_mode: &str, open_net: bool) -> Mode {
+pub(crate) fn resolve_mode(config_mode: &str, open_net: bool) -> Mode {
     if open_net {
         return Mode::Open;
     }
     Mode::from_str(config_mode).unwrap_or(Mode::Enforce)
+}
+
+/// Prepare the egress policy for a run and return the policy dir (to mount into the
+/// proxy): ensure the dir, seed the default allowlist if absent, add the config- and
+/// session-declared domains, write the mode, and truncate the deny log.
+pub(crate) fn prepare_policy(
+    cache: &Path,
+    mode: Mode,
+    config_allow: &[String],
+    extra_allow: &[String],
+) -> std::io::Result<PathBuf> {
+    let np = NetPolicy::new(cache);
+    np.ensure()?;
+    np.seed_allowlist_if_absent();
+    np.append_missing(config_allow);
+    np.append_missing(extra_allow);
+    np.write_mode(mode.as_str());
+    np.truncate_deny_log();
+    Ok(np.dir)
 }
 
 // Seeded on first run; never clobbers later edits. 12 domains + 2 comment lines.

@@ -33,7 +33,7 @@ fn terminal_env_from(
 
 /// Forward the terminal identity verbatim — Claude branches per-terminal rendering on
 /// these, so they are never forced or invented.
-fn terminal_env() -> Vec<String> {
+pub(crate) fn terminal_env() -> Vec<String> {
     let get = |k: &str| std::env::var(k).ok();
     terminal_env_from(
         get("TERM").as_deref(),
@@ -46,7 +46,7 @@ fn terminal_env() -> Vec<String> {
 /// Resolve a GitHub token — explicit env wins, else `gh auth token` (the only route
 /// that works with macOS Keychain storage) — and pass it as GH_TOKEN. Empty when the
 /// host has no gh login.
-fn gh_token_env() -> Vec<String> {
+pub(crate) fn gh_token_env() -> Vec<String> {
     let mut tok = std::env::var("GH_TOKEN").unwrap_or_default();
     if tok.is_empty() {
         tok = std::env::var("GITHUB_TOKEN").unwrap_or_default();
@@ -67,7 +67,7 @@ fn gh_token_env() -> Vec<String> {
 /// Copy the host ~/.gitconfig into the cache (dereferencing symlinks) and mount it at
 /// /home/dev/.gitconfig so in-box commits use the user's identity. A disposable copy,
 /// re-synced each run. Empty when absent.
-fn git_config_mount(home: &Path, cache: &Path) -> Vec<String> {
+pub(crate) fn git_config_mount(home: &Path, cache: &Path) -> Vec<String> {
     let src = home.join(".gitconfig");
     let dst = cache.join("gitconfig");
     if !src.is_file() {

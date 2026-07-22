@@ -13,7 +13,7 @@ const PROXY_IMAGE_NAME: &str = "vhrn-proxy";
 const DEFAULT_REGISTRY: &str = "ghcr.io/aravind-n";
 /// Marks a make-built image used as-is (bare name, no registry) rather than one
 /// pulled from the registry.
-const LOCAL_VERSION: &str = "local";
+pub(crate) const LOCAL_VERSION: &str = "local";
 
 /// Pick the registry base from an injected env value: `VHRN_REGISTRY` when set and
 /// non-empty, else the default. Split from the read so it is unit-testable without
@@ -26,7 +26,7 @@ fn resolve_registry(env: Option<&str>) -> String {
 }
 
 /// The registry base, reading `VHRN_REGISTRY` at the edge.
-fn registry_base() -> String {
+pub(crate) fn registry_base() -> String {
     resolve_registry(std::env::var("VHRN_REGISTRY").ok().as_deref())
 }
 
@@ -46,7 +46,7 @@ fn parse_harness_arg(arg: &str) -> (String, String) {
 /// a make-built install, else the versioned registry ref. `registry` is the resolved
 /// base (see registry_base). The proxy is pinned to the same version, so a box and
 /// its proxy are always a set.
-fn harness_image_ref(registry: &str, h: &Harness, version: &str) -> String {
+pub(crate) fn harness_image_ref(registry: &str, h: &Harness, version: &str) -> String {
     if version == LOCAL_VERSION {
         h.image.clone()
     } else {
@@ -55,7 +55,7 @@ fn harness_image_ref(registry: &str, h: &Harness, version: &str) -> String {
 }
 
 /// The egress proxy ref, pinned to the same version as the harness it serves.
-fn proxy_image_ref(registry: &str, version: &str) -> String {
+pub(crate) fn proxy_image_ref(registry: &str, version: &str) -> String {
     if version == LOCAL_VERSION {
         PROXY_IMAGE_NAME.to_string()
     } else {

@@ -74,7 +74,7 @@ fn merge_config(base: Config, over: Config) -> Config {
 /// the global `config.toml` under `config_dir`, then the project's `.vhrn.toml`.
 /// Missing files are not an error; a malformed one is. `config_dir` is injected (the
 /// caller resolves it from XDG) so this is testable without touching process env.
-fn load_config(config_dir: &Path, project: &Path) -> Result<Config> {
+pub(crate) fn load_config(config_dir: &Path, project: &Path) -> Result<Config> {
     let mut cfg = default_config();
     for path in [config_dir.join("config.toml"), project.join(".vhrn.toml")] {
         if let Some(c) = read_config_file(&path)? {
@@ -100,7 +100,7 @@ fn read_config_file(path: &Path) -> Result<Option<Config>> {
 /// is exact, not subtree: subtree-blocking ~ would refuse every project under $HOME,
 /// so exact-match is what prevents jailing all of $HOME or / while leaving ordinary
 /// projects runnable.
-fn check_blocked_dir(project: &str, home: &str, blocked: &[String]) -> Result<()> {
+pub(crate) fn check_blocked_dir(project: &str, home: &str, blocked: &[String]) -> Result<()> {
     for b in blocked {
         if resolve_dir(b, home) == project {
             bail!("refusing to run in {project} (blocked_dirs); cd into a project subdirectory");
