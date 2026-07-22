@@ -46,7 +46,7 @@ pub(crate) fn parse_harness_arg(arg: &str) -> (String, String) {
 
 /// The image to run for a harness at an installed version: the bare local image for
 /// a make-built install, else the versioned registry ref. `registry` is the resolved
-/// base (see registry_base). The proxy is pinned to the same version, so a box and
+/// base (see `registry_base`). The proxy is pinned to the same version, so a box and
 /// its proxy are always a set.
 pub(crate) fn harness_image_ref(registry: &str, h: &Harness, version: &str) -> String {
     if version == LOCAL_VERSION {

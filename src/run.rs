@@ -1,6 +1,6 @@
 //! The run path — box preparation, engine selection, the proxy sidecar, and the
 //! small host-side path/exec helpers the run and subcommand handlers share. Ports
-//! history_key + these helpers now; the engine and box launch arrive in a later phase.
+//! `history_key` + these helpers now; the engine and box launch arrive in a later phase.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -58,8 +58,7 @@ pub(crate) fn look_path(name: &str) -> bool {
     };
     std::env::split_paths(&paths).any(|dir| {
         std::fs::metadata(dir.join(name))
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     })
 }
 
@@ -639,7 +638,7 @@ mod tests {
             "--model", "opus",
         ]
         .iter()
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
 
         assert_eq!(args, expected);

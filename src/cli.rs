@@ -6,7 +6,7 @@ use anyhow::{Result, bail};
 
 // Subcommand-first help. Bare `vhrn` prints it; a harness runs as `vhrn <harness>
 // …`. Transcribed from the Go usageText (internal/vhrn/usage.go).
-const USAGE: &str = r#"vhrn runs coding agents in a container jailed to the current project, with
+const USAGE: &str = r"vhrn runs coding agents in a container jailed to the current project, with
 default-deny network egress.
 
 Usage:
@@ -44,7 +44,7 @@ Environment:
   VHRN_IMAGE         box image name (default: per-harness, e.g. vhrn-claude)
   VHRN_PROXY_IMAGE   proxy image name (default: vhrn-proxy)
   VHRN_PROXY_PORT    proxy port (default: 8080)
-"#;
+";
 
 /// Entry point: dispatch argv (already stripped of the program name) and return a
 /// process exit code, matching the Go `vhrn.Run`.
@@ -52,7 +52,7 @@ Environment:
 /// Port in progress — `help`/`net`/`install`/`uninstall`/`list` and running a harness
 /// are wired now; an unknown command still falls through to usage (the exit-2 path
 /// lands at the cutover phase).
-pub fn run(args: Vec<String>) -> i32 {
+pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         None | Some("help" | "-h" | "--help") => {
             print!("{USAGE}");
@@ -64,29 +64,30 @@ pub fn run(args: Vec<String>) -> i32 {
         Some("list") => run_list(&args[1..]),
         // A known harness runs that agent; the wrapper's own flags come right after
         // it, then everything else forwards to the agent verbatim.
-        Some(cmd) => match crate::harness::lookup_harness(cmd) {
-            Some(h) => match parse_run_flags(&args[1..]) {
-                Ok(flags) => match crate::run::run_harness(&h, &flags) {
-                    Ok(code) => code,
-                    // Wrapper-level failures get a message; the agent's own non-zero
-                    // exit is returned verbatim above.
+        Some(cmd) => {
+            if let Some(h) = crate::harness::lookup_harness(cmd) {
+                match parse_run_flags(&args[1..]) {
+                    Ok(flags) => match crate::run::run_harness(&h, &flags) {
+                        Ok(code) => code,
+                        // Wrapper-level failures get a message; the agent's own non-zero
+                        // exit is returned verbatim above.
+                        Err(e) => {
+                            eprintln!("vhrn: {e}");
+                            1
+                        }
+                    },
                     Err(e) => {
                         eprintln!("vhrn: {e}");
-                        1
+                        2
                     }
-                },
-                Err(e) => {
-                    eprintln!("vhrn: {e}");
-                    2
                 }
-            },
-            // Unknown-command handling (exit 2) arrives at the cutover phase; until
-            // then an unrecognized command falls through to usage.
-            None => {
+            } else {
+                // Unknown-command handling (exit 2) arrives at the cutover phase; until
+                // then an unrecognized command falls through to usage.
                 print!("{USAGE}");
                 0
             }
-        },
+        }
     }
 }
 
@@ -122,7 +123,7 @@ fn run_install(args: &[String]) -> i32 {
         if a == "--local" {
             local = true;
         } else if arg.is_empty() {
-            arg = a.clone();
+            arg.clone_from(a);
         }
     }
     if arg.is_empty() {
@@ -193,7 +194,7 @@ fn run_uninstall(args: &[String]) -> i32 {
         if a == "--image" {
             rm_image = true;
         } else if name.is_empty() {
-            name = a.clone();
+            name.clone_from(a);
         }
     }
     if name.is_empty() {
@@ -224,7 +225,7 @@ fn run_uninstall(args: &[String]) -> i32 {
     let mut alias = name.clone();
     match crate::harness::lookup_harness(&name) {
         Some(h) => {
-            alias = h.alias.clone();
+            alias.clone_from(&h.alias);
             if rm_image && version.is_none() {
                 eprintln!("vhrn: {name:?} was not installed; no image to remove");
             } else if rm_image && let Ok(engine) = crate::run::detect_engine() {
@@ -302,14 +303,14 @@ mod tests {
     use super::*;
 
     fn v(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
+        items.iter().map(std::string::ToString::to_string).collect()
     }
 
     // Smoke test: the entry point is callable and returns success.
     #[test]
     fn run_prints_usage_and_succeeds() {
-        assert_eq!(run(Vec::new()), 0);
-        assert_eq!(run(vec!["help".to_string()]), 0);
+        assert_eq!(run(&[]), 0);
+        assert_eq!(run(&["help".to_string()]), 0);
     }
 
     #[test]

@@ -69,6 +69,7 @@ fn is_installed(config_dir: &Path, name: &str) -> bool {
 /// Write the registry atomically (same-dir temp + rename), sorted and de-duplicated
 /// by name, one "name version" per line.
 pub(crate) fn write_installed(config_dir: &Path, hs: &[InstalledHarness]) -> std::io::Result<()> {
+    use std::fmt::Write as _;
     std::fs::create_dir_all(config_dir)?;
     let mut sorted: Vec<&InstalledHarness> = hs.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
@@ -79,7 +80,7 @@ pub(crate) fn write_installed(config_dir: &Path, hs: &[InstalledHarness]) -> std
             continue;
         }
         let version = if h.version.is_empty() { "latest" } else { h.version.as_str() };
-        buf.push_str(&format!("{} {version}\n", h.name));
+        let _ = writeln!(buf, "{} {version}", h.name);
     }
     let tmp = config_dir.join(format!("installed.{}.{}", std::process::id(), next_tmp_id()));
     std::fs::write(&tmp, &buf)?;
@@ -206,7 +207,7 @@ pub(crate) fn current_shell() -> Option<String> {
 
 /// The rc files to manage: the known-shell rc files that already exist, plus the
 /// current shell's (created if missing). `shell` is injected (the caller reads
-/// `$SHELL` via current_shell).
+/// `$SHELL` via `current_shell`).
 fn rc_targets(home: &Path, shell: Option<&str>) -> BTreeMap<String, PathBuf> {
     let all = [
         ("bash", home.join(".bashrc")),

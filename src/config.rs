@@ -111,7 +111,7 @@ pub(crate) fn check_blocked_dir(project: &str, home: &str, blocked: &[String]) -
 }
 
 /// Expand a leading `~` then resolve symlinks so a blocked entry can be compared
-/// against the physical cwd (which prepare_box has already resolved). Falls back to
+/// against the physical cwd (which `prepare_box` has already resolved). Falls back to
 /// a lexical clean when the path does not exist.
 fn resolve_dir(p: &str, home: &str) -> String {
     let expanded = if p == "~" {
@@ -138,7 +138,7 @@ fn clean_path(p: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
     for seg in p.split('/') {
         match seg {
-            "" | "." => continue,
+            "" | "." => {}
             ".." => {
                 if out.last().is_some_and(|s| *s != "..") {
                     out.pop();

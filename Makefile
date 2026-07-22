@@ -48,8 +48,10 @@ endif
 # Build every image the CLI needs: shared base, its egress proxy, and the claude harness.
 build: build-base build-proxy build-claude
 
-# CLI (cargo) + proxy (its own dependency-free module) unit tests.
+# CLI (cargo) lint + tests, plus the proxy (its own dependency-free module) tests.
+# Clippy runs first with -D warnings so any lint fails the suite.
 test:
+	cargo clippy --all-targets -- -D warnings
 	cargo test
 	cd $(PROXY_DIR) && go test ./...
 

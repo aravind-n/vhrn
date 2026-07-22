@@ -2,7 +2,7 @@
 //! deny-log) lives under `<cache>/net` and is mounted only into the proxy, never the
 //! box, so an in-box process can never widen its own egress; `vhrn net …` is the only
 //! path that mutates it. The mode string is a byte-level contract (mode file +
-//! VHRN_NET), so it round-trips through as_str/from_str unchanged. Ports net.go.
+//! `VHRN_NET`), so it round-trips through `as_str/from_str` unchanged. Ports net.go.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -18,7 +18,7 @@ pub(crate) enum Mode {
 }
 
 impl Mode {
-    /// The wire string written to the mode file and VHRN_NET.
+    /// The wire string written to the mode file and `VHRN_NET`.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Mode::Enforce => "enforce",
@@ -68,7 +68,7 @@ pub(crate) fn prepare_policy(
 
 /// Seed the egress policy for an install: ensure the policy dir, write the default
 /// allowlist if absent, then union the harness's default domains in (append-if-missing,
-/// so later user edits survive). Unlike prepare_policy this touches neither the mode
+/// so later user edits survive). Unlike `prepare_policy` this touches neither the mode
 /// file nor the deny log — an install only ever widens the allowlist.
 pub(crate) fn seed_allowlist(cache: &Path, domains: &[String]) -> std::io::Result<()> {
     let np = NetPolicy::new(cache);
@@ -79,7 +79,7 @@ pub(crate) fn seed_allowlist(cache: &Path, domains: &[String]) -> std::io::Resul
 }
 
 // Seeded on first run; never clobbers later edits. 12 domains + 2 comment lines.
-const DEFAULT_ALLOWLIST: &str = r#"# vhrn egress allowlist — one domain per line, matching the domain and its
+const DEFAULT_ALLOWLIST: &str = r"# vhrn egress allowlist — one domain per line, matching the domain and its
 # subdomains. Edit freely, or run `vhrn net allow <domain>` while a box runs.
 api.anthropic.com
 claude.ai
@@ -93,7 +93,7 @@ pypi.org
 files.pythonhosted.org
 astral.sh
 mise.jdx.dev
-"#;
+";
 
 /// Locates the host-side egress policy files under `<cache>/net`.
 struct NetPolicy {
@@ -150,6 +150,7 @@ impl NetPolicy {
     /// Append domains not already present (exact line match), mirroring the run path's
     /// --allow handling. Non-atomic, as in the wrapper's run path.
     fn append_missing(&self, domains: &[String]) {
+        use std::io::Write;
         if domains.is_empty() {
             return;
         }
@@ -158,7 +159,6 @@ impl NetPolicy {
         else {
             return;
         };
-        use std::io::Write;
         for d in domains {
             if set.insert(d.clone()) {
                 let _ = writeln!(f, "{d}");
@@ -251,8 +251,7 @@ pub(crate) fn run_net(args: &[String]) -> i32 {
     match cmd {
         "status" => {
             let mode = std::fs::read_to_string(&np.mode_file)
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|_| "enforce".to_string());
+                .map_or_else(|_| "enforce".to_string(), |s| s.trim().to_string());
             println!("mode:    {mode}");
             println!("allowed: {} domain(s) ({})", np.count_domains(), np.allowlist.display());
         }

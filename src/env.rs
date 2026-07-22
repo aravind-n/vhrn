@@ -45,7 +45,7 @@ pub(crate) fn terminal_env() -> Vec<String> {
 }
 
 /// Resolve a GitHub token — explicit env wins, else `gh auth token` (the only route
-/// that works with macOS Keychain storage) — and pass it as GH_TOKEN. Empty when the
+/// that works with macOS Keychain storage) — and pass it as `GH_TOKEN`. Empty when the
 /// host has no gh login.
 pub(crate) fn gh_token_env() -> Vec<String> {
     let mut tok = std::env::var("GH_TOKEN").unwrap_or_default();

@@ -59,7 +59,7 @@ fn bootstrap_credentials(home: &Path, state: &Path, h: &Harness) {
 
 /// Ensure the box-owned config JSON has onboarding completed and this project
 /// pre-trusted, without disturbing anything the box wrote (login/oauthAccount, other
-/// projects). Numbers are preserved exactly (arbitrary_precision), and an unparseable
+/// projects). Numbers are preserved exactly (`arbitrary_precision`), and an unparseable
 /// box-owned file is left untouched rather than clobbered.
 fn seed_claude_config_json(path: &Path, project: &str) -> Result<()> {
     use serde_json::{Map, Value};
@@ -165,7 +165,7 @@ pub(crate) fn write_box_guide(real_claude: &Path, sandbox: &Path, open_net: bool
     std::fs::write(sandbox.join("CLAUDE.md"), b)
 }
 
-const BOX_GUIDE_HEADER: &str = r#"
+const BOX_GUIDE_HEADER: &str = r"
 # vhrn environment
 
 You are running inside vhrn: a container jailed to this project with a
@@ -174,7 +174,7 @@ network egress guard. Adapt as follows:
 - **No sudo, no apt.** Install tools in user space: `mise use -g <tool>` for
   runtimes (node, go, python, ...), `uv tool install <pkg>` for Python CLIs, and
   `npm i -g <pkg>` after `mise use -g node` for npm CLIs.
-"#;
+";
 
 const BOX_GUIDE_OPEN: &str =
     "- **Network egress is unrestricted this session** (the guard is off via `--open-net`).\n";
