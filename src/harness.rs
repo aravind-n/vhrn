@@ -53,12 +53,12 @@ fn registry() -> Vec<Harness> {
 }
 
 /// The spec for `name`, or `None` if it is not a known harness.
-fn lookup_harness(name: &str) -> Option<Harness> {
+pub(crate) fn lookup_harness(name: &str) -> Option<Harness> {
     registry().into_iter().find(|h| h.name == name)
 }
 
 /// The known harness names, sorted for stable output.
-fn harness_names() -> Vec<String> {
+pub(crate) fn harness_names() -> Vec<String> {
     let mut names: Vec<String> = registry().into_iter().map(|h| h.name).collect();
     names.sort();
     names
