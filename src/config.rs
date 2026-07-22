@@ -70,6 +70,32 @@ fn merge_config(base: Config, over: Config) -> Config {
     out
 }
 
+/// Read and merge the config layers in precedence order — built-in defaults, then
+/// the global `config.toml` under `config_dir`, then the project's `.vhrn.toml`.
+/// Missing files are not an error; a malformed one is. `config_dir` is injected (the
+/// caller resolves it from XDG) so this is testable without touching process env.
+fn load_config(config_dir: &Path, project: &Path) -> Result<Config> {
+    let mut cfg = default_config();
+    for path in [config_dir.join("config.toml"), project.join(".vhrn.toml")] {
+        if let Some(c) = read_config_file(&path)? {
+            cfg = merge_config(cfg, c);
+        }
+    }
+    Ok(cfg)
+}
+
+/// Parse one TOML config file; a missing file yields `None`.
+fn read_config_file(path: &Path) -> Result<Option<Config>> {
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let cfg: Config =
+        toml::from_str(&data).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    Ok(Some(cfg))
+}
+
 /// Refuse to launch when the resolved cwd exactly matches a blocked dir. The match
 /// is exact, not subtree: subtree-blocking ~ would refuse every project under $HOME,
 /// so exact-match is what prevents jailing all of $HOME or / while leaving ordinary
@@ -135,23 +161,37 @@ fn clean_path(p: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::testutil::temp_dir;
 
-    // A fresh, canonicalized temp dir (the tempfile crate isn't in the budget).
-    // Canonicalized so comparisons mirror prepare_box's physical cwd — on macOS the
-    // system temp dir lives under the /var -> /private/var symlink.
-    fn temp_dir() -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir()
-            .join(format!("vhrn-cfg-test-{}-{n}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::canonicalize(&dir).unwrap()
+    #[test]
+    fn load_config_no_files_yields_defaults() {
+        let cfg = load_config(&temp_dir(), &temp_dir()).unwrap();
+        assert_eq!(cfg, default_config());
+    }
+
+    #[test]
+    fn load_config_precedence() {
+        let config_dir = temp_dir();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[toolchains]\ntools = [\"go@1.26\"]\n[net]\nmode = \"report\"\nallow = [\"global.example\"]\n",
+        )
+        .unwrap();
+        let project = temp_dir();
+        std::fs::write(project.join(".vhrn.toml"), "[net]\nallow = [\"project.example\"]\n").unwrap();
+
+        let cfg = load_config(&config_dir, &project).unwrap();
+        assert_eq!(cfg.net.allow, Some(vec!["project.example".to_string()])); // project overrides
+        assert_eq!(cfg.net.mode, Some("report".to_string())); // inherited from global
+        assert_eq!(cfg.toolchains.tools, Some(vec!["go@1.26".to_string()]));
+        assert_eq!(cfg.run.blocked_dirs, Some(vec!["~".to_string(), "/".to_string()])); // default
+    }
+
+    #[test]
+    fn load_config_malformed_is_error() {
+        let project = temp_dir();
+        std::fs::write(project.join(".vhrn.toml"), "this is = not valid = toml").unwrap();
+        assert!(load_config(&temp_dir(), &project).is_err());
     }
 
     #[test]
