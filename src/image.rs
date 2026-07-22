@@ -2,11 +2,13 @@
 //! overrides the default registry. Ports the pure parts of images.go + toolchain.go;
 //! the image pull and the derived toolchain build land in later phases.
 
-use crate::harness::Harness;
-use anyhow::{Result, bail};
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+
+use anyhow::{Result, bail};
+use sha2::{Digest, Sha256};
+
+use crate::harness::Harness;
 
 const BASE_IMAGE_NAME: &str = "vhrn-base";
 const PROXY_IMAGE_NAME: &str = "vhrn-proxy";

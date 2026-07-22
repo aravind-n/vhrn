@@ -4,9 +4,10 @@
 //! path that mutates it. The mode string is a byte-level contract (mode file +
 //! VHRN_NET), so it round-trips through as_str/from_str unchanged. Ports net.go.
 
-use crate::run::set_mode;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+use crate::run::set_mode;
 
 /// The egress guard mode for a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

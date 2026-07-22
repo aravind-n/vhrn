@@ -4,8 +4,9 @@
 //! to a lower-precedence layer. Ports config.go's pure parts (structs + merge +
 //! blocked-dir check); the TOML load chain lands in a later phase.
 
-use anyhow::{Result, bail};
 use std::path::Path;
+
+use anyhow::{Result, bail};
 
 /// The merged configuration.
 #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
