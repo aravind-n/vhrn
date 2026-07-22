@@ -53,6 +53,13 @@ pub(crate) fn look_path(name: &str) -> bool {
     })
 }
 
+/// Set a path's unix permission bits (safe — the crate forbids unsafe). Used for the
+/// world-writable policy dir/log and the private creds/.claude.json.
+pub(crate) fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
