@@ -3,7 +3,11 @@
 //! history_key + these helpers now; the engine and box launch arrive in a later phase.
 
 use anyhow::{Result, bail};
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// Reproduce Claude's `projects/<key>` encoding so in-box history unifies with
 /// native history: every character outside `[A-Za-z0-9]` becomes `-`
@@ -95,6 +99,143 @@ pub(crate) fn env_or(key: &str, def: &str) -> String {
     }
 }
 
+/// A running egress-proxy sidecar. The box's in-container firewall pins all egress to
+/// it; policy files live host-side and are mounted only into this sidecar.
+#[derive(Clone)]
+pub(crate) struct Proxy {
+    engine: String,
+    name: String,
+}
+
+impl Proxy {
+    fn stop(&self) {
+        let _ = Command::new(&self.engine).args(["stop", &self.name]).status();
+    }
+
+    fn inspect_ip(&self) -> String {
+        if self.engine == "docker" {
+            let out = Command::new("docker")
+                .args([
+                    "inspect",
+                    "-f",
+                    "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                    &self.name,
+                ])
+                .output();
+            return match out {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                _ => String::new(),
+            };
+        }
+        // Apple `container inspect` prints JSON; scan it for the first dotted quad.
+        match Command::new("container").args(["inspect", &self.name]).output() {
+            Ok(o) if o.status.success() => first_ipv4(&String::from_utf8_lossy(&o.stdout)),
+            _ => String::new(),
+        }
+    }
+}
+
+/// Launch the detached proxy sidecar and resolve its IP (engines differ; retry until
+/// it has one). `policy_dir` is the host-side net policy dir, mounted into the proxy
+/// only — never the box.
+pub(crate) fn start_proxy(engine: &str, image: &str, policy_dir: &Path, port: &str) -> Result<(Proxy, String)> {
+    let name = format!("vhrn-proxy-{}", std::process::id());
+    let status = Command::new(engine)
+        .args(["run", "-d", "--rm", "--name", &name])
+        .arg("--volume")
+        .arg(format!("{}:/etc/vhrn", policy_dir.display()))
+        .args([
+            "--env",
+            "VHRN_ALLOWLIST=/etc/vhrn/allowlist",
+            "--env",
+            "VHRN_MODE_FILE=/etc/vhrn/mode",
+            "--env",
+            "VHRN_DENY_LOG=/etc/vhrn/denied.log",
+        ])
+        .arg("--env")
+        .arg(format!("VHRN_PROXY_LISTEN=:{port}"))
+        .arg(image)
+        .stdout(Stdio::null()) // discard the container id; keep our stdout clean
+        .stderr(Stdio::inherit())
+        .status();
+    if !matches!(status, Ok(s) if s.success()) {
+        bail!("proxy failed to start (is the {image:?} image built?)");
+    }
+    let proxy = Proxy { engine: engine.to_string(), name };
+
+    let mut ip = String::new();
+    for _ in 0..30 {
+        ip = proxy.inspect_ip();
+        if !ip.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    if ip.is_empty() {
+        proxy.stop();
+        bail!("proxy failed to start (is the {image:?} image built?)");
+    }
+    Ok((proxy, ip))
+}
+
+/// The first dotted quad on the first line mentioning `ipv4Address`, matching Go's
+/// `grep -m1 ipv4Address | grep -oE <quad>`. Apple's inspect JSON escapes the CIDR
+/// slash (192.168.64.73\/24), so we match only the quad. No regex crate.
+fn first_ipv4(inspect_output: &str) -> String {
+    for line in inspect_output.split('\n') {
+        if line.contains("ipv4Address") {
+            return find_dotted_quad(line).unwrap_or_default();
+        }
+    }
+    String::new()
+}
+
+/// Find the leftmost `([0-9]{1,3}\.){3}[0-9]{1,3}` in `s`.
+fn find_dotted_quad(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    (0..b.len()).find_map(|start| match_quad(b, start).map(|end| s[start..end].to_string()))
+}
+
+// Match ([0-9]{1,3}\.){3}[0-9]{1,3} at `start`; return the end index on success.
+fn match_quad(b: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    for group in 0..4 {
+        let digits_start = i;
+        while i < b.len() && b[i].is_ascii_digit() && i - digits_start < 3 {
+            i += 1;
+        }
+        if i == digits_start {
+            return None; // needs at least one digit
+        }
+        if group < 3 {
+            if i < b.len() && b[i] == b'.' {
+                i += 1;
+            } else {
+                return None; // groups 0..2 must be followed by a dot
+            }
+        }
+    }
+    Some(i)
+}
+
+/// Keep the sidecar from leaking if vhrn is signaled. SIGTERM tears down the sidecar
+/// and exits; SIGINT is left to the interactive child (the agent) — the parent stays
+/// alive to wait and clean up on exit.
+pub(crate) fn stop_on_signal(proxy: Proxy) {
+    let Ok(mut signals) = Signals::new([SIGINT, SIGTERM]) else {
+        return; // best-effort, like Go
+    };
+    std::thread::spawn(move || {
+        for sig in signals.forever() {
+            if sig == SIGTERM {
+                proxy.stop();
+                std::process::exit(1);
+            }
+            // SIGINT: do nothing; the engine's -it forwards it to the agent.
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +270,17 @@ mod tests {
     #[test]
     fn detect_engine_explicit_missing() {
         assert!(detect_engine_from(Some("vhrn-no-such-engine-xyz"), None).is_err());
+    }
+
+    #[test]
+    fn first_ipv4_apple_and_none() {
+        // Apple container inspect escapes the CIDR slash; only the dotted quad matters.
+        let apple = r#"{
+  "networks": [
+    { "ipv4Address": "192.168.64.73\/24", "gateway": "192.168.64.1" }
+  ]
+}"#;
+        assert_eq!(first_ipv4(apple), "192.168.64.73");
+        assert_eq!(first_ipv4("no address here\nsecond line"), "");
     }
 }
