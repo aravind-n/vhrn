@@ -14,6 +14,7 @@ Usage:
   vhrn list                               show known and installed harnesses
   vhrn net <subcommand>                   manage the egress policy
   vhrn help                               show this help
+  vhrn --version                          print the version
 
 Harnesses:
   claude                   Claude Code
@@ -44,12 +45,21 @@ Environment:
   VHRN_PROXY_PORT    proxy port (default: 8080)
 ";
 
+/// The reported version: an override baked in by release/nightly CI, else the crate version.
+pub(crate) fn version() -> &'static str {
+    option_env!("VHRN_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 /// Dispatch argv (already stripped of the program name) and return a process exit
 /// code. Bare `vhrn` and `help` print usage; an unknown command is an error (exit 2).
 pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         None | Some("help" | "-h" | "--help") => {
             print!("{USAGE}");
+            0
+        }
+        Some("version" | "-V" | "--version") => {
+            println!("vhrn {}", version());
             0
         }
         Some("net") => crate::net::run_net(&args[1..]),
@@ -307,6 +317,19 @@ mod tests {
     #[test]
     fn run_unknown_command_exits_2() {
         assert_eq!(run(&["definitely-not-a-command".to_string()]), 2);
+    }
+
+    #[test]
+    fn run_version_succeeds() {
+        for a in ["version", "-V", "--version"] {
+            assert_eq!(run(&[a.to_string()]), 0, "{a}");
+        }
+    }
+
+    // With no CI override baked in, the version falls back to the crate version.
+    #[test]
+    fn version_falls_back_to_crate_version() {
+        assert_eq!(version(), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
