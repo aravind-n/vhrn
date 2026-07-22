@@ -66,6 +66,18 @@ pub(crate) fn prepare_policy(
     Ok(np.dir)
 }
 
+/// Seed the egress policy for an install: ensure the policy dir, write the default
+/// allowlist if absent, then union the harness's default domains in (append-if-missing,
+/// so later user edits survive). Unlike prepare_policy this touches neither the mode
+/// file nor the deny log — an install only ever widens the allowlist.
+pub(crate) fn seed_allowlist(cache: &Path, domains: &[String]) -> std::io::Result<()> {
+    let np = NetPolicy::new(cache);
+    np.ensure()?;
+    np.seed_allowlist_if_absent();
+    np.append_missing(domains);
+    Ok(())
+}
+
 // Seeded on first run; never clobbers later edits. 12 domains + 2 comment lines.
 const DEFAULT_ALLOWLIST: &str = r#"# vhrn egress allowlist — one domain per line, matching the domain and its
 # subdomains. Edit freely, or run `vhrn net allow <domain>` while a box runs.
@@ -327,6 +339,19 @@ mod tests {
         // Idempotent re-add.
         np.append_missing_atomic(&["docs.rs".into()]).unwrap();
         assert_eq!(np.count_domains(), base + 1);
+    }
+
+    #[test]
+    fn seed_allowlist_unions_harness_domains() {
+        let cache = crate::testutil::temp_dir();
+        // Install seeds the 12 defaults, then unions the harness domains not already
+        // present — api.anthropic.com is a default (no-op); example.test is new.
+        seed_allowlist(&cache, &["api.anthropic.com".into(), "example.test".into()]).unwrap();
+        let np = NetPolicy::new(&cache);
+        assert_eq!(np.count_domains(), 13, "12 defaults + 1 new harness domain");
+        // Idempotent: re-seeding the same domain adds nothing.
+        seed_allowlist(&cache, &["example.test".into()]).unwrap();
+        assert_eq!(np.count_domains(), 13);
     }
 
     #[test]
