@@ -14,5 +14,6 @@ mod config;
 mod harness;
 mod image;
 mod net;
+mod run;
 
 pub use cli::run;
