@@ -49,8 +49,9 @@ Environment:
 /// Entry point: dispatch argv (already stripped of the program name) and return a
 /// process exit code, matching the Go `vhrn.Run`.
 ///
-/// Port in progress — `help`/`net`/`list` are wired now; `install`/`uninstall` and
-/// running a harness land at the cutover phase and until then fall through to usage.
+/// Port in progress — `help`/`net`/`list` and running a harness are wired now;
+/// `install`/`uninstall` land at the cutover phase and until then fall through to
+/// usage.
 pub fn run(args: Vec<String>) -> i32 {
     match args.first().map(String::as_str) {
         None | Some("help" | "-h" | "--help") => {
@@ -59,11 +60,30 @@ pub fn run(args: Vec<String>) -> i32 {
         }
         Some("net") => crate::net::run_net(&args[1..]),
         Some("list") => run_list(&args[1..]),
-        _ => {
-            // install/uninstall/harness-run dispatch arrives at the cutover phase.
-            print!("{USAGE}");
-            0
-        }
+        // A known harness runs that agent; the wrapper's own flags come right after
+        // it, then everything else forwards to the agent verbatim.
+        Some(cmd) => match crate::harness::lookup_harness(cmd) {
+            Some(h) => match parse_run_flags(&args[1..]) {
+                Ok(flags) => match crate::run::run_harness(&h, &flags) {
+                    Ok(code) => code,
+                    // Wrapper-level failures get a message; the agent's own non-zero
+                    // exit is returned verbatim above.
+                    Err(e) => {
+                        eprintln!("vhrn: {e}");
+                        1
+                    }
+                },
+                Err(e) => {
+                    eprintln!("vhrn: {e}");
+                    2
+                }
+            },
+            // install/uninstall + unknown-command handling arrive at the cutover phase.
+            None => {
+                print!("{USAGE}");
+                0
+            }
+        },
     }
 }
 
