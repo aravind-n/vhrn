@@ -28,7 +28,8 @@ jobs:
         run: |
           rustup update stable
           rustup default stable
-          rustup component add clippy
+          rustup component add clippy rustfmt
+      - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --locked
 
