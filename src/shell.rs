@@ -3,9 +3,10 @@
 //! shell-alias blocks regenerated from it. `command <name>` / `\<name>` still reach
 //! the real binary. Ports registry.go + alias.go.
 
-use crate::harness::{Harness, lookup_harness};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+use crate::harness::{Harness, lookup_harness};
 
 // ---- installed registry (registry.go) -------------------------------------------
 

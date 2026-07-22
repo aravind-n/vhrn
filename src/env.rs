@@ -3,9 +3,10 @@
 //! token is env-injected, never file-mounted; ~/.gitconfig is a disposable copy
 //! bind-mounted in. Ports env.go.
 
-use crate::run::look_path;
 use std::path::Path;
 use std::process::Command;
+
+use crate::run::look_path;
 
 /// Build the terminal `--env` args: TERM falls back to xterm-256color; the rest cross
 /// only when set (an empty value counts as unset, like Go's `getenv == ""`). Split

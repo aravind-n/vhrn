@@ -2,16 +2,18 @@
 //! small host-side path/exec helpers the run and subcommand handlers share. Ports
 //! history_key + these helpers now; the engine and box launch arrive in a later phase.
 
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use anyhow::{Result, bail};
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
+
 use crate::cli::RunFlags;
 use crate::config::Config;
 use crate::harness::Harness;
 use crate::net::Mode;
-use anyhow::{Result, bail};
-use signal_hook::consts::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Duration;
 
 /// Reproduce Claude's `projects/<key>` encoding so in-box history unifies with
 /// native history: every character outside `[A-Za-z0-9]` becomes `-`
