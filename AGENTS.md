@@ -63,11 +63,15 @@ Core behavioral invariants — keep these intact:
   stay unauthenticated. The host `~/.gitconfig` is copied into the cache and bind-mounted at
   `/home/dev/.gitconfig` (a disposable copy — change the host file).
 - **Images are pulled from a registry, not built by users.** `vhrn install <harness>[@version]`
-  pulls `vhrn-<harness>` + the same-version `vhrn-proxy` from `ghcr.io/aravind-n` (override
-  `VHRN_REGISTRY`). Image and binary versions are **decoupled**. `--local` uses `make`-built
-  images (recorded as version `local`). The installed registry (`~/.config/vhrn/installed`,
-  `name version` per line) is the source of truth the run path resolves the ref from; the
-  container and its proxy always run the same version (a matched set).
+  pulls `vhrn-<harness>` at the *agent's* version (default `latest`) plus the `vhrn-proxy`
+  matching the **CLI binary's own** version — the proxy rides the CLI's release clock, not the
+  agent's, so a container and its proxy stay a matched set and upgrading the CLI upgrades its
+  proxy (`proxy_tag` derives it: a nightly CLI → nightly proxy, a `vX.Y.Z` CLI → its own tag).
+  Override the registry with `VHRN_REGISTRY`. `--local` uses `make`-built images (version
+  `local`). The installed registry (`~/.config/vhrn/installed`, `name <tag>` per line) records
+  only the agent tag the run path resolves from. `vhrn update` re-pulls a floating install; a
+  daily `harness-images.yml` cron rebuilds a harness when its agent updates — both independent
+  of a CLI release.
 - **Config precedence: flags > `./.vhrn.toml` > `~/.config/vhrn/config.toml` > defaults**
   (`src/config.rs`, `toml` crate). `blocked_dirs` matches the resolved cwd **exactly** (not
   subtree), default `["~","/"]`. `toolchains.tools` resolves to a content-addressed derived
@@ -104,7 +108,7 @@ For a local-image dev loop: `cargo install --path . && make -C image && make -C 
 a single `ci-gate`); `nightly.yml` publishes `nightly` images + a rolling `nightly` binary
 prerelease on master; `release.yml` publishes `vX.Y.Z`+`latest` images + a GitHub Release on
 a `v*` tag. Three reusable workflows (`_test`, `_build-images`, `_build-binaries`) plus
-`pages.yml`. See `docs/RELEASING.md`.
+`pages.yml`. See `docs/runbooks/release.md`.
 
 ## Code style guidelines
 
