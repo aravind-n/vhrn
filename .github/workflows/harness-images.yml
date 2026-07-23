@@ -1,0 +1,35 @@
+# Daily refresh of the harness images, independent of a CLI release: rebuild each
+# harness FROM the current published base and republish only when the agent version
+# changed (skip_if_exists). A manual run can force a rebuild even when unchanged.
+name: harness-images
+
+on:
+  schedule:
+    - cron: '17 7 * * *'   # daily, 07:17 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: rebuild and push even if the agent version is unchanged
+        type: boolean
+        default: false
+
+concurrency:
+  group: harness-images
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  images:
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/_build-images.yml
+    with:
+      flavor: release          # publish the user-facing set: latest + version + version-date
+      components: harness       # base/proxy ride the CLI's release; only the harness here
+      push: true
+      # Skip when the agent version is already published, unless a dispatch forces it.
+      skip_if_exists: ${{ !(github.event_name == 'workflow_dispatch' && inputs.force) }}
