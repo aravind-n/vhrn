@@ -1,7 +1,7 @@
 # A vX.Y.Z tag cuts a release: full suite, then — after a maintainer approves the
 # `release` environment — the release images and a GitHub Release with the CLI binaries
 # and their checksums. Only maintainers can create v* tags (repo ruleset); see
-# docs/RELEASING.md.
+# docs/runbooks/release.md.
 name: release
 
 on:
@@ -72,6 +72,7 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes 2>/dev/null || true
           gh release upload "${GITHUB_REF_NAME}" dist/* --clobber

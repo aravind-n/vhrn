@@ -1,7 +1,8 @@
 # Reusable: build the base, proxy, and harness images multi-arch and (optionally) push
-# them to ghcr. Tags depend on `flavor`; every image gets the same set so the
-# base/proxy/harness matched-set holds. Harness images FROM the base by digest, so the
-# harness build only runs when pushing — a build-only PR validates base + proxy alone.
+# them to ghcr. `components` picks which to build (all | runtime = base + proxy |
+# harness). Tags depend on `flavor`. Harness images are FROM the base by digest when base
+# is built in the same run, else from vhrn-base:latest (else :nightly); the harness build
+# runs only when pushing, so a build-only PR validates base + proxy alone.
 name: build-images
 
 on:
@@ -18,6 +19,14 @@ on:
         description: an extra raw tag, e.g. the immutable nightly version
         type: string
         default: ''
+      components:
+        description: all | runtime (base + proxy) | harness
+        type: string
+        default: all
+      skip_if_exists:
+        description: skip the harness push when its agent version tag already exists
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -28,6 +37,7 @@ env:
 
 jobs:
   base:
+    if: ${{ inputs.components == 'all' || inputs.components == 'runtime' }}
     runs-on: ubuntu-latest
     outputs:
       digest: ${{ steps.build.outputs.digest }}
@@ -63,6 +73,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
   proxy:
+    if: ${{ inputs.components == 'all' || inputs.components == 'runtime' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -94,14 +105,18 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-  # One job per harness (add codex/aider to the matrix as they land).
+  # One job per harness (add codex/aider to the matrix as they land). Each image is
+  # probed for its agent version, which becomes both the image tag and the
+  # org.opencontainers.image.version label the host reads back.
   harness:
     needs: base
-    if: ${{ inputs.push }}
+    if: ${{ !cancelled() && inputs.push && needs.base.result != 'failure' && (inputs.components == 'all' || inputs.components == 'harness') }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        harness: [claude]
+        include:
+          - harness: claude
+            version_cmd: claude --version
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
@@ -111,24 +126,93 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      - id: date
+        run: echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      # Prefer the base just built in this run (by digest); otherwise fall back to the
+      # published base (latest, then nightly). No base at all: warn and exit 0 so a cron
+      # doesn't go red before the first base is ever published.
+      - id: base
+        env:
+          REG: ${{ env.REGISTRY }}/${{ github.repository_owner }}
+          DIGEST: ${{ needs.base.outputs.digest }}
+          HARNESS: ${{ matrix.harness }}
+        run: |
+          if [ -n "$DIGEST" ]; then
+            echo "ref=${REG}/vhrn-base@${DIGEST}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          for tag in latest nightly; do
+            if docker buildx imagetools inspect "${REG}/vhrn-base:${tag}" >/dev/null 2>&1; then
+              echo "ref=${REG}/vhrn-base:${tag}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "::warning::no vhrn-base image (latest or nightly) — skipping ${HARNESS} build"
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+
+      # Probe: build amd64 only (loaded locally, no cache so the agent's unpinned install
+      # layer is refetched), run the agent's version command, and parse the semver. The
+      # multi-arch push below reuses these layers, so amd64 users get exactly this version.
+      - id: probe
+        if: ${{ steps.base.outputs.skip != 'true' }}
+        env:
+          BASE: ${{ steps.base.outputs.ref }}
+          HARNESS: ${{ matrix.harness }}
+          VERSION_CMD: ${{ matrix.version_cmd }}
+        run: |
+          docker buildx build --load --no-cache --platform linux/amd64 \
+            --build-arg "BASE=${BASE}" --tag "vhrn-${HARNESS}:probe" "image/${HARNESS}"
+          read -ra vcmd <<< "$VERSION_CMD"
+          raw=$(docker run --rm "vhrn-${HARNESS}:probe" "${vcmd[@]}")
+          ver=$(printf '%s' "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+          [ -n "$ver" ] || { echo "::error::no version parsed from: $raw"; exit 1; }
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "probed ${HARNESS} $ver"
+
+      # Skip-if-unchanged for the harness refresh cron: nothing to do if the agent
+      # version is already published. nightly/release leave skip_if_exists false and
+      # rebuild unconditionally, so a base change still propagates.
+      - id: exists
+        if: ${{ steps.base.outputs.skip != 'true' && inputs.skip_if_exists }}
+        env:
+          REG: ${{ env.REGISTRY }}/${{ github.repository_owner }}
+          HARNESS: ${{ matrix.harness }}
+          VERSION: ${{ steps.probe.outputs.version }}
+        run: |
+          if docker buildx imagetools inspect "${REG}/vhrn-${HARNESS}:${VERSION}" >/dev/null 2>&1; then
+            echo "::notice::vhrn-${HARNESS}:${VERSION} already published — nothing to do"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - id: meta
+        if: ${{ steps.base.outputs.skip != 'true' && steps.exists.outputs.skip != 'true' }}
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/vhrn-${{ matrix.harness }}
+          # Harness tags are the agent's version, not vhrn's vX.Y.Z. The canonical
+          # <version> / <version>-<date> tags publish on release and the refresh cron
+          # (flavor release) ONLY — never nightly or a PR, so the cron's skip-if-exists
+          # check stays accurate and an unreviewed build can't claim a version tag. latest
+          # tracks the newest agent; nightly is the bleeding edge; PRs get pr-<n>.
           tags: |
             type=ref,event=pr,enable=${{ inputs.flavor == 'pr' }}
             type=sha,prefix=pr-${{ github.event.number }}-,format=short,enable=${{ inputs.flavor == 'pr' }}
+            type=raw,value=${{ steps.probe.outputs.version }},enable=${{ inputs.flavor == 'release' }}
+            type=raw,value=${{ steps.probe.outputs.version }}-${{ steps.date.outputs.date }},enable=${{ inputs.flavor == 'release' }}
             type=raw,value=nightly,enable=${{ inputs.flavor == 'nightly' }}
-            type=sha,prefix=sha-,enable=${{ inputs.flavor == 'nightly' }}
-            type=ref,event=tag,enable=${{ inputs.flavor == 'release' }}
-            type=raw,value=latest,enable=${{ inputs.flavor == 'release' }}
             type=raw,value=${{ inputs.extra_tag }},enable=${{ inputs.extra_tag != '' }}
-      - uses: docker/build-push-action@v6
+            type=raw,value=latest,enable=${{ inputs.flavor == 'release' }}
+          # The label the host reads back via inspect — same probed value as the tag.
+          labels: |
+            org.opencontainers.image.version=${{ steps.probe.outputs.version }}
+      - if: ${{ steps.base.outputs.skip != 'true' && steps.exists.outputs.skip != 'true' }}
+        uses: docker/build-push-action@v6
         with:
           context: image/${{ matrix.harness }}
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            BASE=${{ env.REGISTRY }}/${{ github.repository_owner }}/vhrn-base@${{ needs.base.outputs.digest }}
+            BASE=${{ steps.base.outputs.ref }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
