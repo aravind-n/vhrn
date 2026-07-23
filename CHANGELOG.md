@@ -6,6 +6,8 @@ All notable changes to vhrn are recorded here. The format follows
 
 ## Unreleased
 
+## 0.1.0 - 2026-07-23
+
 ### Added
 
 - `vhrn update [<harness>...]` re-pulls installed harnesses (and their proxy) to the newest
