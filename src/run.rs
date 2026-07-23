@@ -493,7 +493,10 @@ fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
 
     let proxy_image = env_or(
         "VHRN_PROXY_IMAGE",
-        &crate::image::proxy_image_ref(&crate::image::registry_base(), &cfg.version),
+        &crate::image::proxy_image_ref(
+            &crate::image::registry_base(),
+            &crate::image::proxy_tag(crate::cli::version(), &cfg.version),
+        ),
     );
     let (proxy, ip) = start_proxy(&cfg.engine, &proxy_image, &policy_dir, &port)?;
     let _guard = ProxyGuard(proxy.clone());

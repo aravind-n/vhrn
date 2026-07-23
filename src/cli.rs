@@ -12,6 +12,7 @@ Usage:
   vhrn uninstall <harness>                remove the alias/registry entry (--image drops the image)
   vhrn <harness> [flags] [-- ] [args...]  run a harness in the container
   vhrn list                               show known and installed harnesses
+  vhrn update [<harness>...]              re-pull installed harnesses to the latest agent
   vhrn net <subcommand>                   manage the egress policy
   vhrn help                               show this help
   vhrn --version                          print the version
@@ -66,6 +67,7 @@ pub fn run(args: &[String]) -> i32 {
         Some("install") => run_install(&args[1..]),
         Some("uninstall") => run_uninstall(&args[1..]),
         Some("list") => run_list(&args[1..]),
+        Some("update") => run_update(&args[1..]),
         // A known harness runs that agent; the wrapper's own flags come right after
         // it, then everything else forwards to the agent verbatim.
         Some(cmd) => {
@@ -93,7 +95,8 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
-/// Show every known harness and whether `vhrn install` has set it up.
+/// Show every known harness and whether `vhrn install` has set it up, resolving an
+/// installed harness's concrete agent version from its image label when possible.
 fn run_list(_args: &[String]) -> i32 {
     let home = match crate::run::home_dir() {
         Ok(h) => h,
@@ -108,13 +111,36 @@ fn run_list(_args: &[String]) -> i32 {
             .into_iter()
             .map(|ih| (ih.name, ih.version))
             .collect();
+    let registry = crate::image::registry_base();
+    let engine = crate::run::detect_engine().ok();
     for name in crate::harness::harness_names() {
-        match installed.get(&name) {
-            Some(v) => println!("  {name:<12} installed ({v})"),
-            None => println!("  {name:<12} available"),
+        if let Some(tag) = installed.get(&name) {
+            let detail = installed_detail(engine.as_deref(), &registry, &name, tag);
+            println!("  {name:<12} installed ({detail})");
+        } else {
+            println!("  {name:<12} available");
         }
     }
     0
+}
+
+/// The version detail for an installed harness: the concrete agent version resolved from
+/// the image's label when the tag is floating (latest/nightly), else the tag itself (a
+/// pinned version or `local` already names itself). Best-effort — no engine, or no label
+/// (the image isn't pulled, or predates the label), falls back to the tag.
+fn installed_detail(engine: Option<&str>, registry: &str, name: &str, tag: &str) -> String {
+    if tag == crate::image::LOCAL_VERSION || (tag != "latest" && tag != "nightly") {
+        return tag.to_string();
+    }
+    engine
+        .zip(crate::harness::lookup_harness(name))
+        .and_then(|(e, h)| {
+            crate::image::image_version_label(
+                e,
+                &crate::image::harness_image_ref(registry, &h, tag),
+            )
+        })
+        .map_or_else(|| tag.to_string(), |v| format!("{tag} → {v}"))
 }
 
 /// Pull a harness's image and the matching-version proxy from the registry, union its
@@ -191,6 +217,99 @@ fn run_install(args: &[String]) -> i32 {
         h.alias
     );
     0
+}
+
+/// Re-pull each floating harness (and its derived proxy) in place and report the agent
+/// version move read from the image's version label. With no args every installed harness
+/// is updated, else the named ones. A pinned or `--local` install is reported and skipped;
+/// nothing is auto-pruned and the run path is never nagged.
+fn run_update(args: &[String]) -> i32 {
+    let home = match crate::run::home_dir() {
+        Ok(h) => h,
+        Err(e) => {
+            error!("{e}");
+            return 1;
+        }
+    };
+    let config_dir = crate::shell::vhrn_config_dir(&home);
+    let installed = crate::shell::read_installed(&config_dir);
+    if installed.is_empty() {
+        println!("No harnesses installed.");
+        return 0;
+    }
+    // Targets: the named harnesses, or every installed one.
+    let targets: Vec<crate::shell::InstalledHarness> = if args.is_empty() {
+        installed
+    } else {
+        let mut t = Vec::new();
+        for name in args {
+            if let Some(ih) = installed.iter().find(|ih| ih.name == *name) {
+                t.push(ih.clone());
+            } else {
+                warn!("{name:?} is not installed");
+            }
+        }
+        t
+    };
+    let engine = match crate::run::detect_engine() {
+        Ok(e) => e,
+        Err(e) => {
+            error!("{e}");
+            return 1;
+        }
+    };
+    let registry = crate::image::registry_base();
+    for ih in &targets {
+        update_one(&engine, &registry, ih);
+    }
+    0
+}
+
+/// Update one installed harness in place, printing a one-line result. Pinned/local installs
+/// are reported and skipped; a floating one re-pulls and reports the version label move —
+/// no container is started to name the version.
+fn update_one(engine: &str, registry: &str, ih: &crate::shell::InstalledHarness) {
+    let (name, version) = (&ih.name, &ih.version);
+    let Some(h) = crate::harness::lookup_harness(name) else {
+        warn!("{name:?} is not a known harness; skipping");
+        return;
+    };
+    if version == crate::image::LOCAL_VERSION {
+        println!("  {name:<12} local build — rebuild with `make -C image`");
+        return;
+    }
+    if version != "latest" && version != "nightly" {
+        println!("  {name:<12} pinned at {version} — `vhrn install {name}` to return to latest");
+        return;
+    }
+
+    let harness_img = crate::image::harness_image_ref(registry, &h, version);
+    let id_before = crate::image::image_id(engine, &harness_img);
+    let ver_before = crate::image::image_version_label(engine, &harness_img);
+
+    if let Err(e) = crate::image::provision_images(engine, registry, &h, version) {
+        error!("  {name:<12} update failed: {e}");
+        return;
+    }
+
+    let id_after = crate::image::image_id(engine, &harness_img);
+    let ver_after = crate::image::image_version_label(engine, &harness_img);
+
+    // An unmoved digest means the re-pull brought nothing new.
+    if id_before.is_some() && id_before == id_after {
+        if let Some(v) = ver_after {
+            println!("  {name:<12} {v} — already current");
+        } else {
+            println!("  {name:<12} already current ({version})");
+        }
+        return;
+    }
+    match (ver_before, ver_after) {
+        (Some(b), Some(a)) if b == a => println!("  {name:<12} {a} — already current"),
+        (Some(b), Some(a)) => println!("  {name:<12} {b} → {a}"),
+        (_, Some(a)) => println!("  {name:<12} now {a}"),
+        (_, None) => println!("  {name:<12} updated ({version})"),
+    }
 }
 
 /// Drop a harness from the installed registry and regenerate the shell aliases so its
@@ -342,6 +461,26 @@ mod tests {
     #[test]
     fn version_falls_back_to_crate_version() {
         assert_eq!(version(), env!("CARGO_PKG_VERSION"));
+    }
+
+    // installed_detail resolves a label only for a floating tag, and only with an engine;
+    // pinned/local/no-engine cases return the tag without touching the engine.
+    #[test]
+    fn installed_detail_falls_back_to_tag() {
+        assert_eq!(installed_detail(None, "reg", "claude", "latest"), "latest");
+        assert_eq!(
+            installed_detail(None, "reg", "claude", "nightly"),
+            "nightly"
+        );
+        assert_eq!(installed_detail(None, "reg", "claude", "2.1.30"), "2.1.30");
+        assert_eq!(
+            installed_detail(Some("docker"), "reg", "claude", "2.1.30"),
+            "2.1.30"
+        );
+        assert_eq!(
+            installed_detail(Some("docker"), "reg", "claude", "local"),
+            "local"
+        );
     }
 
     #[test]

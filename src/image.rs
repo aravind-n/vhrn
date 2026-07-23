@@ -48,9 +48,8 @@ pub(crate) fn parse_harness_arg(arg: &str) -> (String, String) {
 }
 
 /// The image to run for a harness at an installed version: the bare local image for
-/// a make-built install, else the versioned registry ref. `registry` is the resolved
-/// base (see `registry_base`). The proxy is pinned to the same version, so a container and
-/// its proxy are always a set.
+/// a make-built install, else the versioned registry ref (the version is the agent's).
+/// `registry` is the resolved base (see `registry_base`).
 pub(crate) fn harness_image_ref(registry: &str, h: &Harness, version: &str) -> String {
     if version == LOCAL_VERSION {
         h.image.clone()
@@ -59,12 +58,31 @@ pub(crate) fn harness_image_ref(registry: &str, h: &Harness, version: &str) -> S
     }
 }
 
-/// The egress proxy ref, pinned to the same version as the harness it serves.
-pub(crate) fn proxy_image_ref(registry: &str, version: &str) -> String {
-    if version == LOCAL_VERSION {
+/// The egress proxy ref at `tag`: the bare make-built name for a local build, else the
+/// versioned registry ref. `tag` comes from `proxy_tag`, not the harness version.
+pub(crate) fn proxy_image_ref(registry: &str, tag: &str) -> String {
+    if tag == LOCAL_VERSION {
         PROXY_IMAGE_NAME.to_string()
     } else {
-        format!("{registry}/{PROXY_IMAGE_NAME}:{version}")
+        format!("{registry}/{PROXY_IMAGE_NAME}:{tag}")
+    }
+}
+
+/// The proxy tag for a run. The proxy shares runtime contracts with the CLI (the policy
+/// files, the port, the entrypoint), so it rides the CLI binary's own version rather than
+/// the harness's agent version: a nightly CLI pairs with the nightly proxy, a vX.Y.Z
+/// release with its own tag, and any other version (e.g. a locally-built CLI run against
+/// registry images) with the latest proxy. A `--local` harness uses the make-built proxy.
+pub(crate) fn proxy_tag(cli_version: &str, harness_version: &str) -> String {
+    if harness_version == LOCAL_VERSION {
+        return LOCAL_VERSION.to_string();
+    }
+    if cli_version.contains("-nightly") {
+        "nightly".to_string()
+    } else if cli_version.starts_with('v') {
+        cli_version.to_string()
+    } else {
+        "latest".to_string()
     }
 }
 
@@ -80,9 +98,9 @@ fn image_exists(engine: &str, image: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Make the harness and its matching proxy available at `version`: pull both from the
-/// registry, or (for `--local`) verify the make-built images exist. The container and its
-/// proxy are always the same version — a matched set. `registry` is the resolved base.
+/// Make the harness available at `version` (the agent's tag) and its matching proxy at the
+/// CLI's own version (see `proxy_tag`): pull both from the registry, or (for `--local`)
+/// verify the make-built images exist. `registry` is the resolved base.
 pub(crate) fn provision_images(
     engine: &str,
     registry: &str,
@@ -94,7 +112,7 @@ pub(crate) fn provision_images(
         let _ = Command::new("container").args(["system", "start"]).status();
     }
     let harness_img = harness_image_ref(registry, h, version);
-    let proxy_img = proxy_image_ref(registry, version);
+    let proxy_img = proxy_image_ref(registry, &proxy_tag(crate::cli::version(), version));
 
     if version == LOCAL_VERSION {
         for img in [harness_img.as_str(), proxy_img.as_str()] {
@@ -171,13 +189,100 @@ fn normalize_tools(tools: &[String]) -> Vec<String> {
     out
 }
 
-/// The content-addressed image tag for a tool set: `<base>-tc-<hash12>` (base is the
-/// clean local image name, e.g. vhrn-claude — not the pulled registry ref, which
-/// carries a colon and can't be a tag prefix). Same tools -> same tag, built once.
-fn toolchain_tag(base: &str, tools: &[String]) -> String {
-    let sum = Sha256::digest(normalize_tools(tools).join("\n").as_bytes());
-    let hexed = hex::encode(sum);
-    format!("{base}-tc-{}", &hexed[..12])
+/// The engine's local image ID (a content digest) for `image`, or None if it can't be
+/// read. Docker templates it out; Apple `container image inspect` prints JSON we scan.
+pub(crate) fn image_id(engine: &str, image: &str) -> Option<String> {
+    if engine == "docker" {
+        let out = Command::new("docker")
+            .args(["image", "inspect", "-f", "{{.Id}}", image])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        return (!id.is_empty()).then_some(id);
+    }
+    let out = Command::new("container")
+        .args(["image", "inspect", image])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    first_sha256(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The first `sha256:<hex>` token in engine inspect output (Apple container prints JSON).
+fn first_sha256(s: &str) -> Option<String> {
+    let start = s.find("sha256:")?;
+    let hex: String = s[start + 7..]
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect();
+    (hex.len() >= 12).then(|| format!("sha256:{hex}"))
+}
+
+/// The OCI label CI stamps the agent version into; the host reads it back to name a
+/// harness image's version without running it.
+const VERSION_LABEL: &str = "org.opencontainers.image.version";
+
+/// The agent version in `image`'s version label, or None if unreadable/absent. Docker
+/// templates the label out; Apple `container image inspect` prints JSON we scan.
+pub(crate) fn image_version_label(engine: &str, image: &str) -> Option<String> {
+    if engine == "docker" {
+        let out = Command::new("docker")
+            .args([
+                "image",
+                "inspect",
+                "-f",
+                &format!("{{{{index .Config.Labels \"{VERSION_LABEL}\"}}}}"),
+                image,
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        // docker prints "<no value>" when the label is absent.
+        return (!v.is_empty() && v != "<no value>").then_some(v);
+    }
+    let out = Command::new("container")
+        .args(["image", "inspect", image])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    json_string_value(&String::from_utf8_lossy(&out.stdout), VERSION_LABEL)
+}
+
+/// Best-effort: the quoted string value following `"<key>"` in JSON. Engine inspect output
+/// isn't parsed structurally (Apple's shape varies), so scan for the key's value.
+fn json_string_value(json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let after = json[json.find(&needle)? + needle.len()..]
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
+    let rest = after.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// The content-addressed image tag for a tool set atop a base image: `<prefix>-tc-<hash12>`
+/// (`prefix` is the clean local image name, e.g. vhrn-claude — not the pulled registry ref,
+/// which carries a colon and can't prefix a tag). The hash covers the tools *and* `base_id`
+/// (the base image's identity), so a rebuilt harness image gets a fresh tag even at an
+/// unchanged ref. Same base + same tools -> same tag, built once.
+fn toolchain_tag(prefix: &str, base_id: &str, tools: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(base_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(normalize_tools(tools).join("\n").as_bytes());
+    let hexed = hex::encode(hasher.finalize());
+    format!("{prefix}-tc-{}", &hexed[..12])
 }
 
 /// A Dockerfile deriving an image FROM the harness image that provisions the tools
@@ -260,7 +365,10 @@ pub(crate) fn ensure_toolchain_image(
     if norm.is_empty() {
         return Ok(from_image.to_string());
     }
-    let tag = toolchain_tag(tag_base, &norm);
+    // Fold the base image's identity (its content digest, else the ref itself) into the
+    // tag, so a rebuilt harness image forces a rebuild here even at an unchanged tag.
+    let base_id = image_id(engine, from_image).unwrap_or_else(|| from_image.to_string());
+    let tag = toolchain_tag(tag_base, &base_id, &norm);
     if image_exists(engine, &tag) {
         return Ok(tag);
     }
@@ -333,19 +441,73 @@ mod tests {
     }
 
     #[test]
+    fn proxy_tag_rides_cli_version() {
+        // A --local harness always uses the make-built proxy, whatever the CLI version.
+        assert_eq!(proxy_tag("v0.1.0", LOCAL_VERSION), LOCAL_VERSION);
+        // Otherwise the proxy rides the CLI's own version, not the agent's.
+        assert_eq!(proxy_tag("v0.1.0", "2.1.30"), "v0.1.0"); // release
+        assert_eq!(proxy_tag("v0.2.0", "latest"), "v0.2.0");
+        assert_eq!(
+            proxy_tag("0.1.0-nightly.20260101.abc", "nightly"),
+            "nightly"
+        );
+        assert_eq!(proxy_tag("0.1.0", "latest"), "latest"); // locally-built CLI
+    }
+
+    #[test]
     fn toolchain_tag_stable() {
-        let a = toolchain_tag("vhrn-claude", &["go@1.26".into(), "node@22".into()]);
+        let a = toolchain_tag(
+            "vhrn-claude",
+            "sha256:aa",
+            &["go@1.26".into(), "node@22".into()],
+        );
         // reorder + whitespace + dup must not change the tag.
         let b = toolchain_tag(
             "vhrn-claude",
+            "sha256:aa",
             &["node@22".into(), " go@1.26 ".into(), "node@22".into()],
         );
         assert_eq!(a, b, "tag must be order/whitespace/dup independent");
         assert!(a.starts_with("vhrn-claude-tc-"), "unexpected tag {a}");
         assert_ne!(
-            toolchain_tag("vhrn-claude", &["go@1.26".into()]),
+            toolchain_tag("vhrn-claude", "sha256:aa", &["go@1.26".into()]),
             a,
             "different tool sets should differ"
+        );
+        // A changed base image identity (a rebuilt harness) must change the tag.
+        assert_ne!(
+            toolchain_tag(
+                "vhrn-claude",
+                "sha256:bb",
+                &["go@1.26".into(), "node@22".into()]
+            ),
+            a,
+            "a new base image must force a new toolchain tag"
+        );
+    }
+
+    #[test]
+    fn first_sha256_extracts_digest() {
+        assert_eq!(
+            first_sha256(r#"{"Id":"sha256:abcdef0123456789"}"#),
+            Some("sha256:abcdef0123456789".to_string())
+        );
+        assert_eq!(first_sha256("no digest here"), None);
+        assert_eq!(first_sha256("sha256:abc"), None); // fewer than 12 hex chars
+    }
+
+    #[test]
+    fn json_string_value_scans_key() {
+        let j = r#"{"Config":{"Labels":{"org.opencontainers.image.version":"2.1.31"}}}"#;
+        assert_eq!(
+            json_string_value(j, "org.opencontainers.image.version"),
+            Some("2.1.31".to_string())
+        );
+        assert_eq!(json_string_value(j, "missing.key"), None);
+        // spacing around the colon is tolerated
+        assert_eq!(
+            json_string_value(r#""k" : "v""#, "k"),
+            Some("v".to_string())
         );
     }
 
