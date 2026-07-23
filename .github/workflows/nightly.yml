@@ -26,7 +26,7 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       image_tag: ${{ steps.v.outputs.image_tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - id: v
         run: |
           base=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
@@ -58,9 +58,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
+          pattern: vhrn-*
           merge-multiple: true
       - name: Checksums
         working-directory: dist

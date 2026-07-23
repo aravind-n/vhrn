@@ -20,7 +20,7 @@ jobs:
   guard:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Tag must match Cargo.toml version
         run: |
           tag="${GITHUB_REF_NAME#v}"
@@ -62,9 +62,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
+          pattern: vhrn-*
           merge-multiple: true
       - name: Checksums
         working-directory: dist

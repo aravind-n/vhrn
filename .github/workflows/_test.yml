@@ -23,7 +23,7 @@ jobs:
     if: ${{ inputs.run_rust }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Rust (latest stable)
         run: |
           rustup update stable
@@ -37,8 +37,8 @@ jobs:
     if: ${{ inputs.run_proxy }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: proxy/go.mod
       - name: Vet and test
@@ -52,5 +52,5 @@ jobs:
     if: ${{ inputs.run_scripts }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: shellcheck pages/install.sh image/base/entrypoint.sh
