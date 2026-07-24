@@ -49,4 +49,20 @@ if [ -n "${GH_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
   gh auth setup-git >/dev/null 2>&1 || true
 fi
 
+# Make build-time-installed tools discoverable the way a login shell would: source the
+# profile scripts each installer writes to. vhrn keeps no per-tool PATH list — e.g. rustup
+# appends its own line to ~/.profile. Not /etc/profile: Debian's resets PATH and would drop
+# ~/.local/bin (where the agent binary lives); ~/.profile only prepends. errexit/nounset are
+# relaxed around the sourcing since profile scripts are written for interactive shells.
+set +eu
+if [ -f "$HOME/.profile" ]; then
+  # shellcheck disable=SC1091
+  . "$HOME/.profile"
+fi
+for f in /etc/profile.d/*.sh; do
+  # shellcheck disable=SC1090
+  [ -r "$f" ] && . "$f"
+done
+set -eu
+
 exec "$@"
