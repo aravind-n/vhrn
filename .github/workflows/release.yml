@@ -20,7 +20,7 @@ jobs:
   guard:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Tag must match Cargo.toml version
         run: |
           tag="${GITHUB_REF_NAME#v}"
@@ -62,6 +62,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7 # for CHANGELOG.md — the release notes source
       - uses: actions/download-artifact@v8
         with:
           path: dist
@@ -75,5 +76,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes 2>/dev/null || true
+          # Notes are the tag's own CHANGELOG.md section (## <version> up to the next
+          # ## heading or the link-reference block), never GitHub's auto-generated PR
+          # list. The heading version is matched with surrounding [brackets] stripped,
+          # so both `## X.Y.Z` and Keep a Changelog's `## [X.Y.Z]` work. Fail loudly if
+          # the tag has no section rather than falling back to generated notes.
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v ver="$ver" '
+            $1=="##" { h=$2; gsub(/^\[|\]$/, "", h); if (h==ver) {cap=1; next} else if (cap) exit }
+            cap && /^\[[^][]+\]:/ {exit}
+            cap {print}
+          ' CHANGELOG.md | sed '/./,$!d' > notes.md
+          [ -s notes.md ] || { echo "::error::no CHANGELOG.md section for ${ver}"; exit 1; }
+          # create on first publish; edit so a re-run corrects an existing release's body.
+          gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file notes.md \
+            || gh release edit "${GITHUB_REF_NAME}" --notes-file notes.md
           gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
