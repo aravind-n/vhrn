@@ -196,9 +196,11 @@ const CONTAINER_GUIDE_HEADER: &str = r"
 You are running inside vhrn: a container jailed to this project with a
 network egress guard. Adapt as follows:
 
-- **No sudo, no apt.** Install tools in user space: `mise use -g <tool>` for
-  runtimes (node, go, python, ...), `uv tool install <pkg>` for Python CLIs, and
-  `npm i -g <pkg>` after `mise use -g node` for npm CLIs.
+- **No sudo, no apt at runtime.** The toolchain is baked at build time. You can still
+  `uv tool install <pkg>` for Python CLIs (PyPI is allowlisted). Anything else that is
+  missing — a language runtime or a system package — must be added by the user to
+  `[tools]` in their vhrn config (an `apt` entry or a `run` install command) and
+  reinstalled; you cannot install it from inside the container.
 ";
 
 const CONTAINER_GUIDE_OPEN: &str =

@@ -1,4 +1,4 @@
-//! Registry image references, image pulls, and the content-addressed toolchain build.
+//! Registry image references, image pulls, and the content-addressed tools build.
 //! `VHRN_REGISTRY` overrides the default registry.
 
 use std::path::PathBuf;
@@ -173,20 +173,32 @@ pub(crate) fn remove_image(engine: &str, image: &str) -> Result<()> {
     Ok(())
 }
 
-/// Trim, drop empties, de-duplicate, and sort a tool list so the content hash is
-/// stable regardless of order or incidental whitespace.
-fn normalize_tools(tools: &[String]) -> Vec<String> {
+/// Trim, drop empties, de-duplicate, and sort apt packages: apt install order is
+/// irrelevant, so normalizing keeps the content hash stable regardless of listing order
+/// or incidental whitespace.
+fn normalize_apt(pkgs: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for t in tools {
-        let t = t.trim();
-        if t.is_empty() || !seen.insert(t.to_string()) {
+    for p in pkgs {
+        let p = p.trim();
+        if p.is_empty() || !seen.insert(p.to_string()) {
             continue;
         }
-        out.push(t.to_string());
+        out.push(p.to_string());
     }
     out.sort();
     out
+}
+
+/// Trim and drop empty `run` lines, but PRESERVE order and duplicates: a run sequence is
+/// ordered (a later command can depend on an earlier one), so it must never be sorted or
+/// de-duplicated the way apt packages are.
+fn normalize_run(run: &[String]) -> Vec<String> {
+    run.iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// The engine's local image ID (a content digest) for `image`, or None if it can't be
@@ -304,31 +316,53 @@ fn json_string_value(json: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// The content-addressed image tag for a tool set atop a base image: `<prefix>-tc-<hash12>`
+/// The content-addressed image tag for a tools layer atop a base image: `<prefix>-tools-<hash12>`
 /// (`prefix` is the clean local image name, e.g. vhrn-claude — not the pulled registry ref,
-/// which carries a colon and can't prefix a tag). The hash covers the tools *and* `base_id`
-/// (the base image's identity), so a rebuilt harness image gets a fresh tag even at an
-/// unchanged ref. Same base + same tools -> same tag, built once.
-fn toolchain_tag(prefix: &str, base_id: &str, tools: &[String]) -> String {
+/// which carries a colon and can't prefix a tag). The hash covers `base_id` (the base image's
+/// identity) plus the normalized apt set and the ordered run list, so a rebuilt harness image
+/// — or any change to the requested tooling — yields a fresh tag. Same inputs -> same tag,
+/// built once.
+fn tools_tag(prefix: &str, base_id: &str, apt: &[String], run: &[String]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(base_id.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(normalize_tools(tools).join("\n").as_bytes());
+    hasher.update(b"\napt\n");
+    hasher.update(normalize_apt(apt).join("\n").as_bytes());
+    hasher.update(b"\nrun\n");
+    hasher.update(normalize_run(run).join("\n").as_bytes());
     let hexed = hex::encode(hasher.finalize());
-    format!("{prefix}-tc-{}", &hexed[..12])
+    format!("{prefix}-tools-{}", &hexed[..12])
 }
 
-/// A Dockerfile deriving an image FROM the harness image that provisions the tools
-/// with mise, as the unprivileged dev user (mise installs into its home).
-fn toolchain_dockerfile(base_image: &str, tools: &[String]) -> String {
-    format!(
-        "FROM {base_image}\nUSER dev\nRUN mise use -g {}\nUSER root\n",
-        normalize_tools(tools).join(" ")
-    )
+/// A Dockerfile deriving an image FROM the harness image that bakes in the requested tools
+/// at build time: an optional apt layer (as root, with list cleanup), then each `run`
+/// command in declared order. Everything runs as root with `HOME=/home/dev` so user-space
+/// installers (rustup, nvm) write into dev's home; a final chown hands ownership back to
+/// dev. No sudo is ever introduced. PATH is deliberately not managed here — the entrypoint
+/// sources `~/.profile` at runtime so each installer's own registration takes effect.
+fn tools_dockerfile(base_image: &str, apt: &[String], run: &[String]) -> String {
+    let mut lines = vec![
+        format!("FROM {base_image}"),
+        "USER root".to_string(),
+        "ENV HOME=/home/dev".to_string(),
+    ];
+    let apt = normalize_apt(apt);
+    if !apt.is_empty() {
+        lines.push(format!(
+            "RUN apt-get update && apt-get install -y --no-install-recommends {} \\\n    && rm -rf /var/lib/apt/lists/*",
+            apt.join(" ")
+        ));
+    }
+    for cmd in normalize_run(run) {
+        lines.push(format!("RUN {cmd}"));
+    }
+    lines.push("RUN chown -R dev:dev /home/dev".to_string());
+    let mut df = lines.join("\n");
+    df.push('\n');
+    df
 }
 
-// ---- toolchain local build (only the derived toolchain image is built locally;
-// user-facing images are pulled) --------------------------------------------------
+// ---- tools local build (only the derived tools image is built locally;
+// user-facing images are pulled) ---------------------------------------------------
 
 /// The engine build command line (pure, for testing).
 fn build_argv(image: &str, dockerfile: &str, context: &str, extra: &[String]) -> Vec<String> {
@@ -385,30 +419,51 @@ fn build_image(
 }
 
 /// The image to run: `from_image` unchanged when no tools are declared, else a
-/// content-addressed derived image (FROM `from_image`, tagged from the clean
-/// `tag_base`), built once and cached by its tag. `from_image` is the pulled ref (the
-/// FROM); `tag_base` is the clean image name — a ref with a colon can't prefix a tag.
-pub(crate) fn ensure_toolchain_image(
+/// content-addressed derived image (FROM `from_image`, tagged from the clean `tag_base`),
+/// built once and cached by its tag. `from_image` is the pulled ref (the FROM); `tag_base`
+/// is the clean image name — a ref with a colon can't prefix a tag.
+pub(crate) fn ensure_tools_image(
     engine: &str,
     from_image: &str,
     tag_base: &str,
-    tools: &[String],
+    apt: &[String],
+    run: &[String],
 ) -> Result<String> {
-    let norm = normalize_tools(tools);
-    if norm.is_empty() {
+    let norm_apt = normalize_apt(apt);
+    let norm_run = normalize_run(run);
+    if norm_apt.is_empty() && norm_run.is_empty() {
         return Ok(from_image.to_string());
+    }
+    // A newline inside an entry would split the generated `RUN <cmd>` line into invalid
+    // Dockerfile; reject it up front with a clear message, not an opaque build parse error.
+    for entry in norm_apt.iter().chain(norm_run.iter()) {
+        if entry.contains('\n') {
+            bail!(
+                "[tools] entry spans multiple lines — chain with `&&` or a trailing `\\` in one entry: {entry:?}"
+            );
+        }
     }
     // Fold the base image's identity (its content digest, else the ref itself) into the
     // tag, so a rebuilt harness image forces a rebuild here even at an unchanged tag.
     let base_id = image_id(engine, from_image).unwrap_or_else(|| from_image.to_string());
-    let tag = toolchain_tag(tag_base, &base_id, &norm);
+    let tag = tools_tag(tag_base, &base_id, &norm_apt, &norm_run);
     if image_exists(engine, &tag) {
         return Ok(tag);
     }
     let tmp = build_temp_dir()?;
     let dockerfile = tmp.join("Dockerfile");
-    std::fs::write(&dockerfile, toolchain_dockerfile(from_image, &norm))?;
-    info!("provisioning toolchain ({}) into {tag}...", norm.join(", "));
+    std::fs::write(
+        &dockerfile,
+        tools_dockerfile(from_image, &norm_apt, &norm_run),
+    )?;
+    let mut what = Vec::new();
+    if !norm_apt.is_empty() {
+        what.push(format!("apt: {}", norm_apt.join(", ")));
+    }
+    if !norm_run.is_empty() {
+        what.push(format!("{} run step(s)", norm_run.len()));
+    }
+    info!("provisioning tools ({}) into {tag}...", what.join("; "));
     let result = build_image(
         engine,
         &tag,
@@ -488,34 +543,46 @@ mod tests {
     }
 
     #[test]
-    fn toolchain_tag_stable() {
-        let a = toolchain_tag(
+    fn tools_tag_stable() {
+        let a = tools_tag(
             "vhrn-claude",
             "sha256:aa",
-            &["go@1.26".into(), "node@22".into()],
+            &["ripgrep".into(), "jq".into()],
+            &["curl a | sh".into(), "curl b | sh".into()],
         );
-        // reorder + whitespace + dup must not change the tag.
-        let b = toolchain_tag(
+        // apt: reorder + whitespace + dup must not change the tag.
+        let b = tools_tag(
             "vhrn-claude",
             "sha256:aa",
-            &["node@22".into(), " go@1.26 ".into(), "node@22".into()],
+            &["jq".into(), " ripgrep ".into(), "jq".into()],
+            &["curl a | sh".into(), "curl b | sh".into()],
         );
-        assert_eq!(a, b, "tag must be order/whitespace/dup independent");
-        assert!(a.starts_with("vhrn-claude-tc-"), "unexpected tag {a}");
+        assert_eq!(a, b, "apt must be order/whitespace/dup independent");
+        assert!(a.starts_with("vhrn-claude-tools-"), "unexpected tag {a}");
+        // run order MUST matter — a later command can depend on an earlier one.
+        let c = tools_tag(
+            "vhrn-claude",
+            "sha256:aa",
+            &["ripgrep".into(), "jq".into()],
+            &["curl b | sh".into(), "curl a | sh".into()],
+        );
+        assert_ne!(a, c, "run order must affect the tag");
+        // A different apt set differs.
         assert_ne!(
-            toolchain_tag("vhrn-claude", "sha256:aa", &["go@1.26".into()]),
-            a,
-            "different tool sets should differ"
+            tools_tag("vhrn-claude", "sha256:aa", &["ripgrep".into()], &[]),
+            tools_tag("vhrn-claude", "sha256:aa", &["jq".into()], &[]),
+            "different apt sets should differ"
         );
         // A changed base image identity (a rebuilt harness) must change the tag.
         assert_ne!(
-            toolchain_tag(
+            tools_tag(
                 "vhrn-claude",
                 "sha256:bb",
-                &["go@1.26".into(), "node@22".into()]
+                &["ripgrep".into(), "jq".into()],
+                &["curl a | sh".into(), "curl b | sh".into()],
             ),
             a,
-            "a new base image must force a new toolchain tag"
+            "a new base image must force a new tools tag"
         );
     }
 
@@ -550,26 +617,69 @@ mod tests {
     }
 
     #[test]
-    fn toolchain_dockerfile_contents() {
-        let df = toolchain_dockerfile("vhrn-claude", &["node@22".into(), "go@1.26".into()]);
-        assert!(df.contains("FROM vhrn-claude"), "missing FROM:\n{df}");
-        assert!(
-            df.contains("mise use -g go@1.26 node@22"),
-            "tools not in sorted order:\n{df}"
+    fn tools_dockerfile_contents() {
+        let df = tools_dockerfile(
+            "vhrn-claude",
+            &["ripgrep".into(), "jq".into()],
+            &["curl https://sh.rustup.rs | sh -s -- -y".into()],
         );
         assert!(
-            df.contains("USER dev") && df.contains("USER root"),
-            "provision as dev then root:\n{df}"
+            df.starts_with("FROM vhrn-claude\nUSER root\nENV HOME=/home/dev\n"),
+            "header:\n{df}"
         );
+        // apt sorted + wrapped with update and list cleanup.
+        assert!(
+            df.contains("apt-get install -y --no-install-recommends jq ripgrep"),
+            "apt not sorted/wrapped:\n{df}"
+        );
+        assert!(
+            df.contains("rm -rf /var/lib/apt/lists/*"),
+            "apt cleanup:\n{df}"
+        );
+        // the run line verbatim, chown last, and no sudo anywhere.
+        assert!(
+            df.contains("RUN curl https://sh.rustup.rs | sh -s -- -y\n"),
+            "run line:\n{df}"
+        );
+        assert!(
+            df.trim_end().ends_with("RUN chown -R dev:dev /home/dev"),
+            "chown must be last:\n{df}"
+        );
+        assert!(!df.contains("sudo"), "no sudo:\n{df}");
     }
 
     #[test]
-    fn ensure_toolchain_image_no_tools_passes_through() {
+    fn tools_dockerfile_apt_only_and_run_only() {
+        // apt only: an apt layer, no stray RUN lines.
+        let a = tools_dockerfile("base", &["jq".into()], &[]);
+        assert!(a.contains("apt-get install"), "apt layer:\n{a}");
+        // run only: no apt layer at all.
+        let r = tools_dockerfile("base", &[], &["echo hi".into()]);
+        assert!(!r.contains("apt-get"), "no apt layer when apt empty:\n{r}");
+        assert!(r.contains("RUN echo hi\n"), "run line:\n{r}");
+    }
+
+    #[test]
+    fn ensure_tools_image_no_tools_passes_through() {
         // No tools must pass the harness image through untouched, without touching the engine.
-        let img =
-            ensure_toolchain_image("container", "ghcr.io/x/vhrn-claude:v1", "vhrn-claude", &[])
-                .unwrap();
+        let img = ensure_tools_image(
+            "container",
+            "ghcr.io/x/vhrn-claude:v1",
+            "vhrn-claude",
+            &[],
+            &[],
+        )
+        .unwrap();
         assert_eq!(img, "ghcr.io/x/vhrn-claude:v1");
+    }
+
+    #[test]
+    fn ensure_tools_image_rejects_multiline_entry() {
+        // A newline in an entry is refused before any engine call, with a clear error.
+        let err = ensure_tools_image("container", "img", "base", &[], &["echo a\necho b".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("multiple lines"), "unexpected error: {err}");
     }
 
     #[test]

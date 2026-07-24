@@ -1,6 +1,6 @@
 //! Subcommand dispatch, run-flag parsing, and the usage text — the CLI's front door.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use tracing::{error, info, warn};
 
 // Subcommand-first help. Bare `vhrn` prints it; a harness runs as `vhrn <harness> …`.
@@ -187,12 +187,25 @@ fn run_install(args: &[String]) -> i32 {
         }
     };
 
-    if let Err(e) =
-        crate::image::provision_images(&engine, &crate::image::registry_base(), &h, &version)
-    {
+    let registry = crate::image::registry_base();
+    if let Err(e) = crate::image::provision_images(&engine, &registry, &h, &version) {
         error!("{e}");
         return 1;
     }
+
+    // Pre-build the [tools] layer so the first run is instant. Non-fatal: a broken tools
+    // build must not block the base install — report it, finish the install, and exit
+    // nonzero at the end so a scripted install still sees the failure.
+    let tools_ok = match prewarm_tools(&engine, &registry, &h, &version) {
+        Ok(()) => true,
+        Err(e) => {
+            error!("{e:#}");
+            error!(
+                "base install finished; fix the above, then run `vhrn {name}` to build the tools layer"
+            );
+            false
+        }
+    };
 
     // Union base defaults + this harness's domains into the host allowlist,
     // append-if-missing so later user edits are respected.
@@ -216,7 +229,7 @@ fn run_install(args: &[String]) -> i32 {
         "Installed {name} ({version}). Restart your shell (or source your rc file) to use `{}`.",
         h.alias
     );
-    0
+    i32::from(!tools_ok)
 }
 
 /// Re-pull each floating harness (and its derived proxy) in place and report the agent
@@ -338,6 +351,13 @@ fn pull_update(
         return false;
     }
     on_success();
+    // Rebuild the [tools] layer onto the freshly pulled base. The version move is already
+    // reported; a tools-build failure exits nonzero (not a false-green) but points the retry
+    // at `vhrn <harness>` — re-running `vhrn update` sees "already current" and won't rebuild.
+    if let Err(e) = prewarm_tools(engine, registry, h, version) {
+        error!("  {:<12} {e:#} (run `vhrn {}` to retry)", h.name, h.name);
+        return false;
+    }
     true
 }
 
@@ -347,6 +367,29 @@ fn report_unreachable(name: &str, registry: &str) {
     eprintln!("vhrn: cannot check {name} for updates — registry {registry} unreachable");
     // TODO: once tracing is hardened (e.g. a file sink), also error!(<underlying cause>) so the
     // network error is recorded to the log without duplicating this line on stderr today.
+}
+
+/// Pre-build the [tools] layer (apt/run from the host config) onto the harness image at
+/// `version`, so the first run doesn't pay for it. Returns Ok(()) when nothing is declared.
+/// Callers treat a build error as non-fatal but exit nonzero, so a broken [tools] config
+/// neither bricks install/update nor passes silently.
+fn prewarm_tools(
+    engine: &str,
+    registry: &str,
+    h: &crate::harness::Harness,
+    version: &str,
+) -> Result<()> {
+    let home = crate::run::home_dir()?;
+    let cfg = crate::config::load_config(&crate::shell::vhrn_config_dir(&home))?;
+    let apt = cfg.tools.apt.unwrap_or_default();
+    let run = cfg.tools.run.unwrap_or_default();
+    if apt.is_empty() && run.is_empty() {
+        return Ok(());
+    }
+    let from = crate::image::harness_image_ref(registry, h, version);
+    crate::image::ensure_tools_image(engine, &from, &h.image, &apt, &run)
+        .context("building the [tools] image")?;
+    Ok(())
 }
 
 /// Drop a harness from the installed registry and regenerate the shell aliases so its
