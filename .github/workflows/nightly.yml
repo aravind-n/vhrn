@@ -26,7 +26,7 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       image_tag: ${{ steps.v.outputs.image_tag }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - id: v
         run: |
           base=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)

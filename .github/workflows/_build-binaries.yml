@@ -40,7 +40,7 @@ jobs:
     env:
       VHRN_BUILD_VERSION: ${{ inputs.version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Rust (latest stable)
         run: |
           rustup update stable
