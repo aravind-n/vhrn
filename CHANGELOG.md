@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The base image now bundles more of the tools an agent reaches for: gcc/g++
+  (`build-essential`), `cmake`, `ninja-build`, `openssh-client`, `wget`, `rsync`, `xz-utils`,
+  `gnupg`, `sqlite3`, and `patch`.
+
 ### Changed
+
+- The `[toolchains]` config section (language runtimes provisioned with mise) is replaced by
+  `[tools]`. `apt = [...]` installs Debian packages and `run = [...]` runs arbitrary
+  build-time commands (vendor installers, tarballs, a private mirror), baked onto the harness
+  image at build time and content-addressed so they build once. Pin language runtimes the way
+  you would on any Linux box — a `run` line for rustup, a Node tarball, and so on. Old
+  `[toolchains]` config is silently ignored; move your entries to `[tools]`.
 
 - `vhrn update` now asks the registry whether a newer agent is published and re-pulls only when
   one is, instead of re-pulling every time and diffing image digests to find out. An up-to-date
@@ -15,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metadata-only query over the standard OCI bearer-challenge flow, so it works on any registry,
   not just GHCR. A registry that can't be reached is now a hard error (non-zero exit) rather
   than a blind re-pull — you can't update an offline machine.
+
+### Removed
+
+- mise is no longer bundled in the base image, and `mise.jdx.dev` is dropped from the default
+  egress allowlist. Provision language runtimes through `[tools]` at build time instead.
 
 ### Fixed
 
