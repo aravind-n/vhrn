@@ -39,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Release notes are taken from the release's `CHANGELOG.md` section rather than
   auto-generated from merged pull-request titles.
 
+- Git no longer fails intermittently inside the container with `fatal: detected dubious
+  ownership in repository at …`. Apple Container's virtiofs reports the project mount's
+  ownership inconsistently, which tripped git's ownership check at random — hitting the agent's
+  own `git status`/`commit` as readily as a statusline's git segment, which would show, drop,
+  and reappear. The base image now exempts the mounted project. Re-run
+  `vhrn install <harness>` to pick up the rebuilt image.
+
 ## [0.2.0] - 2026-07-24
 
 ### Security

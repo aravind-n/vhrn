@@ -75,6 +75,11 @@ RUN groupadd -g "$USER_GID" dev 2>/dev/null || true; \
 # ~/.profile, which the entrypoint sources at runtime — so no per-tool paths live here.
 ENV PATH=/home/dev/.local/bin:$PATH
 
+# virtiofs reports the bind-mount root's owner inconsistently (0:0 one moment, dev the next),
+# which trips git's dubious-ownership check at random. Only the one project is ever mounted,
+# so a blanket exemption weakens nothing. --system: /etc/gitconfig, not the mounted ~/.gitconfig.
+RUN git config --system --add safe.directory '*'
+
 # Entrypoint installs the egress firewall then drops to dev; needs procps for the lock check.
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
