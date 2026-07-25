@@ -480,14 +480,16 @@ fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
         let _ = Command::new("container").args(["system", "start"]).status();
     }
 
-    // A declared toolchain resolves to a derived, content-addressed image.
-    let tools = cfg.config.toolchains.tools.clone().unwrap_or_default();
-    if !tools.is_empty() {
-        cfg.image = crate::image::ensure_toolchain_image(
+    // Declared tools resolve to a derived, content-addressed image built FROM the harness.
+    let apt = cfg.config.tools.apt.clone().unwrap_or_default();
+    let run = cfg.config.tools.run.clone().unwrap_or_default();
+    if !apt.is_empty() || !run.is_empty() {
+        cfg.image = crate::image::ensure_tools_image(
             &cfg.engine,
             &cfg.image,
             &cfg.harness.image,
-            &tools,
+            &apt,
+            &run,
         )?;
     }
 

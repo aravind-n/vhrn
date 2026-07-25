@@ -13,7 +13,7 @@ use anyhow::{Result, bail};
 #[serde(default)]
 pub(crate) struct Config {
     pub run: RunConfig,
-    pub toolchains: ToolchainsConfig,
+    pub tools: ToolsConfig,
     pub net: NetConfig,
 }
 
@@ -26,11 +26,14 @@ pub(crate) struct RunConfig {
     pub blocked_dirs: Option<Vec<String>>,
 }
 
-/// Tools provisioned into the container beyond the base image, e.g. "go@1.26", "node@22".
+/// Extra tooling baked onto the harness image at build time. `apt` is sugar for a Debian
+/// package install; `run` is arbitrary build-time shell (vendor installers, tarballs, a
+/// private mirror) — vhrn stays language-agnostic and just bakes what it is told.
 #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
 #[serde(default)]
-pub(crate) struct ToolchainsConfig {
-    pub tools: Option<Vec<String>>,
+pub(crate) struct ToolsConfig {
+    pub apt: Option<Vec<String>>,
+    pub run: Option<Vec<String>>,
 }
 
 /// Folds into the egress policy: extra allowlist domains and the guard mode. `mode`
@@ -49,7 +52,7 @@ fn default_config() -> Config {
         run: RunConfig {
             blocked_dirs: Some(vec!["~".into(), "/".into()]),
         },
-        toolchains: ToolchainsConfig::default(),
+        tools: ToolsConfig::default(),
         net: NetConfig {
             allow: None,
             mode: Some("enforce".into()),
@@ -64,8 +67,11 @@ fn merge_config(base: Config, over: Config) -> Config {
     if over.run.blocked_dirs.is_some() {
         out.run.blocked_dirs = over.run.blocked_dirs;
     }
-    if over.toolchains.tools.is_some() {
-        out.toolchains.tools = over.toolchains.tools;
+    if over.tools.apt.is_some() {
+        out.tools.apt = over.tools.apt;
+    }
+    if over.tools.run.is_some() {
+        out.tools.run = over.tools.run;
     }
     if over.net.allow.is_some() {
         out.net.allow = over.net.allow;
@@ -179,14 +185,18 @@ mod tests {
         let config_dir = temp_dir();
         std::fs::write(
             config_dir.join("config.toml"),
-            "[toolchains]\ntools = [\"go@1.26\"]\n[net]\nmode = \"report\"\nallow = [\"global.example\"]\n",
+            "[tools]\napt = [\"ripgrep\"]\nrun = [\"curl https://example.test | sh\"]\n[net]\nmode = \"report\"\nallow = [\"global.example\"]\n",
         )
         .unwrap();
 
         let cfg = load_config(&config_dir).unwrap();
         assert_eq!(cfg.net.allow, Some(vec!["global.example".to_string()])); // from global config
         assert_eq!(cfg.net.mode, Some("report".to_string()));
-        assert_eq!(cfg.toolchains.tools, Some(vec!["go@1.26".to_string()]));
+        assert_eq!(cfg.tools.apt, Some(vec!["ripgrep".to_string()]));
+        assert_eq!(
+            cfg.tools.run,
+            Some(vec!["curl https://example.test | sh".to_string()])
+        );
         assert_eq!(
             cfg.run.blocked_dirs,
             Some(vec!["~".to_string(), "/".to_string()])
@@ -248,7 +258,8 @@ mod tests {
             merged.run.blocked_dirs,
             Some(vec!["~".to_string(), "/".to_string()])
         ); // inherited
-        assert_eq!(merged.toolchains.tools, None); // set nowhere
+        assert_eq!(merged.tools.apt, None); // set nowhere
+        assert_eq!(merged.tools.run, None);
     }
 
     #[test]

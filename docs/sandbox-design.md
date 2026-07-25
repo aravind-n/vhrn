@@ -52,10 +52,12 @@ native sessions share it.
 ## Working inside the container
 
 - There is no sudo inside the container; removing it is what keeps the egress firewall
-  tamper-proof. Install tools in user space instead — `mise use -g <tool>` for runtimes,
-  `uv tool install <pkg>` for Python CLIs — or declare them under `[toolchains]` in your
-  config. A basic C toolchain (clang, libc headers) is baked into the base image, since
-  native builds can't fetch one under the egress guard.
+  tamper-proof. The toolchain is baked at build time — a C/C++ toolchain (clang, gcc/g++,
+  cmake) plus the common CLIs live in the base image, and you add anything else under
+  `[tools]` in your config (`apt` packages or arbitrary `run` install commands), which vhrn
+  bakes onto the harness image at install time. At runtime you can still `uv tool install
+  <pkg>` for Python CLIs (PyPI is allowlisted), but you cannot apt or add system packages
+  under the guard.
 - `gh` auth is forwarded as an env token (`$GH_TOKEN` or `$GITHUB_TOKEN`, else
   `gh auth token`), which covers git-over-HTTPS inside the container. SSH remotes stay
   unauthenticated. Under an open guard, the wrapper warns that a token is present.

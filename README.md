@@ -50,8 +50,9 @@ nothing from the project directory, so a cloned repo can never reconfigure the j
 [run]
 blocked_dirs = ["~", "/"]        # refuse to launch when cwd is exactly one of these
 
-[toolchains]
-tools = ["go@1.26", "node@22"]   # provisioned into the container with mise
+[tools]                          # extra tooling baked onto the harness image at build time
+apt = ["postgresql-client"]      # Debian packages
+run = ["curl -fsSL https://sh.rustup.rs | sh -s -- -y"]   # arbitrary build-time install commands
 
 [net]
 allow = ["docs.rs"]              # extra allowlist domains

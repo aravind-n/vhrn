@@ -27,7 +27,7 @@ matches against and `history_key` already derives:
 mode = "enforce"                       # global default for every project
 
 [project."/Users/me/work/payments"]
-toolchains.tools = ["go@1.26"]
+tools.apt = ["postgresql-client"]
 net.allow = ["proxy.golang.org"]       # this project only
 
 [project."/Users/me/oss/ffmpeg"]
@@ -45,8 +45,8 @@ project's block does not silently apply to a nested checkout.
 
 ## What it may set
 
-The existing `RunConfig` / `ToolchainsConfig` / `NetConfig` fields, scoped to the project:
-`toolchains.tools`, `net.allow`, `net.mode`, `run.blocked_dirs`. Same expressiveness the old
+The existing `RunConfig` / `ToolsConfig` / `NetConfig` fields, scoped to the project:
+`tools.apt`, `tools.run`, `net.allow`, `net.mode`, `run.blocked_dirs`. Same expressiveness the old
 project layer had — with the trust properties inverted, because the file lives where only the
 user can write it.
 

@@ -80,7 +80,7 @@ pub(crate) fn seed_allowlist(cache: &Path, domains: &[String]) -> std::io::Resul
     Ok(())
 }
 
-// Seeded on first run; never clobbers later edits. 12 domains + 2 comment lines.
+// Seeded on first run; never clobbers later edits. 11 domains + 2 comment lines.
 const DEFAULT_ALLOWLIST: &str = r"# vhrn egress allowlist — one domain per line, matching the domain and its
 # subdomains. Edit freely, or run `vhrn net allow <domain>` while a container runs.
 api.anthropic.com
@@ -94,7 +94,6 @@ registry.npmjs.org
 pypi.org
 files.pythonhosted.org
 astral.sh
-mise.jdx.dev
 ";
 
 /// Locates the host-side egress policy files under `<cache>/net`.
@@ -347,7 +346,7 @@ mod tests {
         np.ensure().unwrap();
         np.seed_allowlist_if_absent();
         let base = np.count_domains();
-        assert_eq!(base, 12, "default domain count");
+        assert_eq!(base, 11, "default domain count");
         // Adds a new domain; ignores duplicates (incl. one already present).
         np.append_missing_atomic(&[
             "docs.rs".into(),
@@ -364,14 +363,14 @@ mod tests {
     #[test]
     fn seed_allowlist_unions_harness_domains() {
         let cache = crate::testutil::temp_dir();
-        // Install seeds the 12 defaults, then unions the harness domains not already
+        // Install seeds the 11 defaults, then unions the harness domains not already
         // present — api.anthropic.com is a default (no-op); example.test is new.
         seed_allowlist(&cache, &["api.anthropic.com".into(), "example.test".into()]).unwrap();
         let np = NetPolicy::new(&cache);
-        assert_eq!(np.count_domains(), 13, "12 defaults + 1 new harness domain");
+        assert_eq!(np.count_domains(), 12, "11 defaults + 1 new harness domain");
         // Idempotent: re-seeding the same domain adds nothing.
         seed_allowlist(&cache, &["example.test".into()]).unwrap();
-        assert_eq!(np.count_domains(), 13);
+        assert_eq!(np.count_domains(), 12);
     }
 
     #[test]

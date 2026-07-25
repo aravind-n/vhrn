@@ -77,9 +77,12 @@ Core behavioral invariants — keep these intact:
 - **Config precedence: flags > `~/.config/vhrn/config.toml` > defaults** (`src/config.rs`,
   `toml` crate). Config is **host-owned only** — nothing is read from the project directory, so
   repo content can never configure the jail. `blocked_dirs` matches the resolved cwd
-  **exactly** (not subtree), default `["~","/"]`. `toolchains.tools` resolves to a
-  content-addressed derived image (`vhrn-<h>-tc-<hash>`, `FROM` the harness image +
-  `mise use -g`), cached by tag.
+  **exactly** (not subtree), default `["~","/"]`. `[tools]` (`apt` packages + ordered `run`
+  commands) resolves to a content-addressed derived image (`vhrn-<h>-tools-<hash>`, `FROM`
+  the harness image: an apt layer then the run steps, as root with `HOME=/home/dev` and a
+  final chown — no sudo), pre-built at install/update and cached by tag. PATH is not managed
+  by vhrn — the entrypoint sources `~/.profile` at runtime so build-time installers register
+  themselves.
 - **Shell aliases and the installed registry are host state.** `install`/`uninstall` mutate
   `~/.config/vhrn/installed` and regenerate reversible marker-delimited alias blocks in
   bash/zsh/fish rc files (existing files + the current shell's). `command <name>`/`\<name>`
@@ -101,8 +104,9 @@ them directly:
 - **Proxy image:** `make -C proxy` builds `vhrn-proxy`; `make -C proxy clean` removes it.
 
 The image Makefiles auto-detect the engine (`container`, then `docker`; `ENGINE=docker`
-forces Docker). Baked into `vhrn-base`: a basic C toolchain (clang/lld/llvm/libc),
-python3/uv, mise, gh, ripgrep/fd, zip/unzip, nftables — a non-root `dev` user, no sudo.
+forces Docker). Baked into `vhrn-base`: a C/C++ toolchain (clang/lld/llvm/libc,
+gcc/g++/cmake/ninja), python3/uv, gh, ripgrep/fd, zip/unzip, plus
+openssh-client/wget/rsync/xz-utils/gnupg/sqlite3 and nftables — a non-root `dev` user, no sudo.
 
 Day to day you build nothing — `vhrn install <harness>` pulls prebuilt images from ghcr.
 For a local-image dev loop: `cargo install --path . && make -C image && make -C proxy`, then
@@ -145,7 +149,7 @@ Tests cover flag parsing, the history-key encoding, terminal env, allowlist add/
 engine-inspect IP parsing, the harness registry, the installed registry, shell-alias blocks,
 install/uninstall arg assembly, the persistence state store (creds bootstrap + `.claude.json`
 merge), the mount topology, TOML config load/merge, `blocked_dirs`, net-mode resolution, and
-toolchain hashing — plus the proxy's allowlist-matching and IP-classifier tests. Keep pure
+tools-layer hashing — plus the proxy's allowlist-matching and IP-classifier tests. Keep pure
 logic in functions that take their inputs as arguments so new behavior stays unit-testable
 without a live container.
 
