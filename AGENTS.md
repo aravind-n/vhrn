@@ -61,7 +61,10 @@ Core behavioral invariants — keep these intact:
   (`$GH_TOKEN`/`$GITHUB_TOKEN`, else `gh auth token`) and passes it as `GH_TOKEN`; the
   entrypoint runs `gh auth setup-git`. Skips silently without a host gh login; SSH remotes
   stay unauthenticated. The host `~/.gitconfig` is copied into the cache and bind-mounted at
-  `/home/dev/.gitconfig` (a disposable copy — change the host file).
+  `/home/dev/.gitconfig` (a disposable copy — change the host file). The base image also sets
+  `safe.directory = *` in `/etc/gitconfig`: virtiofs reports the mount root's owner
+  inconsistently and would otherwise break git at random — only one project is ever mounted,
+  so it weakens nothing.
 - **Images are pulled from a registry, not built by users.** `vhrn install <harness>[@version]`
   pulls `vhrn-<harness>` at the *agent's* version (default `latest`) plus the `vhrn-proxy`
   matching the **CLI binary's own** version — the proxy rides the CLI's release clock, not the
