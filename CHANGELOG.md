@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- fish no longer has its alias injected into `config.fish`. `vhrn install` writes a
+  vhrn-owned `$XDG_CONFIG_HOME/fish/conf.d/vhrn.fish` (the convention fish's `conf.d`
+  exists for, as rustup and friends use), and `vhrn uninstall` deletes it. The path now
+  honors `$XDG_CONFIG_HOME` instead of assuming `~/.config`.
+
+  **Upgrading:** the old block is left where it is — delete the
+  `# >>> vhrn managed aliases >>>` … `# <<< vhrn managed aliases <<<` block from your
+  `config.fish` by hand, or the alias is defined twice.
+
 ## [0.3.0] - 2026-07-25
 
 ### Added

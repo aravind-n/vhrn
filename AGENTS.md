@@ -87,8 +87,11 @@ Core behavioral invariants — keep these intact:
   by vhrn — the entrypoint sources `~/.profile` at runtime so build-time installers register
   themselves.
 - **Shell aliases and the installed registry are host state.** `install`/`uninstall` mutate
-  `~/.config/vhrn/installed` and regenerate reversible marker-delimited alias blocks in
-  bash/zsh/fish rc files (existing files + the current shell's). `command <name>`/`\<name>`
+  `~/.config/vhrn/installed` and regenerate reversible marker-delimited alias blocks in the
+  bash/zsh rc files (existing files + the current shell's). fish is not an rc file: it gets a
+  vhrn-owned `<xdg>/fish/conf.d/vhrn.fish` (whole-file, no markers, deleted on uninstall),
+  managed when the fish config dir exists or fish is the current shell. Both roots resolve
+  through `xdg_config_root`, so `$XDG_CONFIG_HOME` is honored. `command <name>`/`\<name>`
   still reach the real binary.
 - The harness binary is baked into the image (native, in `~/.local`; no host install) and
   honors `HTTPS_PROXY`. The entrypoint clears a stale `$PWD/.git/index.lock` on boot (needs

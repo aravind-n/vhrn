@@ -219,14 +219,17 @@ fn run_install(args: &[String]) -> i32 {
         error!("{e}");
         return 1;
     }
-    if let Err(e) =
-        crate::shell::sync_aliases(&config_dir, &home, crate::shell::current_shell().as_deref())
-    {
+    if let Err(e) = crate::shell::sync_aliases(
+        &config_dir,
+        &home,
+        crate::shell::current_shell().as_deref(),
+        crate::shell::xdg_config_home().as_deref(),
+    ) {
         warn!("could not update shell aliases: {e}");
     }
 
     println!(
-        "Installed {name} ({version}). Restart your shell (or source your rc file) to use `{}`.",
+        "Installed {name} ({version}). Restart your shell to use `{}`.",
         h.alias
     );
     i32::from(!tools_ok)
@@ -426,9 +429,12 @@ fn run_uninstall(args: &[String]) -> i32 {
         error!("{e}");
         return 1;
     }
-    if let Err(e) =
-        crate::shell::sync_aliases(&config_dir, &home, crate::shell::current_shell().as_deref())
-    {
+    if let Err(e) = crate::shell::sync_aliases(
+        &config_dir,
+        &home,
+        crate::shell::current_shell().as_deref(),
+        crate::shell::xdg_config_home().as_deref(),
+    ) {
         warn!("could not update shell aliases: {e}");
     }
 
