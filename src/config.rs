@@ -176,7 +176,8 @@ mod tests {
 
     #[test]
     fn load_config_no_files_yields_defaults() {
-        let cfg = load_config(&temp_dir()).unwrap();
+        let dir = temp_dir();
+        let cfg = load_config(dir.path()).unwrap();
         assert_eq!(cfg, default_config());
     }
 
@@ -184,12 +185,12 @@ mod tests {
     fn load_config_global_over_defaults() {
         let config_dir = temp_dir();
         std::fs::write(
-            config_dir.join("config.toml"),
+            config_dir.path().join("config.toml"),
             "[tools]\napt = [\"ripgrep\"]\nrun = [\"curl https://example.test | sh\"]\n[net]\nmode = \"report\"\nallow = [\"global.example\"]\n",
         )
         .unwrap();
 
-        let cfg = load_config(&config_dir).unwrap();
+        let cfg = load_config(config_dir.path()).unwrap();
         assert_eq!(cfg.net.allow, Some(vec!["global.example".to_string()])); // from global config
         assert_eq!(cfg.net.mode, Some("report".to_string()));
         assert_eq!(cfg.tools.apt, Some(vec!["ripgrep".to_string()]));
@@ -206,14 +207,18 @@ mod tests {
     #[test]
     fn load_config_malformed_is_error() {
         let config_dir = temp_dir();
-        std::fs::write(config_dir.join("config.toml"), "this is = not valid = toml").unwrap();
-        assert!(load_config(&config_dir).is_err());
+        std::fs::write(
+            config_dir.path().join("config.toml"),
+            "this is = not valid = toml",
+        )
+        .unwrap();
+        assert!(load_config(config_dir.path()).is_err());
     }
 
     #[test]
     fn check_blocked_dir_exact_match_only() {
-        let home = temp_dir();
-        let home = home.to_str().unwrap();
+        let home_dir = temp_dir();
+        let home = home_dir.path().to_str().unwrap();
         let blocked = vec!["~".to_string(), "/".to_string()];
 
         // Exact $HOME and exact / are refused.

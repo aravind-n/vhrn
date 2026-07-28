@@ -363,17 +363,17 @@ mod tests {
     fn installed_registry_add_update_remove() {
         let dir = temp_dir();
         assert!(
-            read_installed(&dir).is_empty(),
+            read_installed(dir.path()).is_empty(),
             "fresh registry should be empty"
         );
-        assert!(installed_version(&dir, "claude").is_none());
+        assert!(installed_version(dir.path(), "claude").is_none());
 
-        add_installed(&dir, "claude", "v0.2.0").unwrap();
-        add_installed(&dir, "codex", "latest").unwrap();
-        add_installed(&dir, "claude", "v0.3.0").unwrap(); // update in place
+        add_installed(dir.path(), "claude", "v0.2.0").unwrap();
+        add_installed(dir.path(), "codex", "latest").unwrap();
+        add_installed(dir.path(), "claude", "v0.3.0").unwrap(); // update in place
 
         assert_eq!(
-            read_installed(&dir),
+            read_installed(dir.path()),
             vec![
                 InstalledHarness {
                     name: "claude".into(),
@@ -385,11 +385,14 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(installed_version(&dir, "claude").as_deref(), Some("v0.3.0"));
-
-        remove_installed(&dir, "claude").unwrap();
         assert_eq!(
-            read_installed(&dir),
+            installed_version(dir.path(), "claude").as_deref(),
+            Some("v0.3.0")
+        );
+
+        remove_installed(dir.path(), "claude").unwrap();
+        assert_eq!(
+            read_installed(dir.path()),
             vec![InstalledHarness {
                 name: "codex".into(),
                 version: "latest".into()
@@ -400,13 +403,17 @@ mod tests {
     #[test]
     fn read_installed_bare_name_defaults_latest() {
         let dir = temp_dir();
-        std::fs::write(installed_registry_path(&dir), "claude\n").unwrap();
-        assert_eq!(installed_version(&dir, "claude").as_deref(), Some("latest"));
+        std::fs::write(installed_registry_path(dir.path()), "claude\n").unwrap();
+        assert_eq!(
+            installed_version(dir.path(), "claude").as_deref(),
+            Some("latest")
+        );
     }
 
     #[test]
     fn write_alias_block_round_trip() {
-        let path = temp_dir().join(".zshrc");
+        let dir = temp_dir();
+        let path = dir.path().join(".zshrc");
         std::fs::write(&path, "export FOO=1\n").unwrap();
 
         let block = alias_block(std::slice::from_ref(&claude()), "zsh");
@@ -434,8 +441,13 @@ mod tests {
 
     #[test]
     fn write_alias_block_no_spurious_file() {
-        let path = temp_dir().join(".bashrc"); // temp_dir exists; this file does not
+        let dir = temp_dir();
+        let path = dir.path().join(".bashrc");
         write_alias_block(&path, "").unwrap();
+        assert!(
+            dir.path().is_dir(),
+            "the guard must outlive the assert below"
+        );
         assert!(
             !path.exists(),
             "removing a block from an absent file should not create it"
@@ -446,12 +458,12 @@ mod tests {
     fn sync_aliases_manages_existing_and_current_shell() {
         let config_dir = temp_dir();
         let home = temp_dir();
-        let bashrc = home.join(".bashrc");
+        let bashrc = home.path().join(".bashrc");
         std::fs::write(&bashrc, "# bash\n").unwrap(); // exists -> managed
-        let zshrc = home.join(".zshrc"); // current shell -> created
+        let zshrc = home.path().join(".zshrc"); // current shell -> created
 
-        add_installed(&config_dir, "claude", "latest").unwrap();
-        sync_aliases(&config_dir, &home, Some("zsh"), None).unwrap();
+        add_installed(config_dir.path(), "claude", "latest").unwrap();
+        sync_aliases(config_dir.path(), home.path(), Some("zsh"), None).unwrap();
 
         for p in [&bashrc, &zshrc] {
             let data = std::fs::read_to_string(p).unwrap_or_default();
@@ -461,13 +473,13 @@ mod tests {
             );
         }
         assert!(
-            !fish_conf_path(&home, None).exists(),
+            !fish_conf_path(home.path(), None).exists(),
             "fish neither configured nor current shell; leave alone"
         );
 
         // Uninstalling clears the blocks.
-        remove_installed(&config_dir, "claude").unwrap();
-        sync_aliases(&config_dir, &home, Some("zsh"), None).unwrap();
+        remove_installed(config_dir.path(), "claude").unwrap();
+        sync_aliases(config_dir.path(), home.path(), Some("zsh"), None).unwrap();
         assert!(
             !std::fs::read_to_string(&zshrc)
                 .unwrap()
@@ -512,10 +524,10 @@ mod tests {
     fn sync_aliases_writes_and_removes_fish_conf() {
         let config_dir = temp_dir();
         let home = temp_dir();
-        let conf = fish_conf_path(&home, None);
+        let conf = fish_conf_path(home.path(), None);
 
-        add_installed(&config_dir, "claude", "latest").unwrap();
-        sync_aliases(&config_dir, &home, Some("fish"), None).unwrap();
+        add_installed(config_dir.path(), "claude", "latest").unwrap();
+        sync_aliases(config_dir.path(), home.path(), Some("fish"), None).unwrap();
         assert!(
             std::fs::read_to_string(&conf)
                 .unwrap()
@@ -523,12 +535,12 @@ mod tests {
             "fish alias should land in conf.d/vhrn.fish"
         );
         assert!(
-            !home.join(".config/fish/config.fish").exists(),
+            !home.path().join(".config/fish/config.fish").exists(),
             "config.fish is the user's; vhrn must not touch it"
         );
 
-        remove_installed(&config_dir, "claude").unwrap();
-        sync_aliases(&config_dir, &home, Some("fish"), None).unwrap();
+        remove_installed(config_dir.path(), "claude").unwrap();
+        sync_aliases(config_dir.path(), home.path(), Some("fish"), None).unwrap();
         assert!(
             !conf.exists(),
             "uninstall should remove the vhrn-owned file, not blank it"
@@ -540,18 +552,18 @@ mod tests {
         let config_dir = temp_dir();
         let home = temp_dir();
         let xdg = temp_dir();
-        std::fs::create_dir_all(xdg.join("fish")).unwrap(); // fish configured, but not $SHELL
-        let xdg_s = xdg.to_string_lossy().into_owned();
+        std::fs::create_dir_all(xdg.path().join("fish")).unwrap(); // fish configured, but not $SHELL
+        let xdg_s = xdg.path().to_string_lossy().into_owned();
 
-        add_installed(&config_dir, "claude", "latest").unwrap();
-        sync_aliases(&config_dir, &home, Some("zsh"), Some(&xdg_s)).unwrap();
+        add_installed(config_dir.path(), "claude", "latest").unwrap();
+        sync_aliases(config_dir.path(), home.path(), Some("zsh"), Some(&xdg_s)).unwrap();
 
         assert!(
-            xdg.join("fish/conf.d/vhrn.fish").is_file(),
+            xdg.path().join("fish/conf.d/vhrn.fish").is_file(),
             "an existing fish config dir should be managed even when fish isn't $SHELL"
         );
         assert!(
-            !home.join(".config/fish").exists(),
+            !home.path().join(".config/fish").exists(),
             "XDG_CONFIG_HOME must win over ~/.config"
         );
     }
@@ -560,9 +572,9 @@ mod tests {
     fn sync_aliases_no_spurious_fish_conf() {
         let config_dir = temp_dir();
         let home = temp_dir();
-        sync_aliases(&config_dir, &home, Some("fish"), None).unwrap();
+        sync_aliases(config_dir.path(), home.path(), Some("fish"), None).unwrap();
         assert!(
-            !home.join(".config/fish").exists(),
+            !home.path().join(".config/fish").exists(),
             "nothing installed should not conjure a fish config tree"
         );
     }
