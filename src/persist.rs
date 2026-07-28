@@ -229,33 +229,38 @@ mod tests {
         let h = claude();
 
         // No host creds: nothing seeded.
-        bootstrap_credentials(&home, &state, &h);
+        bootstrap_credentials(home.path(), state.path(), &h);
         assert!(
-            !state.join(".credentials.json").is_file(),
+            !state.path().join(".credentials.json").is_file(),
             "seeded creds without a host source"
         );
 
         // Host login present + empty store: inherited.
-        std::fs::create_dir_all(home.join(".claude")).unwrap();
-        std::fs::write(home.join(".claude").join(".credentials.json"), "HOST").unwrap();
-        bootstrap_credentials(&home, &state, &h);
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude").join(".credentials.json"),
+            "HOST",
+        )
+        .unwrap();
+        bootstrap_credentials(home.path(), state.path(), &h);
         assert_eq!(
-            std::fs::read_to_string(state.join(".credentials.json")).unwrap(),
+            std::fs::read_to_string(state.path().join(".credentials.json")).unwrap(),
             "HOST"
         );
 
         // Container has since logged in: the host seed must not clobber it.
-        std::fs::write(state.join(".credentials.json"), "existing").unwrap();
-        bootstrap_credentials(&home, &state, &h);
+        std::fs::write(state.path().join(".credentials.json"), "existing").unwrap();
+        bootstrap_credentials(home.path(), state.path(), &h);
         assert_eq!(
-            std::fs::read_to_string(state.join(".credentials.json")).unwrap(),
+            std::fs::read_to_string(state.path().join(".credentials.json")).unwrap(),
             "existing"
         );
     }
 
     #[test]
     fn seed_claude_config_json_preserves_login() {
-        let path = temp_dir().join(".claude.json");
+        let dir = temp_dir();
+        let path = dir.path().join(".claude.json");
         std::fs::write(
             &path,
             r#"{"hasCompletedOnboarding":false,"oauthAccount":{"emailAddress":"a@b.c"},"numberOfStartups":1784592922215,"projects":{"/other":{"hasTrustDialogAccepted":true}}}"#,
@@ -292,7 +297,8 @@ mod tests {
 
     #[test]
     fn seed_claude_config_json_fresh() {
-        let path = temp_dir().join(".claude.json");
+        let dir = temp_dir();
+        let path = dir.path().join(".claude.json");
         seed_claude_config_json(&path, "/proj").unwrap();
         let m: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();

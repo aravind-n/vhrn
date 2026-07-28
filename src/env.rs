@@ -132,14 +132,14 @@ mod tests {
         let cache = crate::testutil::temp_dir();
 
         // Absent: no mount, and any stale copy is removed.
-        let dst = cache.join("gitconfig");
+        let dst = cache.path().join("gitconfig");
         std::fs::write(&dst, "old").unwrap();
-        assert!(git_config_mount(&home, &cache).is_empty());
+        assert!(git_config_mount(home.path(), cache.path()).is_empty());
         assert!(!dst.exists(), "stale gitconfig copy should be removed");
 
         // Present: copied and mounted.
-        std::fs::write(home.join(".gitconfig"), "[user]\n\tname = X\n").unwrap();
-        let m = git_config_mount(&home, &cache);
+        std::fs::write(home.path().join(".gitconfig"), "[user]\n\tname = X\n").unwrap();
+        let m = git_config_mount(home.path(), cache.path());
         assert_eq!(
             m,
             vec![

@@ -585,8 +585,9 @@ mod tests {
 
     // A ContainerConfig fixture whose sandbox has skills/ + settings.json + CLAUDE.md, but
     // no commands/agents dirs or statusline.sh.
-    fn fixture_with_sandbox() -> (ContainerConfig, std::path::PathBuf) {
-        let sandbox = crate::testutil::temp_dir();
+    fn fixture_with_sandbox() -> (ContainerConfig, tempfile::TempDir) {
+        let dir = crate::testutil::temp_dir();
+        let sandbox = dir.path();
         std::fs::create_dir_all(sandbox.join("skills")).unwrap();
         std::fs::write(sandbox.join("settings.json"), "{}").unwrap();
         std::fs::write(sandbox.join("CLAUDE.md"), "guide").unwrap();
@@ -602,7 +603,7 @@ mod tests {
             key: "-proj".into(),
             ..Default::default()
         };
-        (cfg, sandbox)
+        (cfg, dir)
     }
 
     #[test]
@@ -618,15 +619,15 @@ mod tests {
         for want in [
             format!(
                 "{}:/home/dev/.claude/skills",
-                sandbox.join("skills").display()
+                sandbox.path().join("skills").display()
             ),
             format!(
                 "{}:/home/dev/.claude/settings.json",
-                sandbox.join("settings.json").display()
+                sandbox.path().join("settings.json").display()
             ),
             format!(
                 "{}:/home/dev/.claude/CLAUDE.md",
-                sandbox.join("CLAUDE.md").display()
+                sandbox.path().join("CLAUDE.md").display()
             ),
             "/host/history:/home/dev/.claude/projects/-proj".to_string(),
         ] {
@@ -643,9 +644,9 @@ mod tests {
     #[test]
     fn container_run_args_golden() {
         let sandbox = crate::testutil::temp_dir();
-        std::fs::create_dir_all(sandbox.join("skills")).unwrap();
-        std::fs::write(sandbox.join("settings.json"), "{}").unwrap();
-        std::fs::write(sandbox.join("CLAUDE.md"), "guide").unwrap();
+        std::fs::create_dir_all(sandbox.path().join("skills")).unwrap();
+        std::fs::write(sandbox.path().join("settings.json"), "{}").unwrap();
+        std::fs::write(sandbox.path().join("CLAUDE.md"), "guide").unwrap();
 
         let cfg = ContainerConfig {
             engine: "container".into(),
@@ -660,7 +661,7 @@ mod tests {
             project: "/proj".into(),
             key: "-proj".into(),
             state: "/state".into(),
-            sandbox: sandbox.to_string_lossy().into_owned(),
+            sandbox: sandbox.path().to_string_lossy().into_owned(),
             config_dir: "/home/dev/.claude".into(),
             history: "/hist".into(),
             git_mount: vec![
@@ -681,15 +682,15 @@ mod tests {
 
         let skills = format!(
             "{}:/home/dev/.claude/skills",
-            sandbox.join("skills").display()
+            sandbox.path().join("skills").display()
         );
         let settings = format!(
             "{}:/home/dev/.claude/settings.json",
-            sandbox.join("settings.json").display()
+            sandbox.path().join("settings.json").display()
         );
         let guide = format!(
             "{}:/home/dev/.claude/CLAUDE.md",
-            sandbox.join("CLAUDE.md").display()
+            sandbox.path().join("CLAUDE.md").display()
         );
         let expected: Vec<String> = [
             "run",

@@ -342,7 +342,8 @@ mod tests {
 
     #[test]
     fn allowlist_seed_count_and_atomic_add() {
-        let np = NetPolicy::new(&crate::testutil::temp_dir());
+        let dir = crate::testutil::temp_dir();
+        let np = NetPolicy::new(dir.path());
         np.ensure().unwrap();
         np.seed_allowlist_if_absent();
         let base = np.count_domains();
@@ -365,17 +366,22 @@ mod tests {
         let cache = crate::testutil::temp_dir();
         // Install seeds the 11 defaults, then unions the harness domains not already
         // present — api.anthropic.com is a default (no-op); example.test is new.
-        seed_allowlist(&cache, &["api.anthropic.com".into(), "example.test".into()]).unwrap();
-        let np = NetPolicy::new(&cache);
+        seed_allowlist(
+            cache.path(),
+            &["api.anthropic.com".into(), "example.test".into()],
+        )
+        .unwrap();
+        let np = NetPolicy::new(cache.path());
         assert_eq!(np.count_domains(), 12, "11 defaults + 1 new harness domain");
         // Idempotent: re-seeding the same domain adds nothing.
-        seed_allowlist(&cache, &["example.test".into()]).unwrap();
+        seed_allowlist(cache.path(), &["example.test".into()]).unwrap();
         assert_eq!(np.count_domains(), 12);
     }
 
     #[test]
     fn denied_domains_unique_sorted() {
-        let np = NetPolicy::new(&crate::testutil::temp_dir());
+        let dir = crate::testutil::temp_dir();
+        let np = NetPolicy::new(dir.path());
         np.ensure().unwrap();
         std::fs::write(
             &np.deny_log,
@@ -387,7 +393,8 @@ mod tests {
             vec!["evil.com".to_string(), "tracker.io".to_string()]
         );
 
-        let empty = NetPolicy::new(&crate::testutil::temp_dir());
+        let empty_dir = crate::testutil::temp_dir();
+        let empty = NetPolicy::new(empty_dir.path());
         empty.ensure().unwrap();
         assert!(empty.denied_domains().is_empty());
     }
