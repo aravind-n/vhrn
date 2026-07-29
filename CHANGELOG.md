@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Deleting a config directory or file on the host now removes it from the container too.
+  The disposable copy is meant to mirror your host config, but a source that disappeared
+  left its copy behind, so a skill or setting you had deleted kept loading on every
+  subsequent run.
+
 - fish no longer has its alias injected into `config.fish`. `vhrn install` writes a
   vhrn-owned `$XDG_CONFIG_HOME/fish/conf.d/vhrn.fish` (the convention fish's `conf.d`
   exists for, as rustup and friends use), and `vhrn uninstall` deletes it. The path now

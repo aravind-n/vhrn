@@ -123,10 +123,13 @@ fn copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// sandbox files are never pruned.
 pub(crate) fn sync_claude_subdir(real: &Path, sandbox: &Path, name: &str) {
     let src = real.join(name);
+    let dst = sandbox.join(name);
     if !src.is_dir() {
+        // The source is gone, so the mirror goes too — otherwise config the user deleted
+        // keeps being mounted every run.
+        let _ = std::fs::remove_dir_all(&dst);
         return;
     }
-    let dst = sandbox.join(name);
     if look_path("rsync") {
         let ok = Command::new("rsync")
             .args(["-aL", "--delete"])
@@ -154,10 +157,12 @@ pub(crate) fn sync_claude_subdir(real: &Path, sandbox: &Path, name: &str) {
 /// Copy a single ~/.claude file into the sandbox (cp -L).
 pub(crate) fn copy_file_into(real: &Path, sandbox: &Path, name: &str) {
     let src = real.join(name);
+    let dst = sandbox.join(name);
     if !src.is_file() {
+        let _ = std::fs::remove_file(&dst); // as in sync_claude_subdir: the mirror follows
         return;
     }
-    if copy_file(&src, &sandbox.join(name)).is_err() {
+    if copy_file(&src, &dst).is_err() {
         warn!("could not copy '{name}'");
     }
 }
@@ -220,6 +225,49 @@ mod tests {
             credentials: vec![".credentials.json".into()],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn sync_mirrors_a_live_source() {
+        let host = temp_dir();
+        let sandbox = temp_dir();
+        std::fs::create_dir_all(host.path().join("skills")).unwrap();
+        std::fs::write(host.path().join("skills").join("SKILL.md"), "real").unwrap();
+        std::fs::write(host.path().join("settings.json"), "{}").unwrap();
+
+        sync_claude_subdir(host.path(), sandbox.path(), "skills");
+        copy_file_into(host.path(), sandbox.path(), "settings.json");
+
+        assert_eq!(
+            std::fs::read_to_string(sandbox.path().join("skills").join("SKILL.md")).unwrap(),
+            "real"
+        );
+        assert_eq!(
+            std::fs::read_to_string(sandbox.path().join("settings.json")).unwrap(),
+            "{}"
+        );
+    }
+
+    #[test]
+    fn sync_drops_a_copy_whose_source_is_gone() {
+        let host = temp_dir(); // nothing on the host behind either copy
+        let sandbox = temp_dir();
+        std::fs::create_dir_all(sandbox.path().join("skills")).unwrap();
+        std::fs::write(sandbox.path().join("skills").join("SKILL.md"), "stale").unwrap();
+        std::fs::write(sandbox.path().join("settings.json"), "stale").unwrap();
+
+        sync_claude_subdir(host.path(), sandbox.path(), "skills");
+        copy_file_into(host.path(), sandbox.path(), "settings.json");
+
+        // Config the user deleted must not keep being mounted.
+        assert!(
+            !sandbox.path().join("skills").exists(),
+            "stale dir outlived its source"
+        );
+        assert!(
+            !sandbox.path().join("settings.json").exists(),
+            "stale file outlived its source"
+        );
     }
 
     #[test]
