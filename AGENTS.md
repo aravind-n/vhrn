@@ -52,8 +52,10 @@ Core behavioral invariants — keep these intact:
   a backup file), never a single-file mount.
 - **The disposable config copy (`~/.cache/vhrn/sandbox/<harness>`) is re-synced from
   `~/.claude` every run** (`rsync -aL --delete`, `cp -RL` fallback), so edits there are wiped
-  — change `~/.claude` instead. It is physically separate from `state/`, and per-harness so
-  one harness's `--delete` never runs on a tree another's live container has mounted.
+  — change `~/.claude` instead. Deleting the host source removes the copy too, so config the
+  user deleted is never mounted again. It is physically separate from `state/`, and
+  per-harness so one harness's `--delete` never runs on a tree another's live container has
+  mounted.
 - **The history key must match Claude's `projects/<key>` encoding** (`[^A-Za-z0-9]` → `-` on
   the absolute project path), or in-container history stops unifying with native history.
 - **Terminal env crosses verbatim.** `TERM`/`COLORTERM`/`TERM_PROGRAM`/`TERM_PROGRAM_VERSION`
