@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Your `~/.agents` is now mounted in the container at `/home/dev/.agents`, for every
+- `~/.agents` is now mounted in the container at `/home/dev/.agents`, for every
   harness. It is the vendor-neutral config dir agent tools converged on so portable
   configuration — a skill library, today — is installed once rather than once per vendor
   directory. The whole tree is carried in, so a path an agent starts reading later needs no
