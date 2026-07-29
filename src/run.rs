@@ -49,6 +49,13 @@ pub(crate) fn vhrn_cache(home: &Path) -> PathBuf {
     vhrn_cache_from(home, std::env::var("XDG_CACHE_HOME").ok().as_deref())
 }
 
+/// The disposable config copy for one harness (`<cache>/sandbox/<harness>`). Per-harness so
+/// one harness's `rsync --delete` never runs on a directory another's live container has
+/// mounted — the same split `state/<harness>` already has.
+fn sandbox_dir(cache: &Path, harness: &str) -> PathBuf {
+    cache.join("sandbox").join(harness)
+}
+
 /// Whether `name` is an executable on `$PATH`: a file with any execute bit set in some
 /// PATH directory.
 pub(crate) fn look_path(name: &str) -> bool {
@@ -271,7 +278,7 @@ pub(crate) struct ContainerConfig {
     pub key: String,   // history key: [^A-Za-z0-9] -> '-'
     pub cache: String, // ~/.cache/vhrn
     pub state: String, // <cache>/state/<harness> -> the container's persistent config dir
-    pub sandbox: String, // <cache>/sandbox -> disposable synced config
+    pub sandbox: String, // <cache>/sandbox/<harness> -> disposable synced config
     pub config_dir: String, // container config dir, e.g. /home/dev/.claude
     pub host_config: String, // host config dir, e.g. ~/.claude
     pub history: String, // <host_config>/projects/<key>
@@ -353,7 +360,7 @@ fn prepare_container(h: &Harness) -> Result<ContainerConfig> {
     let cache = vhrn_cache(&home);
     let key = history_key(&project_s);
     let host_config = home.join(&h.host_config);
-    let sandbox = cache.join("sandbox");
+    let sandbox = sandbox_dir(&cache, &h.name);
     let history = host_config.join("projects").join(&key);
 
     // The persistent, container-owned store — login/credentials/onboarding live here.
@@ -558,6 +565,16 @@ mod tests {
             vhrn_cache_from(home, None),
             Path::new("/home/u/.cache/vhrn")
         );
+    }
+
+    #[test]
+    fn sandbox_dir_is_per_harness() {
+        let cache = Path::new("/c/vhrn");
+        assert_eq!(
+            sandbox_dir(cache, "claude"),
+            Path::new("/c/vhrn/sandbox/claude")
+        );
+        assert_ne!(sandbox_dir(cache, "claude"), sandbox_dir(cache, "codex"));
     }
 
     #[test]

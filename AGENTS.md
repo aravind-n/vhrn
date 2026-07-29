@@ -50,9 +50,10 @@ Core behavioral invariants — keep these intact:
   `projects/<key>` history layer on top as **nested** mounts, so the config sync can never
   reach `state/`. `.claude.json` must sit in a real directory mount (Claude rewrites it via
   a backup file), never a single-file mount.
-- **The disposable config copy (`~/.cache/vhrn/sandbox`) is re-synced from `~/.claude` every
-  run** (`rsync -aL --delete`, `cp -RL` fallback), so edits there are wiped — change
-  `~/.claude` instead. It is physically separate from `state/`.
+- **The disposable config copy (`~/.cache/vhrn/sandbox/<harness>`) is re-synced from
+  `~/.claude` every run** (`rsync -aL --delete`, `cp -RL` fallback), so edits there are wiped
+  — change `~/.claude` instead. It is physically separate from `state/`, and per-harness so
+  one harness's `--delete` never runs on a tree another's live container has mounted.
 - **The history key must match Claude's `projects/<key>` encoding** (`[^A-Za-z0-9]` → `-` on
   the absolute project path), or in-container history stops unifying with native history.
 - **Terminal env crosses verbatim.** `TERM`/`COLORTERM`/`TERM_PROGRAM`/`TERM_PROGRAM_VERSION`

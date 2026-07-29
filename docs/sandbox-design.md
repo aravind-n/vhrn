@@ -43,8 +43,8 @@ every boot. Persistence is a property of what's mounted, not of container lifeti
 (Caveat: an in-container token refresh doesn't flow back to the host.)
 
 A disposable copy of your host harness config (skills, commands, agents, harness
-settings) is synced into `~/.cache/vhrn/sandbox/` on each run and layered on top of the
-persistent store, so edits to that copy don't survive — change your real host config
+settings) is synced into `~/.cache/vhrn/sandbox/<harness>/` on each run and layered on top
+of the persistent store, so edits to that copy don't survive — change your real host config
 instead (e.g. `~/.claude` for Claude). The persistent store is separate and is never
 touched by the sync. Session history is written back to the host so in-container and
 native sessions share it.
