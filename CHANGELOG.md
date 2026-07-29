@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- vhrn no longer decides for you whether a project is trusted. It used to write
+  `hasTrustDialogAccepted` into the container's `.claude.json` before every launch, so the
+  trust dialog never appeared — and untrusting a folder from inside the container was undone
+  on the next run, with no way to make it stick. That also meant a repo's own
+  `.claude/skills` got their `allowed-tools` grants without you ever being asked.
+
+  You will now see the trust prompt once per project, and the answer persists. On a config
+  store that has never been used you will also see the one-time onboarding screen.
+  Existing stores keep every trust answer already recorded in them — nothing is reset.
+
 - The disposable config copy moved from `~/.cache/vhrn/sandbox/` to
   `~/.cache/vhrn/sandbox/<harness>/`, so one harness's sync can never delete files under a
   running container of another. The old directory is left where it is; it is derived state

@@ -70,7 +70,7 @@ pub(crate) fn look_path(name: &str) -> bool {
 }
 
 /// Set a path's unix permission bits (safe — the crate forbids unsafe). Used for the
-/// world-writable policy dir/log and the private creds/.claude.json.
+/// world-writable policy dir/log and the private state dir and credentials.
 pub(crate) fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
@@ -401,7 +401,7 @@ fn prepare_container(h: &Harness) -> Result<ContainerConfig> {
     let history = host_config.join("projects").join(&key);
 
     // The persistent, container-owned store — login/credentials/onboarding live here.
-    let state = crate::persist::prepare_state(&home, &cache, h, &project_s)?;
+    let state = crate::persist::prepare_state(&home, &cache, h)?;
 
     std::fs::create_dir_all(&sandbox)?;
     std::fs::create_dir_all(&history)?;

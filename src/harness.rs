@@ -22,8 +22,6 @@ pub(crate) struct Harness {
     pub sync_dirs: Vec<String>, // disposable synced subdirs, e.g. skills/commands/agents
     pub sync_files: Vec<String>, // disposable synced files, e.g. settings.json/statusline.sh
     pub credentials: Vec<String>, // state_dir-relative bootstrap-only files
-    pub config_json: String, // state_dir-relative login/onboarding/trust file
-    pub seed_trust: bool,  // pre-seed onboarding + per-project trust into config_json
 }
 
 /// The built-in registry. Only claude exists today; the struct shape is what a
@@ -47,8 +45,6 @@ fn registry() -> Vec<Harness> {
         sync_dirs: vec!["skills".into(), "commands".into(), "agents".into()],
         sync_files: vec!["settings.json".into(), "statusline.sh".into()],
         credentials: vec![".credentials.json".into()],
-        config_json: ".claude.json".into(),
-        seed_trust: true,
     }]
 }
 

@@ -1,9 +1,9 @@
 //! The container-owned state store and the disposable config sync. `state/<harness>/` is
 //! the persistent store mounted as the container's config dir; host credentials seed it
-//! bootstrap-only (an in-container login is never clobbered), and `.claude.json` is merged
-//! in place to complete onboarding + trust this project without touching
-//! `oauthAccount`/other projects. The sandbox sync + container guide are re-derived each
-//! run and layered on top as nested mounts.
+//! bootstrap-only (an in-container login is never clobbered). Everything else in the store
+//! belongs to the agent — onboarding and per-project trust included — so a decision made
+//! in the container is the one that survives. The sandbox sync + container guide are
+//! re-derived each run and layered on top as nested mounts.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,25 +20,13 @@ fn host_state_dir(cache: &Path, harness: &str) -> PathBuf {
     cache.join("state").join(harness)
 }
 
-/// Ready the persistent store before launch and return its path: ensure the dir,
-/// bootstrap credentials from the host once, and seed onboarding + this project's
-/// trust into the config JSON.
-pub(crate) fn prepare_state(
-    home: &Path,
-    cache: &Path,
-    h: &Harness,
-    project: &str,
-) -> Result<PathBuf> {
+/// Ready the persistent store before launch and return its path: ensure the dir and
+/// bootstrap credentials from the host once.
+pub(crate) fn prepare_state(home: &Path, cache: &Path, h: &Harness) -> Result<PathBuf> {
     let state = host_state_dir(cache, &h.name);
     std::fs::create_dir_all(&state)?;
     set_mode(&state, 0o700)?;
     bootstrap_credentials(home, &state, h);
-    if h.seed_trust
-        && !h.config_json.is_empty()
-        && let Err(e) = seed_claude_config_json(&state.join(&h.config_json), project)
-    {
-        warn!("could not seed {}: {e}", h.config_json);
-    }
     Ok(state)
 }
 
@@ -61,52 +49,6 @@ fn bootstrap_credentials(home: &Path, state: &Path, h: &Harness) {
         }
         let _ = set_mode(&dst, 0o600); // credentials stay private
     }
-}
-
-/// Ensure the container-owned config JSON has onboarding completed and this project
-/// pre-trusted, without disturbing anything the container wrote (login/oauthAccount, other
-/// projects). Numbers are preserved exactly (`arbitrary_precision`), and an unparseable
-/// container-owned file is left untouched rather than clobbered.
-fn seed_claude_config_json(path: &Path, project: &str) -> Result<()> {
-    use serde_json::{Map, Value};
-
-    let mut m: Map<String, Value> = match std::fs::read(path) {
-        Ok(data) if !data.is_empty() => match serde_json::from_slice::<Value>(&data) {
-            Ok(Value::Object(map)) => map,
-            _ => return Ok(()), // unparseable / not an object: leave the container's file untouched
-        },
-        _ => Map::new(), // absent or empty: fresh
-    };
-
-    m.entry("hasCompletedOnboarding")
-        .or_insert(Value::Bool(true));
-
-    let projects = m
-        .entry("projects")
-        .or_insert_with(|| Value::Object(Map::new()));
-    if !projects.is_object() {
-        *projects = Value::Object(Map::new());
-    }
-    let projects = projects.as_object_mut().unwrap();
-
-    let proj = projects
-        .entry(project)
-        .or_insert_with(|| Value::Object(Map::new()));
-    if !proj.is_object() {
-        *proj = Value::Object(Map::new());
-    }
-    let proj = proj.as_object_mut().unwrap();
-    proj.insert("hasTrustDialogAccepted".to_string(), Value::Bool(true));
-    proj.insert(
-        "hasCompletedProjectOnboarding".to_string(),
-        Value::Bool(true),
-    );
-
-    let mut out = serde_json::to_string_pretty(&Value::Object(m))?;
-    out.push('\n');
-    std::fs::write(path, out)?;
-    set_mode(path, 0o600)?;
-    Ok(())
 }
 
 /// Copy src to dst, following symlinks in src (like cp -L), creating parents.
@@ -307,51 +249,21 @@ mod tests {
     }
 
     #[test]
-    fn seed_claude_config_json_preserves_login() {
-        let dir = temp_dir();
-        let path = dir.path().join(".claude.json");
-        std::fs::write(
-            &path,
-            r#"{"hasCompletedOnboarding":false,"oauthAccount":{"emailAddress":"a@b.c"},"numberOfStartups":1784592922215,"projects":{"/other":{"hasTrustDialogAccepted":true}}}"#,
-        )
-        .unwrap();
+    fn prepare_state_leaves_the_config_json_alone() {
+        let home = temp_dir();
+        let cache = temp_dir();
+        let h = claude();
 
-        seed_claude_config_json(&path, "/proj").unwrap();
-        let raw = std::fs::read_to_string(&path).unwrap();
-        // Big integers survive without float mangling.
-        assert!(
-            raw.contains("1784592922215"),
-            "large number not preserved:\n{raw}"
-        );
+        // A container-owned file that has the project explicitly *untrusted*.
+        let state = cache.path().join("state").join("claude");
+        std::fs::create_dir_all(&state).unwrap();
+        let path = state.join(".claude.json");
+        let before = r#"{"projects":{"/proj":{"hasTrustDialogAccepted":false}}}"#;
+        std::fs::write(&path, before).unwrap();
 
-        let m: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert!(
-            m.get("oauthAccount").is_some(),
-            "oauthAccount (login) dropped"
-        );
-        assert_eq!(
-            m["hasCompletedOnboarding"], false,
-            "existing onboarding overwritten"
-        );
-        assert!(
-            m["projects"].get("/other").is_some(),
-            "existing project trust dropped"
-        );
-        assert_eq!(m["projects"]["/proj"]["hasTrustDialogAccepted"], true);
-        assert_eq!(
-            m["projects"]["/proj"]["hasCompletedProjectOnboarding"],
-            true
-        );
-    }
+        prepare_state(home.path(), cache.path(), &h).unwrap();
 
-    #[test]
-    fn seed_claude_config_json_fresh() {
-        let dir = temp_dir();
-        let path = dir.path().join(".claude.json");
-        seed_claude_config_json(&path, "/proj").unwrap();
-        let m: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(m["hasCompletedOnboarding"], true);
-        assert_eq!(m["projects"]["/proj"]["hasTrustDialogAccepted"], true);
+        // The agent owns this file: an untrust made in the container must survive.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 }
