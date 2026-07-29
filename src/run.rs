@@ -287,11 +287,13 @@ pub(crate) struct ContainerConfig {
     pub sandbox: String, // <cache>/sandbox/<harness> -> disposable synced config
     pub config_dir: String, // container config dir, e.g. /home/dev/.claude
     pub host_config: String, // host config dir, e.g. ~/.claude
-    pub history: String, // <host_config>/projects/<key>
+    pub history: String, // <host_config>/projects/<key>; empty unless the harness shares it
+    pub sessions: String, // <cache>/state/<harness>-sessions/<key>; empty = not partitioned
     pub config: Config, // merged defaults + global + project config
     pub git_mount: Vec<String>,
     pub gh_env: Vec<String>,
     pub term_env: Vec<String>,
+    pub cred_env: Vec<String>, // the harness's credential vars, when the host has them
 }
 
 impl ContainerConfig {
@@ -315,17 +317,75 @@ impl ContainerConfig {
                 m.push(format!("{}:{}/{}", src.display(), self.config_dir, f));
             }
         }
-        let guide = Path::new(&self.sandbox).join("CLAUDE.md");
-        if guide.is_file() {
-            m.push("--volume".to_string());
-            m.push(format!("{}:{}/CLAUDE.md", guide.display(), self.config_dir));
+        // A guide written straight into the state dir is already inside the state mount and
+        // needs no mount of its own.
+        let h = &self.harness;
+        if !h.guide.file.is_empty() && !h.guide.in_state {
+            let guide = Path::new(&self.sandbox).join(&h.guide.file);
+            if guide.is_file() {
+                m.push("--volume".to_string());
+                m.push(format!(
+                    "{}:{}/{}",
+                    guide.display(),
+                    self.config_dir,
+                    h.guide.file
+                ));
+            }
         }
-        m.push("--volume".to_string());
-        m.push(format!(
-            "{}:{}/projects/{}",
-            self.history, self.config_dir, self.key
-        ));
+        // The transcript dir sits under the config dir but belongs to the session store, so
+        // the index and the files it names can never land in different partitions.
+        if !self.sessions.is_empty() && !h.sessions_dir.is_empty() {
+            let src = Path::new(&self.sessions).join(&h.sessions_dir);
+            if src.is_dir() {
+                m.push("--volume".to_string());
+                m.push(format!(
+                    "{}:{}/{}",
+                    src.display(),
+                    self.config_dir,
+                    h.sessions_dir
+                ));
+            }
+        }
+        if h.share_history {
+            m.push("--volume".to_string());
+            m.push(format!(
+                "{}:{}/projects/{}",
+                self.history, self.config_dir, self.key
+            ));
+        }
         m
+    }
+
+    /// The per-project session store: a top-level mount plus the env var pointing the
+    /// agent's session index at it. Login and config stay shared in the state mount; only
+    /// what a session produces is partitioned.
+    fn sessions_mount(&self) -> Vec<String> {
+        if self.sessions.is_empty() || self.harness.sessions_env.is_empty() {
+            return Vec::new();
+        }
+        let dst = format!("{CONTAINER_HOME}/{}-sessions", self.harness.state_dir);
+        vec![
+            "--volume".to_string(),
+            format!("{}:{dst}", self.sessions),
+            "--env".to_string(),
+            format!("{}={dst}", self.harness.sessions_env),
+        ]
+    }
+
+    /// The system-config layer, bound read-only at `/etc/<harness>`. A directory mount
+    /// rather than two file mounts: it sidesteps the rewrite problem a single-file mount
+    /// has, and leaves room for the agent's other admin-scope paths. Deliberately not part
+    /// of `nested_mounts` — nothing about it layers onto the state dir. Read-only is what
+    /// puts vhrn's constraints out of reach of anything running in the container.
+    fn system_config_mount(&self) -> Vec<String> {
+        let src = Path::new(&self.sandbox).join(crate::persist::SYSTEM_CONFIG_DIR);
+        if !self.harness.system_config || !src.is_dir() {
+            return Vec::new();
+        }
+        vec![
+            "--volume".to_string(),
+            format!("{}:/etc/{}:ro", src.display(), self.harness.name),
+        ]
     }
 
     /// `.agents`, bound at the container home rather than under the config dir.
@@ -398,13 +458,22 @@ fn prepare_container(h: &Harness) -> Result<ContainerConfig> {
     let key = history_key(&project_s);
     let host_config = home.join(&h.host_config);
     let sandbox = sandbox_dir(&cache, &h.name);
-    let history = host_config.join("projects").join(&key);
 
     // The persistent, container-owned store — login/credentials/onboarding live here.
     let state = crate::persist::prepare_state(&home, &cache, h)?;
+    let sessions = crate::persist::prepare_sessions(&cache, h, &key)?;
+
+    // Only a harness that shares native history has one, so vhrn never creates a projects/
+    // layout under a config dir whose agent does not use it.
+    let history = if h.share_history {
+        let p = host_config.join("projects").join(&key);
+        std::fs::create_dir_all(&p)?;
+        p.to_string_lossy().into_owned()
+    } else {
+        String::new()
+    };
 
     std::fs::create_dir_all(&sandbox)?;
-    std::fs::create_dir_all(&history)?;
 
     // Disposable config synced from the host, layered on top of the state mount.
     for (parent, name) in dir_sync_plan(&home, &host_config, h) {
@@ -413,6 +482,10 @@ fn prepare_container(h: &Harness) -> Result<ContainerConfig> {
     for f in &h.sync_files {
         crate::persist::copy_file_into(&host_config, &sandbox, f);
     }
+
+    // Fatal, unlike the guide: this layer carries vhrn's constraints, and a session that
+    // silently ran without them would not be the session the user asked for.
+    crate::persist::write_system_config(&host_config, &sandbox, h)?;
 
     Ok(ContainerConfig {
         engine,
@@ -426,11 +499,15 @@ fn prepare_container(h: &Harness) -> Result<ContainerConfig> {
         sandbox: sandbox.to_string_lossy().into_owned(),
         config_dir: format!("{CONTAINER_HOME}/{}", h.state_dir),
         host_config: host_config.to_string_lossy().into_owned(),
-        history: history.to_string_lossy().into_owned(),
+        history,
+        sessions: sessions
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         config: conf,
         git_mount: crate::env::git_config_mount(&home, &cache),
         gh_env: crate::env::gh_token_env(),
         term_env: crate::env::terminal_env(),
+        cred_env: crate::env::credential_env(&h.credential_env),
     })
 }
 
@@ -479,10 +556,13 @@ fn container_run_args(
     args.push("--volume".into());
     args.push(format!("{}:{}", cfg.state, cfg.config_dir));
     args.extend(cfg.nested_mounts());
+    args.extend(cfg.sessions_mount());
     args.extend(cfg.agents_mount());
+    args.extend(cfg.system_config_mount());
     args.extend(cfg.git_mount.iter().cloned());
     args.extend(cfg.term_env.iter().cloned());
     args.extend(cfg.gh_env.iter().cloned());
+    args.extend(cfg.cred_env.iter().cloned());
     args.push(cfg.image.clone());
     args.push(cfg.harness.command.clone());
     args.extend(f.rest.iter().cloned());
@@ -512,12 +592,20 @@ fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
     let policy_dir =
         crate::net::prepare_policy(Path::new(&cfg.cache), mode, &config_allow, &f.extra_allow)?;
 
+    // The guide lands wherever the harness reads it from: the disposable sandbox, or the
+    // state dir for an agent that resolves it under its own config dir.
+    let guide_dst = if cfg.harness.guide.in_state {
+        &cfg.state
+    } else {
+        &cfg.sandbox
+    };
     if let Err(e) = crate::persist::write_container_guide(
         Path::new(&cfg.host_config),
-        Path::new(&cfg.sandbox),
+        Path::new(guide_dst),
+        &cfg.harness,
         mode == Mode::Open,
     ) {
-        warn!("could not write container CLAUDE.md: {e}");
+        warn!("could not write container {}: {e}", cfg.harness.guide.file);
     }
 
     // Apple container needs its system service up; Docker manages its own daemon.
@@ -556,6 +644,14 @@ fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
         if !cfg.gh_env.is_empty() {
             eprintln!("vhrn: a GitHub token is present in the container with the guard off.");
         }
+        // Name the variables, never their values — this goes to a terminal the user may share.
+        let creds = crate::env::env_arg_names(&cfg.cred_env);
+        if !creds.is_empty() {
+            eprintln!(
+                "vhrn: agent credentials are present in the container with the guard off ({}).",
+                creds.join(", ")
+            );
+        }
     }
 
     let args = container_run_args(&cfg, f, mode, &ip, &port);
@@ -573,6 +669,7 @@ pub(crate) fn run_harness(h: &Harness, f: &RunFlags) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::Guide;
 
     #[test]
     fn history_key_encoding() {
@@ -650,6 +747,11 @@ mod tests {
             harness: Harness {
                 sync_dirs: vec!["skills".into(), "commands".into(), "agents".into()],
                 sync_files: vec!["settings.json".into(), "statusline.sh".into()],
+                guide: Guide {
+                    file: "CLAUDE.md".into(),
+                    ..Default::default()
+                },
+                share_history: true,
                 ..Default::default()
             },
             sandbox: sandbox.to_string_lossy().into_owned(),
@@ -808,6 +910,11 @@ mod tests {
                 config_dir_env: "CLAUDE_CONFIG_DIR".into(),
                 sync_dirs: vec!["skills".into(), "commands".into()], // commands absent
                 sync_files: vec!["settings.json".into()],
+                guide: Guide {
+                    file: "CLAUDE.md".into(),
+                    ..Default::default()
+                },
+                share_history: true,
                 ..Default::default()
             },
             image: "vhrn-claude:latest".into(),
@@ -826,6 +933,125 @@ mod tests {
             ..Default::default()
         };
         (cfg, dir)
+    }
+
+    #[test]
+    fn history_mount_is_opt_in() {
+        let (mut cfg, _dir) = fixture_with_sandbox();
+        assert!(
+            cfg.nested_mounts()
+                .join(" ")
+                .contains("/home/dev/.claude/projects/-proj")
+        );
+
+        // A harness that does not share native history gets no projects/ mount at all —
+        // otherwise vhrn litters a layout the agent never reads.
+        cfg.harness.share_history = false;
+        assert!(!cfg.nested_mounts().join(" ").contains("projects"));
+    }
+
+    #[test]
+    fn sessions_partition_per_project() {
+        let store = crate::testutil::temp_dir();
+        let (mut cfg, _dir) = fixture_with_sandbox();
+        std::fs::create_dir_all(store.path().join("sessions")).unwrap();
+        cfg.harness.share_history = false;
+        cfg.harness.state_dir = ".codex".into();
+        cfg.harness.sessions_env = "CODEX_SQLITE_HOME".into();
+        cfg.harness.sessions_dir = "sessions".into();
+        cfg.config_dir = "/home/dev/.codex".into();
+        cfg.sessions = store.path().to_string_lossy().into_owned();
+
+        // The store is a sibling of the config dir, pointed at by the agent's own env var.
+        assert_eq!(
+            cfg.sessions_mount(),
+            vec![
+                "--volume".to_string(),
+                format!("{}:/home/dev/.codex-sessions", store.path().display()),
+                "--env".to_string(),
+                "CODEX_SQLITE_HOME=/home/dev/.codex-sessions".to_string(),
+            ]
+        );
+        // ...and the transcripts it indexes are layered back under the config dir from the
+        // same host tree, so index and files can never fall into different partitions.
+        assert!(cfg.nested_mounts().join(" ").contains(&format!(
+            "{}:/home/dev/.codex/sessions",
+            store.path().join("sessions").display()
+        )));
+
+        // A harness that declares no session env keeps sessions in the shared state store.
+        cfg.harness.sessions_env = String::new();
+        assert!(cfg.sessions_mount().is_empty());
+    }
+
+    #[test]
+    fn prepare_sessions_is_keyed_and_opt_in() {
+        let cache = crate::testutil::temp_dir();
+        let h = Harness {
+            name: "codex".into(),
+            sessions_env: "CODEX_SQLITE_HOME".into(),
+            sessions_dir: "sessions".into(),
+            ..Default::default()
+        };
+        let a = crate::persist::prepare_sessions(cache.path(), &h, "-a")
+            .unwrap()
+            .unwrap();
+        let b = crate::persist::prepare_sessions(cache.path(), &h, "-b")
+            .unwrap()
+            .unwrap();
+        assert_ne!(a, b, "two projects must not share a session store");
+        assert!(a.join("sessions").is_dir());
+        // A sibling of the shared state dir, never inside it — the shared store holds the
+        // login every project uses.
+        assert!(!a.starts_with(cache.path().join("state").join("codex")));
+
+        assert!(
+            crate::persist::prepare_sessions(cache.path(), &Harness::default(), "-a")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn system_config_mount_is_read_only_and_opt_in() {
+        let (mut cfg, dir) = golden_fixture();
+        // claude declares no system config, so it emits no /etc mount even if the dir exists.
+        std::fs::create_dir_all(dir.path().join(crate::persist::SYSTEM_CONFIG_DIR)).unwrap();
+        assert!(cfg.system_config_mount().is_empty());
+
+        cfg.harness.system_config = true;
+        cfg.harness.name = "codex".into();
+        assert_eq!(
+            cfg.system_config_mount(),
+            vec![
+                "--volume".to_string(),
+                format!(
+                    "{}:/etc/codex:ro",
+                    dir.path().join(crate::persist::SYSTEM_CONFIG_DIR).display()
+                ),
+            ]
+        );
+        // It hangs off /etc, so it must never appear among the state-dir layers.
+        assert!(!cfg.nested_mounts().join(" ").contains("/etc/codex"));
+    }
+
+    // Credential vars ride alongside the other env passthrough, after the gh token and
+    // before the image — the agent's own args must still come last and untouched.
+    #[test]
+    fn credential_env_args_precede_the_image() {
+        let (mut cfg, _dir) = golden_fixture();
+        cfg.cred_env = vec!["--env".into(), "OPENAI_API_KEY=sk-x".into()];
+        let f = RunFlags {
+            open_net: false,
+            extra_allow: vec![],
+            rest: vec!["--model".into(), "gpt-5".into()],
+        };
+
+        let args = container_run_args(&cfg, &f, Mode::Enforce, "10.0.0.2", "8080");
+        let pos = |needle: &str| args.iter().position(|a| a == needle).expect(needle);
+        assert!(pos("GH_TOKEN=tok") < pos("OPENAI_API_KEY=sk-x"));
+        assert!(pos("OPENAI_API_KEY=sk-x") < pos("vhrn-claude:latest"));
+        assert_eq!(&args[args.len() - 2..], ["--model", "gpt-5"]);
     }
 
     #[test]

@@ -67,6 +67,35 @@ pub(crate) fn gh_token_env() -> Vec<String> {
     vec!["--env".to_string(), format!("GH_TOKEN={tok}")]
 }
 
+/// Forward the harness's credential variables, each only when the host actually has it
+/// set. Mirrors `gh_token_env`: an unset (or empty) variable produces no `--env` arg at
+/// all, so nothing arbitrary from the host environment crosses.
+pub(crate) fn credential_env(names: &[String]) -> Vec<String> {
+    credential_env_from(names, |k| std::env::var(k).ok())
+}
+
+/// Pure resolver behind `credential_env`, so the selection is testable without process env.
+fn credential_env_from(names: &[String], get: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut env = Vec::new();
+    for name in names {
+        if let Some(v) = get(name).filter(|v| !v.is_empty()) {
+            env.push("--env".to_string());
+            env.push(format!("{name}={v}"));
+        }
+    }
+    env
+}
+
+/// The variable names in an assembled `--env` list. For user-facing messages that must
+/// name what crossed without ever printing a value — the `--env` literals carry no `=`
+/// and drop out.
+pub(crate) fn env_arg_names(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter_map(|a| a.split_once('='))
+        .map(|(k, _)| k.to_string())
+        .collect()
+}
+
 /// Copy the host ~/.gitconfig into the cache (dereferencing symlinks) and mount it at
 /// /home/dev/.gitconfig so in-container commits use the user's identity. A disposable copy,
 /// re-synced each run. Empty when absent.
@@ -124,6 +153,49 @@ mod tests {
             "TERM_PROGRAM=Apple_Terminal",
         ];
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn credential_env_forwards_only_what_is_set() {
+        let names: Vec<String> = ["CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY"]
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+
+        // Nothing set: no --env args at all, not empty assignments.
+        assert!(credential_env_from(&names, |_| None).is_empty());
+        // An empty value counts as unset, as it does for the terminal and gh vars.
+        assert!(credential_env_from(&names, |_| Some(String::new())).is_empty());
+
+        // Only the set ones cross, in spec order.
+        let got = credential_env_from(&names, |k| match k {
+            "OPENAI_API_KEY" => Some("sk-live".into()),
+            "CODEX_API_KEY" => Some("ck".into()),
+            _ => None,
+        });
+        assert_eq!(
+            got,
+            [
+                "--env",
+                "CODEX_API_KEY=ck",
+                "--env",
+                "OPENAI_API_KEY=sk-live"
+            ]
+        );
+    }
+
+    #[test]
+    fn env_arg_names_never_expose_values() {
+        let args = credential_env_from(&["OPENAI_API_KEY".to_string()], |_| {
+            Some("sk-secret".into())
+        });
+        let names = env_arg_names(&args);
+        assert_eq!(names, ["OPENAI_API_KEY"]);
+        assert!(
+            !names.join(" ").contains("sk-secret"),
+            "a credential value reached a user-facing name list"
+        );
+        assert!(env_arg_names(&[]).is_empty());
     }
 
     #[test]
