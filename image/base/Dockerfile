@@ -7,7 +7,13 @@ FROM debian:trixie-slim
 # terminal support, and the file/search/network/archive/db CLIs an agent reaches for.
 # This is an agent jail — ship what an agent shells out to, not human-comfort tooling
 # (no editors, pagers-as-luxury, or TUIs; the agent has its own file tools).
+#
+# bubblewrap is here because an agent that sandboxes its own shell commands looks for it
+# and does not degrade gracefully without it — it aborts. Unprivileged user namespaces are
+# available in the container, so it works as dev with every capability dropped, whether or
+# not a given harness asks the agent to use it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    bubblewrap \
     ca-certificates \
     curl \
     git \

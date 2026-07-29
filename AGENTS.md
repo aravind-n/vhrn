@@ -21,7 +21,7 @@ A small monorepo with three independently-built parts plus packaging:
   image) enforcing the domain allowlist. Its own stdlib-only module (no third-party deps,
   no `go.sum`), published as `vhrn-proxy`.
 - **`image/`** — the container image recipes: `image/base/` (`Dockerfile` + `entrypoint.sh`)
-  is the shared `vhrn-base`; `image/<harness>/` (e.g. `image/claude/`) is a thin
+  is the shared `vhrn-base`; `image/<harness>/` (`image/claude/`, `image/codex/`) is a thin
   `FROM vhrn-base` plus the agent binary.
 - **`pages/`** — the `curl | sh` installer and landing page, served over GitHub Pages.
   **`.github/workflows/`** — the CI/CD pipeline. **`docs/`** — release docs.
@@ -34,8 +34,8 @@ Core behavioral invariants — keep these intact:
 - **Harnesses are data, not forks.** `src/harness.rs` holds the registry; a `Harness` spec
   carries the image name, in-container command, alias, default egress domains, and the
   persistence descriptors. Dispatch, install, run, and persistence all read from it. Adding
-  codex/aider = a spec + a `FROM vhrn-base` Dockerfile under `image/<harness>/` + a matrix
-  entry in `_build-images.yml`. No CLI fork.
+  a harness = a spec + a `FROM vhrn-base` Dockerfile under `image/<harness>/` + a matrix
+  entry in `_build-images.yml`. No CLI fork. See `docs/adding-a-harness.md`.
 - **Both Apple `container` and Docker must work, for build and run.** `image/Makefile`,
   `proxy/Makefile`, and `src/run.rs` (`detect_engine`) select the engine (explicit
   `ENGINE`/`VHRN_ENGINE`, else auto-detect `container` then `docker`) — keep them in sync.
@@ -52,9 +52,32 @@ Core behavioral invariants — keep these intact:
   container guide, and the `projects/<key>` history layer on top as **nested** mounts, so the
   config sync can never reach `state/`. `.claude.json` must sit in a real directory mount
   (Claude rewrites it via a backup file), never a single-file mount.
-- **The disposable config copy (`~/.cache/vhrn/sandbox/<harness>`) is re-synced from
-  `~/.claude` every run** (`rsync -aL --delete`, `cp -RL` fallback), so edits there are wiped
-  — change `~/.claude` instead. Deleting the host source removes the copy too, so config the
+- **If an agent writes its own config file, vhrn does not write it** — inject through a layer
+  the agent only reads. Deriving that file each run destroys the decisions the agent records
+  in it, with no way for the user to make an answer stick. `system_config` mounts the host's
+  config plus vhrn's own settings at `/etc/<name>`, **read-only** (a setting the container can
+  edit is not one). These are *defaults*, at the bottom of the agent's precedence chain: the
+  layer above it that would have outranked even the CLI (`requirements.toml`) is **ignored by
+  Codex**, verified against 0.146.0, so it is not written. `--sandbox` therefore still works
+  as a per-run hatch. The host copy is filtered: its `[projects.*]`
+  trust tables are stripped, because the project is mounted at its real host path, so copying
+  them through would answer in the container a trust question the user answered on the host —
+  `hasTrustDialogAccepted` again, by another route. Everything else crosses byte-for-byte; a
+  malformed config stays the agent's error to report, not vhrn's to parse.
+- **Persistence descriptors are per-harness, not universal.** `guide` (filename, host sources
+  first-non-empty-wins, state-dir vs sandbox, before-or-after the host's text),
+  `system_config`, `share_history`, `sessions_env`/`sessions_dir`, and `credential_env` all
+  differ between claude and codex — none of them is a default that happens to suit one agent.
+  The container guide is the *only* file vhrn derives into a state dir.
+- **Sessions are partitioned per project where an agent keeps one flat tree.** Codex's
+  `CODEX_SQLITE_HOME` points at `state/<harness>-sessions/<key>`, a sibling of the shared
+  state dir, and the transcript subdir inside it is bound back under the config dir so the
+  index and the files it names cannot land in different partitions. Login and config stay
+  shared; the databases that follow that variable carry memories and goals too, so those are
+  per-project — a documented delta, not an accident.
+- **The disposable config copy (`~/.cache/vhrn/sandbox/<harness>`) is re-synced from the
+  harness config dir every run** (`rsync -aL --delete`, `cp -RL` fallback), so edits there are
+  wiped — change `~/.claude` / `~/.codex` instead. Deleting the host source removes the copy too, so config the
   user deleted is never mounted again. It is physically separate from `state/`, and
   per-harness so one harness's `--delete` never runs on a tree another's live container has
   mounted.
@@ -66,7 +89,8 @@ Core behavioral invariants — keep these intact:
   agent ships support for it with no vhrn change. Same disposable contract as the rest of the
   sync — edit `~/.agents` on the host.
 - **The history key must match Claude's `projects/<key>` encoding** (`[^A-Za-z0-9]` → `-` on
-  the absolute project path), or in-container history stops unifying with native history.
+  the absolute project path), or in-container history stops unifying with native history. It
+  doubles as the per-project session key, so the same encoding is load-bearing twice.
 - **Terminal env crosses verbatim.** `TERM`/`COLORTERM`/`TERM_PROGRAM`/`TERM_PROGRAM_VERSION`
   are forwarded as-is, never forced. Don't reintroduce `COLORTERM=truecolor`/`FORCE_COLOR`.
 - **gh auth is env-injected, never file-mounted.** The wrapper resolves a token
@@ -117,8 +141,8 @@ them directly:
 - **CLI:** `cargo build --release` → `target/release/vhrn`; `cargo install --path .` installs
   it to `~/.cargo/bin`.
 - **Images:** `make -C image` builds `vhrn-base` then the harnesses (`build-base`,
-  `build-claude`; the harness is `FROM vhrn-base`, so base first). `make -C image build-base`/
-  `build-claude` build one; `make -C image clean` removes them.
+  `build-claude`, `build-codex`; each harness is `FROM vhrn-base`, so base first).
+  `make -C image build-<name>` builds one; `make -C image clean` removes them.
 - **Proxy image:** `make -C proxy` builds `vhrn-proxy`; `make -C proxy clean` removes it.
 
 The image Makefiles auto-detect the engine (`container`, then `docker`; `ENGINE=docker`
@@ -171,15 +195,18 @@ The suite runs per changed component on PRs and in full on master:
 
 Tests cover flag parsing, the history-key encoding, terminal env, allowlist add/dedup,
 engine-inspect IP parsing, the harness registry, the installed registry, shell-alias blocks,
-install/uninstall arg assembly, the persistence state store (creds bootstrap + `.claude.json`
+install/uninstall arg assembly, the guide composition and its source chain, the system
+config layer (host copy, trust-table strip, sandbox-mode injection, env-policy yielding),
+credential-env forwarding,
+per-project session stores, the persistence state store (creds bootstrap + `.claude.json`
 merge), the mount topology, TOML config load/merge, `blocked_dirs`, net-mode resolution, and
 tools-layer hashing — plus the proxy's allowlist-matching and IP-classifier tests. Keep pure
 logic in functions that take their inputs as arguments so new behavior stays unit-testable
 without a live container.
 
 The unit tests **don't exercise a live container**. To verify the full run path end-to-end,
-`vhrn install claude` (or `make -C image && make -C proxy` then `--local`), then run
-`vhrn claude` in a throwaway project directory.
+`vhrn install <harness>` (or `make -C image && make -C proxy` then `--local`), then run
+`vhrn <harness>` in a throwaway project directory.
 
 ## Security considerations
 
@@ -206,12 +233,14 @@ exfiltrating freely. Guard these:
   and does **not** terminate TLS, so it can't stop exfiltration to an already-allowed domain
   or domain-fronting behind an allowed CDN.
 - **Only the project and the user's agent configuration are mounted.** The config side is
-  the harness's own dir (`~/.claude`), the vendor-neutral `~/.agents`, and `~/.gitconfig` —
-  each as a disposable copy, never the host original. `~/.ssh`, your other projects, and the
+  the harness's own dir (`~/.claude`, `~/.codex`), the vendor-neutral `~/.agents`, and
+  `~/.gitconfig` — each as a disposable copy, never the host original. `~/.ssh`, your other projects, and the
   rest of `$HOME` stay outside; `blocked_dirs` refuses to jail `$HOME` or `/`. Config trees
   are synced with `rsync -aL`, so a symlink inside one is followed to its target — the user
   curates those trees, and anything they link in is a deliberate choice.
-- **Threat model** (full version in the README): protects the host filesystem and against
-  casual exfiltration. Does **not** cover exfiltration to an allowed domain, sessions run
-  with `--open-net`/`net.mode = "open"`, or a container escape under Docker (Docker shares
-  the host kernel; Apple `container` gives each container its own lightweight VM).
+- **Threat model** (full version in `docs/sandbox-design.md`): protects the host filesystem
+  and against casual exfiltration. Does **not** cover exfiltration to an allowed domain,
+  sessions run with `--open-net`/`net.mode = "open"`, executable config inside a repo the
+  user has **trusted** (a project `.codex/config.toml`, a project skill), or a container
+  escape under Docker (Docker shares the host kernel; Apple `container` gives each container
+  its own lightweight VM).

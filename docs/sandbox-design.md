@@ -45,16 +45,37 @@ every boot. Persistence is a property of what's mounted, not of container lifeti
 A disposable copy of your host harness config (skills, commands, agents, harness
 settings) is synced into `~/.cache/vhrn/sandbox/<harness>/` on each run and layered on top
 of the persistent store, so edits to that copy don't survive — change your real host config
-instead (e.g. `~/.claude` for Claude). The persistent store is separate and is never
-touched by the sync. Session history is written back to the host so in-container and
-native sessions share it.
+instead (e.g. `~/.claude` for Claude, `~/.codex` for Codex). The persistent store is
+separate and is never touched by the sync.
+
+What else persists is per-harness, because the agents differ:
+
+- **Claude** writes session history back to the host, so in-container and native sessions
+  share one history.
+- **Codex** keeps every project's transcripts in one flat tree, which vhrn does not mount —
+  it would hand a jailed agent every transcript on the machine. Instead each project gets
+  its own session store, so `codex resume` sees this project's sessions and no others. The
+  databases that follow that store carry Codex's memories and goals too, so those are
+  per-project as well; the login and the config stay shared across all of them.
+- **Codex's `config.toml`** is written by the agent — it records which projects you trusted
+  and which notices you dismissed — so vhrn never writes that file. Your host copy is
+  mounted a layer *below* it, at `/etc/codex/config.toml`, together with vhrn's own
+  own settings. It is read-only and is not a file Codex writes to, so an answer you give
+  inside the container is the one that sticks. The host copy's project-trust entries are
+  stripped on the way in: trusting a folder on your host does not trust it in the jail.
+- **Codex's own sandbox is turned off** (`sandbox_mode = "danger-full-access"`), because the
+  container, its firewall, and the egress proxy already are the sandbox, and nesting Codex's
+  on top costs its shell commands all network access. This is a *default*, so `vhrn codex
+  --sandbox workspace-write` still turns it back on for a run. bubblewrap is installed in the
+  image either way: Codex aborts rather than degrades when it looks for it and finds nothing.
 
 `~/.agents` — the vendor-neutral config dir several agent tools read, so portable
 configuration like a skill library is installed once instead of once per vendor — is copied
 in the same way and mounted at `/home/dev/.agents`, for every harness. The whole tree is
 carried in, so a directory an agent starts reading later needs no change here. Whether an
-agent reads it at all is up to that agent: Claude Code reads `~/.claude/skills` only today,
-so for Claude the mount is present and unused.
+agent reads it at all is up to that agent: Codex resolves `~/.agents/skills` as its user
+skill root, while Claude Code reads `~/.claude/skills` only, so for Claude the mount is
+present and unused.
 
 ## Working inside the container
 
@@ -88,6 +109,15 @@ so for Claude the mount is present and unused.
 - Exfiltration to a domain you have already allowed. The proxy matches on hostname and
   doesn't terminate TLS, so it can't stop data being pushed to an allowed domain (a repo
   on `github.com`, for instance) or domain-fronted behind an allowed CDN.
+- Repo content you have **trusted**. Once you answer an agent's trust prompt for a project,
+  parts of that repo become executable configuration: a project `.codex/config.toml` can
+  declare MCP servers and hooks, and a project skill under `.agents/skills/` or
+  `.claude/skills/` carries its own tool grants. Those run in the container, with the
+  forwarded GitHub token and the agent's credentials in reach of an allowed domain. That is
+  the same bargain you make running the agent natively — the jail bounds the blast radius
+  rather than preventing execution — which is why vhrn does not answer the trust prompt for
+  you, on the host's behalf or otherwise. Treat trusting an unfamiliar repo as running its
+  code, because it is.
 - Sessions run with `--open-net` (or `net.mode = "open"`), which turn the guard off.
 - A container escape under Docker, where the container shares the host's kernel. Apple
   `container` puts each container in its own lightweight VM, a stronger boundary.

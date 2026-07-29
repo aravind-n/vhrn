@@ -105,7 +105,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-  # One job per harness (add codex/aider to the matrix as they land). Each image is
+  # One job per harness (add aider and friends to the matrix as they land). Each image is
   # probed for its agent version, which becomes both the image tag and the
   # org.opencontainers.image.version label the host reads back.
   harness:
@@ -117,6 +117,8 @@ jobs:
         include:
           - harness: claude
             version_cmd: claude --version
+          - harness: codex
+            version_cmd: codex --version
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-qemu-action@v4

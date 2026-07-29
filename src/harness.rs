@@ -59,39 +59,84 @@ pub(crate) struct Guide {
     pub first: bool,          // guide before the host's text, for a byte-capped doc chain
 }
 
-/// The built-in registry. Only claude exists today; the struct shape is what a
-/// codex/aider spec would fill in.
+/// The built-in registry. Adding an agent is an entry here plus a `FROM vhrn-base`
+/// Dockerfile and a CI matrix row — never a branch in the CLI.
 fn registry() -> Vec<Harness> {
-    vec![Harness {
-        name: "claude".into(),
-        image: "vhrn-claude".into(),
-        command: "claude".into(),
-        alias: "claude".into(),
-        allow_domains: vec![
-            "api.anthropic.com".into(),
-            "claude.ai".into(),
-            "platform.claude.com".into(),
-            "statsig.anthropic.com".into(),
-            "sentry.io".into(),
-        ],
-        state_dir: ".claude".into(),
-        config_dir_env: "CLAUDE_CONFIG_DIR".into(),
-        host_config: ".claude".into(),
-        sync_dirs: vec!["skills".into(), "commands".into(), "agents".into()],
-        sync_files: vec!["settings.json".into(), "statusline.sh".into()],
-        credentials: vec![".credentials.json".into()],
-        guide: Guide {
-            file: "CLAUDE.md".into(),
-            sources: vec!["CLAUDE.md".into()],
-            in_state: false,
-            first: false,
+    vec![
+        Harness {
+            name: "claude".into(),
+            image: "vhrn-claude".into(),
+            command: "claude".into(),
+            alias: "claude".into(),
+            allow_domains: vec![
+                "api.anthropic.com".into(),
+                "claude.ai".into(),
+                "platform.claude.com".into(),
+                "statsig.anthropic.com".into(),
+                "sentry.io".into(),
+            ],
+            state_dir: ".claude".into(),
+            config_dir_env: "CLAUDE_CONFIG_DIR".into(),
+            host_config: ".claude".into(),
+            sync_dirs: vec!["skills".into(), "commands".into(), "agents".into()],
+            sync_files: vec!["settings.json".into(), "statusline.sh".into()],
+            credentials: vec![".credentials.json".into()],
+            guide: Guide {
+                file: "CLAUDE.md".into(),
+                sources: vec!["CLAUDE.md".into()],
+                in_state: false,
+                first: false,
+            },
+            credential_env: vec![], // claude's login lives in the state store, not the environment
+            system_config: false,
+            share_history: true,
+            sessions_env: String::new(), // history is already per-project; nothing to partition
+            sessions_dir: String::new(),
         },
-        credential_env: vec![], // claude's login lives in the state store, not the environment
-        system_config: false,
-        share_history: true,
-        sessions_env: String::new(), // history is already per-project; nothing to partition
-        sessions_dir: String::new(),
-    }]
+        Harness {
+            name: "codex".into(),
+            image: "vhrn-codex".into(),
+            command: "codex".into(),
+            alias: "codex".into(),
+            // The proxy matches label-anchored, so openai.com already covers api. and auth.
+            // Deliberately the wide set for a first install: a user who cannot authenticate
+            // cannot get far, and widening is a host command they would have to discover.
+            // Narrow it once a live `vhrn net report` says what a login and a turn touch.
+            allow_domains: vec!["chatgpt.com".into(), "openai.com".into()],
+            state_dir: ".codex".into(),
+            config_dir_env: "CODEX_HOME".into(),
+            host_config: ".codex".into(),
+            // No `skills`: the agent's own skills dir is where it installs remote skills and
+            // caches its bundled set, so it is container state rather than host config. The
+            // host's skill library arrives through ~/.agents, which every harness mounts.
+            sync_dirs: vec!["prompts".into()],
+            sync_files: vec![],
+            // Nothing bootstrapped: device-auth logs in inside the container and mints its own
+            // token, rather than sharing one rotating token with the host install.
+            credentials: vec![],
+            guide: Guide {
+                // Only the first non-empty global file is read, so a user who already has an
+                // override would shadow a guide written anywhere else. Take that slot and fold
+                // their text in, and both survive.
+                file: "AGENTS.override.md".into(),
+                sources: vec!["AGENTS.override.md".into(), "AGENTS.md".into()],
+                // The config dir is where this one is resolved from, and it is the state mount.
+                in_state: true,
+                // The instruction chain is capped by bytes and truncated from the end; the
+                // guide must not be the part that gets cut.
+                first: true,
+            },
+            credential_env: vec![
+                "CODEX_API_KEY".into(),
+                "CODEX_ACCESS_TOKEN".into(),
+                "OPENAI_API_KEY".into(),
+            ],
+            system_config: true,
+            share_history: false,
+            sessions_env: "CODEX_SQLITE_HOME".into(),
+            sessions_dir: "sessions".into(),
+        },
+    ]
 }
 
 /// The spec for `name`, or `None` if it is not a known harness.
@@ -129,9 +174,58 @@ mod tests {
     }
 
     #[test]
+    fn lookup_harness_codex() {
+        let h = lookup_harness("codex").expect("codex should be a known harness");
+        assert_eq!(h.image, "vhrn-codex");
+        assert_eq!(h.command, "codex");
+        assert_eq!(h.config_dir_env, "CODEX_HOME");
+        assert_eq!(h.state_dir, ".codex");
+        assert_eq!(h.guide.file, "AGENTS.override.md");
+        assert!(h.guide.first && h.guide.in_state);
+        assert_eq!(h.sessions_env, "CODEX_SQLITE_HOME");
+        assert!(h.system_config);
+        assert!(
+            !h.share_history,
+            "codex has no projects/<key> layout to share"
+        );
+        assert_eq!(
+            h.credential_env,
+            ["CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY"]
+        );
+        assert!(
+            h.credentials.is_empty(),
+            "codex logs in inside the container; nothing is copied from the host"
+        );
+        // The agent's own skills dir is container state, and the host library rides in on
+        // ~/.agents — syncing either would clobber what the agent installed there.
+        assert_eq!(h.sync_dirs, ["prompts"]);
+    }
+
+    // Every harness has to answer the persistence questions, or the run path silently
+    // falls back to a default that was only ever right for one of them.
+    #[test]
+    fn every_harness_declares_its_persistence() {
+        for h in registry() {
+            let n = &h.name;
+            assert!(!h.state_dir.is_empty(), "{n}: no state dir");
+            assert!(!h.host_config.is_empty(), "{n}: no host config dir");
+            assert!(!h.guide.file.is_empty(), "{n}: no container guide");
+            assert!(!h.guide.sources.is_empty(), "{n}: guide folds in nothing");
+            assert!(!h.allow_domains.is_empty(), "{n}: no egress domains");
+            // A session partition needs both halves: an env var with no transcript dir
+            // would index files that were never bound in.
+            assert_eq!(
+                h.sessions_env.is_empty(),
+                h.sessions_dir.is_empty(),
+                "{n}: half a session partition"
+            );
+        }
+    }
+
+    #[test]
     fn harness_names_sorted() {
         let names = harness_names();
-        assert!(!names.is_empty(), "expected at least one harness");
+        assert_eq!(names, ["claude", "codex"]);
         for w in names.windows(2) {
             assert!(w[0] <= w[1], "harness_names not sorted: {names:?}");
         }

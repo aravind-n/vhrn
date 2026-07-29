@@ -19,6 +19,7 @@ Usage:
 
 Harnesses:
   claude                   Claude Code
+  codex                    OpenAI Codex
 
 Run flags (after the harness name, before the agent's own flags):
   --open-net               drop the egress guard for this run (all egress)
