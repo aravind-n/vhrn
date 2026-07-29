@@ -1054,6 +1054,79 @@ mod tests {
         assert_eq!(&args[args.len() - 2..], ["--model", "gpt-5"]);
     }
 
+    // The codex mount topology end to end, against the real spec. Each piece has its own
+    // test above; what this pins is the combination, which is what actually regresses.
+    #[test]
+    fn container_run_args_codex_golden() {
+        let dir = crate::testutil::temp_dir();
+        let sandbox = dir.path().join("sandbox");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(sandbox.join("prompts")).unwrap();
+        std::fs::create_dir_all(sandbox.join(AGENTS_DIR)).unwrap();
+        std::fs::create_dir_all(sandbox.join(crate::persist::SYSTEM_CONFIG_DIR)).unwrap();
+        std::fs::create_dir_all(sessions.join("sessions")).unwrap();
+        // The derived guide is written into the state dir, so it is already inside the
+        // state mount. A stray sandbox copy must not become a mount of its own.
+        std::fs::write(sandbox.join("AGENTS.override.md"), "stray").unwrap();
+
+        let h = crate::harness::lookup_harness("codex").unwrap();
+        let cfg = ContainerConfig {
+            engine: "container".into(),
+            image: "vhrn-codex:latest".into(),
+            project: "/proj".into(),
+            key: "-proj".into(),
+            state: "/state".into(),
+            sandbox: sandbox.to_string_lossy().into_owned(),
+            sessions: sessions.to_string_lossy().into_owned(),
+            config_dir: format!("{CONTAINER_HOME}/{}", h.state_dir),
+            harness: h,
+            ..Default::default()
+        };
+
+        let args = container_run_args(
+            &cfg,
+            &RunFlags::default(),
+            Mode::Enforce,
+            "10.0.0.2",
+            "8080",
+        );
+        let joined = args.join(" ");
+
+        for want in [
+            "CODEX_HOME=/home/dev/.codex".to_string(),
+            "/state:/home/dev/.codex".to_string(),
+            format!(
+                "{}:/home/dev/.codex/prompts",
+                sandbox.join("prompts").display()
+            ),
+            format!(
+                "{}:/home/dev/.codex/sessions",
+                sessions.join("sessions").display()
+            ),
+            format!("{}:/home/dev/.codex-sessions", sessions.display()),
+            "CODEX_SQLITE_HOME=/home/dev/.codex-sessions".to_string(),
+            format!(
+                "{}:/etc/codex:ro",
+                sandbox.join(crate::persist::SYSTEM_CONFIG_DIR).display()
+            ),
+            format!("{}:/home/dev/.agents", sandbox.join(AGENTS_DIR).display()),
+        ] {
+            assert!(joined.contains(&want), "missing {want:?} in {args:?}");
+        }
+        for absent in [
+            "CLAUDE_CONFIG_DIR",
+            "AGENTS.override.md:", // the guide rides inside the state mount
+            "/home/dev/.codex/projects", // no native history layout to share
+            "/home/dev/.codex/skills", // container state: the agent installs its own
+        ] {
+            assert!(
+                !joined.contains(absent),
+                "unexpected {absent:?} in {args:?}"
+            );
+        }
+        assert_eq!(args.last().unwrap(), "codex");
+    }
+
     #[test]
     fn container_run_args_golden() {
         let (cfg, sandbox) = golden_fixture();

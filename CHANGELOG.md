@@ -9,16 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenAI Codex is now a harness.** `vhrn install codex`, then `codex` (or `vhrn codex`)
+  in any project — same jail, same default-deny egress as Claude Code. It differs in a few
+  ways, each deliberate:
+
+  - **Logging in.** Run `codex login --device-auth` inside the container, once. The browser
+    callback port isn't reachable from the jail, and device-auth mints the container its own
+    token instead of sharing your host one. For non-interactive use, `CODEX_API_KEY`,
+    `CODEX_ACCESS_TOKEN`, and `OPENAI_API_KEY` are forwarded from the host when set — and
+    hidden from commands the agent spawns by default (set `[shell_environment_policy]` in
+    your own config and yours wins).
+  - **Your `~/.codex/config.toml` applies as defaults**, mounted read-only at
+    `/etc/codex/config.toml`. Codex records trust answers and dismissed notices in its own
+    copy, so vhrn never writes that file and your answers survive across runs. Edit the host
+    file to change a setting. Its `[projects.*]` entries are deliberately left behind:
+    trusting a folder on your host does not trust it inside the jail.
+  - **Sessions are per project.** `codex resume` sees this project's sessions and no others.
+    Codex keeps every project's transcripts in one flat tree, and mounting that would put
+    every transcript on your machine within reach of a jailed agent. Codex's memories and
+    goals live in the same store, so those are per-project too; your login and config stay
+    shared across projects.
+  - **Codex's own sandbox is off** (`danger-full-access`), because the container, its
+    firewall, and the egress proxy already are the sandbox — and nesting Codex's on top costs
+    its shell commands all network access, which would break `gh`, `git push`, and
+    `uv tool install` inside the jail. It is a default, not a constraint, so
+    `vhrn codex --sandbox workspace-write` turns it back on for a run.
+  - `~/.agents/skills` is Codex's user skill root, so the mount below is live for this
+    harness rather than merely present.
+
 - `~/.agents` is now mounted in the container at `/home/dev/.agents`, for every
   harness. It is the vendor-neutral config dir agent tools converged on so portable
   configuration — a skill library, today — is installed once rather than once per vendor
   directory. The whole tree is carried in, so a path an agent starts reading later needs no
   vhrn release. Disposable like the rest of the synced config: edit `~/.agents` on the host.
 
-  Whether an agent reads it is up to that agent. Claude Code reads `~/.claude/skills` only
-  today, so with the shipped harness the directory is present and unused.
+  Whether an agent reads it is up to that agent. Claude Code reads `~/.claude/skills` only,
+  so for Claude the directory is present and unused; Codex resolves `~/.agents/skills`.
 
 ### Changed
+
+- The container image now ships `bubblewrap`. An agent that sandboxes its own shell
+  commands looks for it and **aborts** rather than degrading when it is missing, and the
+  Linux release of at least one agent bundles no copy of its own. Unprivileged user
+  namespaces are available in the container, so it works as the unprivileged `dev` user
+  with every capability dropped.
+
+- The default egress allowlist no longer carries the five Anthropic domains — they now come
+  from the claude harness itself. A fresh `vhrn install claude` still ends up with exactly
+  the same eleven domains, and **no existing allowlist changes**: the defaults are written
+  only when no allowlist file exists, and installing a harness only ever appends. What this
+  buys is that installing codex no longer seeds egress for a vendor you never asked for.
+
+  The allowlist is still shared across harnesses, so installing a second one does widen
+  egress for the first. `vhrn net status` shows the current list.
+
+- The note the agent reads about blocked domains now warns that a denial can arrive after
+  retries and can read as an ordinary connection or timeout error rather than a policy
+  refusal. Agents were treating blocks as flaky networking and retrying instead of telling
+  you which host to allow.
 
 - vhrn no longer decides for you whether a project is trusted. It used to write
   `hasTrustDialogAccepted` into the container's `.claude.json` before every launch, so the

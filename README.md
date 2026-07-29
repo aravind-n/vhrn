@@ -22,6 +22,21 @@ version with `@` (`vhrn install claude@2.1.30`, or `@nightly` for the latest mas
 and `vhrn update` re-pulls installed harnesses only when the registry has a newer agent.
 `VHRN_VERSION` pins the CLI installer.
 
+| Harness | Agent | Logging in |
+| --- | --- | --- |
+| `claude` | Claude Code | Your host login bootstraps an empty store, once |
+| `codex` | OpenAI Codex | `codex login --device-auth` inside the container, once |
+
+Codex uses device-auth because the browser callback port isn't reachable from inside the
+container, and because it mints the container its own token instead of sharing your host
+one. Either login persists across runs and serves every project. For non-interactive use,
+`CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, and `OPENAI_API_KEY` are forwarded from the host
+when set. vhrn defaults to hiding them from commands the agent spawns; set
+`[shell_environment_policy]` in your host config and yours wins.
+
+Harnesses share one egress allowlist, so installing a second one widens egress for the
+first. `vhrn net status` shows the current list.
+
 ## Usage
 
 A shell alias runs the harness directly (e.g. `claude` → `vhrn claude`); `command
@@ -59,10 +74,17 @@ allow = ["docs.rs"]              # extra allowlist domains
 mode  = "enforce"                # enforce | report | open
 ```
 
-Your harness config dir (`~/.claude` for Claude) and the vendor-neutral `~/.agents` are
+Your harness config dir (`~/.claude`, `~/.codex`) and the vendor-neutral `~/.agents` are
 copied into the container on each run, the latter at `/home/dev/.agents` for every harness.
 Both copies are disposable — edit the host directories, not the copies. Whether an agent
-reads `~/.agents` is up to that agent; Claude Code reads `~/.claude/skills` only today.
+reads `~/.agents` is up to that agent: Codex resolves `~/.agents/skills` as its user skill
+root, while Claude Code reads `~/.claude/skills` only, so for Claude the mount is inert.
+
+Codex's own `~/.codex/config.toml` is applied as *defaults* rather than as your config
+layer, so that the copy the agent writes inside the container — trust answers, dismissed
+notices — is the one that persists. Edit the host file to change a setting; its
+`[projects.*]` trust entries are deliberately left behind, so trusting a folder on the host
+does not trust it in the jail.
 
 ## Building from source
 

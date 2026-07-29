@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        image: [vhrn-base, vhrn-proxy, vhrn-claude]
+        image: [vhrn-base, vhrn-proxy, vhrn-claude, vhrn-codex]
     steps:
       - name: Delete pr-${{ github.event.number }} tags
         env:

@@ -80,14 +80,12 @@ pub(crate) fn seed_allowlist(cache: &Path, domains: &[String]) -> std::io::Resul
     Ok(())
 }
 
-// Seeded on first run; never clobbers later edits. 11 domains + 2 comment lines.
+// Seeded on first run; never clobbers later edits. 6 domains + 2 comment lines.
+// Harness-agnostic infrastructure only — an agent's own vendor domains live in its spec
+// (`Harness::allow_domains`) and are unioned in by `vhrn install`, so installing one
+// harness does not seed egress for a vendor the user never asked for.
 const DEFAULT_ALLOWLIST: &str = r"# vhrn egress allowlist — one domain per line, matching the domain and its
 # subdomains. Edit freely, or run `vhrn net allow <domain>` while a container runs.
-api.anthropic.com
-claude.ai
-platform.claude.com
-statsig.anthropic.com
-sentry.io
 github.com
 githubusercontent.com
 registry.npmjs.org
@@ -347,14 +345,10 @@ mod tests {
         np.ensure().unwrap();
         np.seed_allowlist_if_absent();
         let base = np.count_domains();
-        assert_eq!(base, 11, "default domain count");
+        assert_eq!(base, 6, "default domain count");
         // Adds a new domain; ignores duplicates (incl. one already present).
-        np.append_missing_atomic(&[
-            "docs.rs".into(),
-            "api.anthropic.com".into(),
-            "docs.rs".into(),
-        ])
-        .unwrap();
+        np.append_missing_atomic(&["docs.rs".into(), "github.com".into(), "docs.rs".into()])
+            .unwrap();
         assert_eq!(np.count_domains(), base + 1);
         // Idempotent re-add.
         np.append_missing_atomic(&["docs.rs".into()]).unwrap();
@@ -364,18 +358,20 @@ mod tests {
     #[test]
     fn seed_allowlist_unions_harness_domains() {
         let cache = crate::testutil::temp_dir();
-        // Install seeds the 11 defaults, then unions the harness domains not already
-        // present — api.anthropic.com is a default (no-op); example.test is new.
-        seed_allowlist(
-            cache.path(),
-            &["api.anthropic.com".into(), "example.test".into()],
-        )
-        .unwrap();
+        // Install seeds the 6 harness-agnostic defaults, then unions the harness's own
+        // domains not already present — github.com is a default (no-op), example.test is new.
+        seed_allowlist(cache.path(), &["github.com".into(), "example.test".into()]).unwrap();
         let np = NetPolicy::new(cache.path());
-        assert_eq!(np.count_domains(), 12, "11 defaults + 1 new harness domain");
+        assert_eq!(np.count_domains(), 7, "6 defaults + 1 new harness domain");
         // Idempotent: re-seeding the same domain adds nothing.
         seed_allowlist(cache.path(), &["example.test".into()]).unwrap();
-        assert_eq!(np.count_domains(), 12);
+        assert_eq!(np.count_domains(), 7);
+
+        // A second harness widens the shared list rather than replacing it — installing
+        // codex must not cost claude the domains it needs.
+        seed_allowlist(cache.path(), &["openai.com".into()]).unwrap();
+        assert_eq!(np.count_domains(), 8);
+        assert!(np.lines().iter().any(|l| l == "example.test"));
     }
 
     #[test]

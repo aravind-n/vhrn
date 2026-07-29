@@ -20,6 +20,11 @@ CLAUDE_IMAGE ?= vhrn-claude
 CLAUDE_REF   := $(CLAUDE_IMAGE):$(TAG)
 CLAUDE_DIR   ?= claude
 
+# The codex harness image (FROM vhrn-base + OpenAI Codex).
+CODEX_IMAGE ?= vhrn-codex
+CODEX_REF   := $(CODEX_IMAGE):$(TAG)
+CODEX_DIR   ?= codex
+
 # Match the container user to your host UID/GID (native Linux Docker only). Applied
 # to the base build, where the dev user is created.
 BUILD_ARGS :=
@@ -36,10 +41,10 @@ RM_IMAGE := $(ENGINE) image delete
 endif
 
 .DEFAULT_GOAL := build
-.PHONY: build build-base build-claude clean
+.PHONY: build build-base build-claude build-codex clean
 
 # Build the base image and its harnesses (the proxy image builds separately).
-build: build-base build-claude
+build: build-base build-claude build-codex
 
 build-base:
 	$(ENGINE) build $(BUILD_ARGS) --tag $(BASE_REF) --file $(BASE_DIR)/Dockerfile $(BASE_DIR)
@@ -48,6 +53,10 @@ build-base:
 build-claude: build-base
 	$(ENGINE) build --build-arg BASE=$(BASE_REF) --tag $(CLAUDE_REF) --file $(CLAUDE_DIR)/Dockerfile $(CLAUDE_DIR)
 
+build-codex: build-base
+	$(ENGINE) build --build-arg BASE=$(BASE_REF) --tag $(CODEX_REF) --file $(CODEX_DIR)/Dockerfile $(CODEX_DIR)
+
 clean:
 	-$(RM_IMAGE) $(CLAUDE_REF)
+	-$(RM_IMAGE) $(CODEX_REF)
 	-$(RM_IMAGE) $(BASE_REF)
