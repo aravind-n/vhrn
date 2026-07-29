@@ -44,12 +44,14 @@ Core behavioral invariants — keep these intact:
 - **Login/state persists via a container-owned store, not the disposable copy.**
   `~/.cache/vhrn/state/<harness>/` is mounted as the harness's config dir
   (`CLAUDE_CONFIG_DIR` for claude). Host credentials are copied in **only when the store is
-  empty** (bootstrap-only — an in-container login is never overwritten); `.claude.json` is
-  merged in place for onboarding + this project's trust without touching `oauthAccount` or
-  other projects. The disposable synced config, the container guide, and the
-  `projects/<key>` history layer on top as **nested** mounts, so the config sync can never
-  reach `state/`. `.claude.json` must sit in a real directory mount (Claude rewrites it via
-  a backup file), never a single-file mount.
+  empty** (bootstrap-only — an in-container login is never overwritten). Nothing else in the
+  store is ever written by vhrn: onboarding and per-project trust belong to the agent, so the
+  answer given in the container is the one that persists — **do not reintroduce seeding of
+  `hasTrustDialogAccepted`**, which made untrusting a project impossible and handed a repo's
+  own `.claude/skills` their `allowed-tools` grants unasked. The disposable synced config, the
+  container guide, and the `projects/<key>` history layer on top as **nested** mounts, so the
+  config sync can never reach `state/`. `.claude.json` must sit in a real directory mount
+  (Claude rewrites it via a backup file), never a single-file mount.
 - **The disposable config copy (`~/.cache/vhrn/sandbox/<harness>`) is re-synced from
   `~/.claude` every run** (`rsync -aL --delete`, `cp -RL` fallback), so edits there are wiped
   — change `~/.claude` instead. Deleting the host source removes the copy too, so config the
