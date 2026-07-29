@@ -157,7 +157,13 @@ The suite runs per changed component on PRs and in full on master:
 
 - **CLI:** `cargo fmt --all -- --check`, then `cargo clippy --all-targets -- -D warnings`,
   then `cargo test` (fmt runs before clippy).
-- **Proxy:** `cd proxy && gofmt -l . && go vet ./... && go test ./...`.
+- **Proxy:** `cd proxy && gofmt -l . && go vet ./... && go test ./...`, then `govulncheck
+  ./...` (`go install golang.org/x/vuln/cmd/govulncheck@latest`). The stdlib is the only
+  dependency, so a reachable toolchain CVE is the only kind this binary can have — and
+  with no `go.sum` there is no lockfile churn to surface one. The build image and `go.mod`
+  move together on a minor (`golang:1.26` / `go 1.26`) so patches land on their own and a
+  major is a deliberate bump of both; CI runs `go-version: stable`, so it meets the next
+  major before the image does.
 - **Workflows:** `actionlint` (with shellcheck on inline `run:` scripts) validates
   `.github/workflows/**`.
 

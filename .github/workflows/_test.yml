@@ -38,15 +38,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # Latest stable, not go-version-file: go.mod states the floor, and testing on
+      # it would pin CI to a toolchain that eventually goes end-of-life.
       - uses: actions/setup-go@v7
         with:
-          go-version-file: proxy/go.mod
+          go-version: stable
       - name: Vet and test
         working-directory: proxy
         run: |
           test -z "$(gofmt -l .)" || { echo 'gofmt needed:'; gofmt -l .; exit 1; }
           go vet ./...
           go test ./...
+      # The stdlib is this binary's only dependency, so a toolchain CVE is the only kind
+      # it can have. govulncheck reports the ones actually reachable from our call graph,
+      # which beats the toolchain version as a signal. `go install pkg@version` resolves
+      # outside the module, so it adds nothing to go.mod.
+      - name: Vulnerability scan
+        working-directory: proxy
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
 
   scripts:
     if: ${{ inputs.run_scripts }}

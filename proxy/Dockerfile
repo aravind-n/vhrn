@@ -1,6 +1,9 @@
 # Build the egress proxy as a static binary and ship it in scratch — no shell,
 # no userland, minimal CVE surface for the component that enforces the boundary.
-FROM golang:1.23 AS build
+# Minor pin, in lockstep with go.mod: patch releases and their security fixes arrive on
+# their own, a major is a deliberate bump of both so language semantics never shift
+# unreviewed. govulncheck in CI is the alarm if this is left to go end-of-life.
+FROM golang:1.26 AS build
 WORKDIR /src
 # No third-party modules, so go.mod alone is enough — there is no go.sum to fetch.
 COPY go.mod ./
