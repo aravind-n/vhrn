@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The disposable config copy moved from `~/.cache/vhrn/sandbox/` to
+  `~/.cache/vhrn/sandbox/<harness>/`, so one harness's sync can never delete files under a
+  running container of another. The old directory is left where it is; it is derived state
+  and costs only a one-time re-sync, but you can `rm -rf` its stray top-level files
+  (everything in `~/.cache/vhrn/sandbox/` that is not a harness-named directory).
+
 ### Fixed
 
 - fish no longer has its alias injected into `config.fish`. `vhrn install` writes a
