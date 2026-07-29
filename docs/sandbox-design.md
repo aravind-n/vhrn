@@ -49,6 +49,13 @@ instead (e.g. `~/.claude` for Claude). The persistent store is separate and is n
 touched by the sync. Session history is written back to the host so in-container and
 native sessions share it.
 
+`~/.agents` — the vendor-neutral config dir several agent tools read, so portable
+configuration like a skill library is installed once instead of once per vendor — is copied
+in the same way and mounted at `/home/dev/.agents`, for every harness. The whole tree is
+carried in, so a directory an agent starts reading later needs no change here. Whether an
+agent reads it at all is up to that agent: Claude Code reads `~/.claude/skills` only today,
+so for Claude the mount is present and unused.
+
 ## Working inside the container
 
 - There is no sudo inside the container; removing it is what keeps the egress firewall
@@ -68,8 +75,11 @@ native sessions share it.
 
 **What it protects:**
 
-- Your host filesystem. Secrets and your other projects are never mounted, so nothing
-  inside the container can read or damage them.
+- Your host filesystem. Only the project and your agent configuration are mounted —
+  `~/.ssh`, your other projects, and the rest of `$HOME` are not, so nothing inside the
+  container can read or damage them. The configuration that does come in (the harness's
+  own dir, `~/.agents`, `~/.gitconfig`) is a disposable copy, so the container cannot
+  write back to your real config either.
 - Against casual exfiltration. Default-deny egress stops a prompt injection from POSTing
   your source to an outside server; it can only reach the domains you have allowed.
 

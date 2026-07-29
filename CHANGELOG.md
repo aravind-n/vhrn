@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Your `~/.agents` is now mounted in the container at `/home/dev/.agents`, for every
+  harness. It is the vendor-neutral config dir agent tools converged on so portable
+  configuration — a skill library, today — is installed once rather than once per vendor
+  directory. The whole tree is carried in, so a path an agent starts reading later needs no
+  vhrn release. Disposable like the rest of the synced config: edit `~/.agents` on the host.
+
+  Whether an agent reads it is up to that agent. Claude Code reads `~/.claude/skills` only
+  today, so with the shipped harness the directory is present and unused.
+
 ### Changed
 
 - The disposable config copy moved from `~/.cache/vhrn/sandbox/` to

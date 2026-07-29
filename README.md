@@ -1,6 +1,6 @@
 # vhrn (Virtualized Harness Runtime)
 
-Run coding agents inside a container jailed to the current project directory, with **default-deny network egress**. Only the current project is mounted — credentials, other projects, and the rest of your home directory stay outside the container — and outbound traffic is limited to an allowlist. The harness binary runs in the container; it is not installed on the host.
+Run coding agents inside a container jailed to the current project directory, with **default-deny network egress**. Only the current project and your agent configuration are mounted — SSH keys, other projects, and the rest of your home directory stay outside the container — and outbound traffic is limited to an allowlist. The harness binary runs in the container; it is not installed on the host.
 
 ## Requirements
 
@@ -58,6 +58,11 @@ run = ["curl -fsSL https://sh.rustup.rs | sh -s -- -y"]   # arbitrary build-time
 allow = ["docs.rs"]              # extra allowlist domains
 mode  = "enforce"                # enforce | report | open
 ```
+
+Your harness config dir (`~/.claude` for Claude) and the vendor-neutral `~/.agents` are
+copied into the container on each run, the latter at `/home/dev/.agents` for every harness.
+Both copies are disposable — edit the host directories, not the copies. Whether an agent
+reads `~/.agents` is up to that agent; Claude Code reads `~/.claude/skills` only today.
 
 ## Building from source
 

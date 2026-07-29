@@ -56,6 +56,13 @@ Core behavioral invariants — keep these intact:
   user deleted is never mounted again. It is physically separate from `state/`, and
   per-harness so one harness's `--delete` never runs on a tree another's live container has
   mounted.
+- **`~/.agents` is mounted for every harness**, at `/home/dev/.agents`. It is the
+  vendor-neutral config dir agents resolve from `$HOME` rather than from their own config
+  dir, so it is a *top-level* mount beside the state mount, not one of `nested_mounts()`, and
+  a run-path constant rather than a `Harness` field. The whole tree is synced instead of an
+  enumerated set of children: unread paths are inert, so a new convention works the day an
+  agent ships support for it with no vhrn change. Same disposable contract as the rest of the
+  sync — edit `~/.agents` on the host.
 - **The history key must match Claude's `projects/<key>` encoding** (`[^A-Za-z0-9]` → `-` on
   the absolute project path), or in-container history stops unifying with native history.
 - **Terminal env crosses verbatim.** `TERM`/`COLORTERM`/`TERM_PROGRAM`/`TERM_PROGRAM_VERSION`
@@ -190,8 +197,12 @@ exfiltrating freely. Guard these:
   (no shell, no userland), running unprivileged: minimal CVE surface. It matches on hostname
   and does **not** terminate TLS, so it can't stop exfiltration to an already-allowed domain
   or domain-fronting behind an allowed CDN.
-- **Only the project is mounted.** `~/.ssh`, your other projects, and the rest of `$HOME`
-  stay outside the container; `blocked_dirs` refuses to jail `$HOME` or `/`.
+- **Only the project and the user's agent configuration are mounted.** The config side is
+  the harness's own dir (`~/.claude`), the vendor-neutral `~/.agents`, and `~/.gitconfig` —
+  each as a disposable copy, never the host original. `~/.ssh`, your other projects, and the
+  rest of `$HOME` stay outside; `blocked_dirs` refuses to jail `$HOME` or `/`. Config trees
+  are synced with `rsync -aL`, so a symlink inside one is followed to its target — the user
+  curates those trees, and anything they link in is a deliberate choice.
 - **Threat model** (full version in the README): protects the host filesystem and against
   casual exfiltration. Does **not** cover exfiltration to an allowed domain, sessions run
   with `--open-net`/`net.mode = "open"`, or a container escape under Docker (Docker shares
