@@ -118,10 +118,11 @@ fn copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Mirror one ~/.claude subdir into the sandbox, dereferencing symlinks (rsync -aL
-/// --delete, cp -RL fallback). --delete is confined to the subdir, so top-level
-/// sandbox files are never pruned.
-pub(crate) fn sync_claude_subdir(real: &Path, sandbox: &Path, name: &str) {
+/// Mirror one host subdir into the sandbox, dereferencing symlinks (rsync -aL
+/// --delete, cp -RL fallback). `real` is the host parent — the harness config dir for a
+/// synced config dir, the home dir for `.agents`. --delete is confined to the
+/// subdir, so top-level sandbox files are never pruned.
+pub(crate) fn sync_subdir(real: &Path, sandbox: &Path, name: &str) {
     let src = real.join(name);
     let dst = sandbox.join(name);
     if !src.is_dir() {
@@ -159,7 +160,7 @@ pub(crate) fn copy_file_into(real: &Path, sandbox: &Path, name: &str) {
     let src = real.join(name);
     let dst = sandbox.join(name);
     if !src.is_file() {
-        let _ = std::fs::remove_file(&dst); // as in sync_claude_subdir: the mirror follows
+        let _ = std::fs::remove_file(&dst); // as in sync_subdir: the mirror follows the source
         return;
     }
     if copy_file(&src, &dst).is_err() {
@@ -235,7 +236,7 @@ mod tests {
         std::fs::write(host.path().join("skills").join("SKILL.md"), "real").unwrap();
         std::fs::write(host.path().join("settings.json"), "{}").unwrap();
 
-        sync_claude_subdir(host.path(), sandbox.path(), "skills");
+        sync_subdir(host.path(), sandbox.path(), "skills");
         copy_file_into(host.path(), sandbox.path(), "settings.json");
 
         assert_eq!(
@@ -256,7 +257,7 @@ mod tests {
         std::fs::write(sandbox.path().join("skills").join("SKILL.md"), "stale").unwrap();
         std::fs::write(sandbox.path().join("settings.json"), "stale").unwrap();
 
-        sync_claude_subdir(host.path(), sandbox.path(), "skills");
+        sync_subdir(host.path(), sandbox.path(), "skills");
         copy_file_into(host.path(), sandbox.path(), "settings.json");
 
         // Config the user deleted must not keep being mounted.

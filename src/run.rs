@@ -266,6 +266,12 @@ pub(crate) fn stop_on_signal(proxy: Proxy) {
 /// The unprivileged container user's home; all container-side paths hang off it.
 const CONTAINER_HOME: &str = "/home/dev";
 
+/// `.agents`, the vendor-neutral config dir. Host-owned, disposable, mounted for every
+/// harness — agents resolve it from $HOME, not from their own config dir, so it is a
+/// constant here rather than a per-harness spec field. Whether an agent reads it is the
+/// agent's business.
+const AGENTS_DIR: &str = ".agents";
+
 /// The resolved host-side state for one run: paths, engine/image, and the extra
 /// --volume/--env args assembled during preparation.
 #[derive(Default)]
@@ -321,6 +327,37 @@ impl ContainerConfig {
         ));
         m
     }
+
+    /// `.agents`, bound at the container home rather than under the config dir.
+    /// Deliberately not part of `nested_mounts` — nothing about it is layered on the state
+    /// mount. Guarded on the sandbox copy, so no `~/.agents` on the host means no mount.
+    fn agents_mount(&self) -> Vec<String> {
+        let src = Path::new(&self.sandbox).join(AGENTS_DIR);
+        if !src.is_dir() {
+            return Vec::new();
+        }
+        vec![
+            "--volume".to_string(),
+            format!("{}:{CONTAINER_HOME}/{AGENTS_DIR}", src.display()),
+        ]
+    }
+}
+
+/// Which host directory each disposable sync reads from: the harness config dir for the
+/// harness's own subdirs, the home dir for `.agents`. Directories only — synced *files*
+/// are always harness config. Pure so the source of each sync is pinned by a test.
+fn dir_sync_plan<'a>(
+    home: &'a Path,
+    host_config: &'a Path,
+    h: &'a Harness,
+) -> Vec<(&'a Path, &'a str)> {
+    let mut plan: Vec<(&Path, &str)> = h
+        .sync_dirs
+        .iter()
+        .map(|d| (host_config, d.as_str()))
+        .collect();
+    plan.push((home, AGENTS_DIR));
+    plan
 }
 
 /// Perform all host-side preparation: resolve paths and engine, ready the persistent
@@ -370,8 +407,8 @@ fn prepare_container(h: &Harness) -> Result<ContainerConfig> {
     std::fs::create_dir_all(&history)?;
 
     // Disposable config synced from the host, layered on top of the state mount.
-    for d in &h.sync_dirs {
-        crate::persist::sync_claude_subdir(&host_config, &sandbox, d);
+    for (parent, name) in dir_sync_plan(&home, &host_config, h) {
+        crate::persist::sync_subdir(parent, &sandbox, name);
     }
     for f in &h.sync_files {
         crate::persist::copy_file_into(&host_config, &sandbox, f);
@@ -442,6 +479,7 @@ fn container_run_args(
     args.push("--volume".into());
     args.push(format!("{}:{}", cfg.state, cfg.config_dir));
     args.extend(cfg.nested_mounts());
+    args.extend(cfg.agents_mount());
     args.extend(cfg.git_mount.iter().cloned());
     args.extend(cfg.term_env.iter().cloned());
     args.extend(cfg.gh_env.iter().cloned());
@@ -659,12 +697,110 @@ mod tests {
     }
 
     #[test]
-    fn container_run_args_golden() {
-        let sandbox = crate::testutil::temp_dir();
-        std::fs::create_dir_all(sandbox.path().join("skills")).unwrap();
-        std::fs::write(sandbox.path().join("settings.json"), "{}").unwrap();
-        std::fs::write(sandbox.path().join("CLAUDE.md"), "guide").unwrap();
+    fn agents_mount_is_per_harness_and_top_level() {
+        let cache = crate::testutil::temp_dir();
+        // An empty config_dir_env stands in for a harness that names no config dir env at
+        // all: the `.agents` mount hangs off the container home, so it must not care.
+        for (harness, config_dir, config_dir_env) in [
+            ("claude", "/home/dev/.claude", "CLAUDE_CONFIG_DIR"),
+            ("codex", "/home/dev/.codex", ""),
+        ] {
+            let sandbox = sandbox_dir(cache.path(), harness);
+            std::fs::create_dir_all(sandbox.join(AGENTS_DIR)).unwrap();
+            let cfg = ContainerConfig {
+                harness: Harness {
+                    config_dir_env: config_dir_env.into(),
+                    ..Default::default()
+                },
+                sandbox: sandbox.to_string_lossy().into_owned(),
+                config_dir: config_dir.into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                cfg.agents_mount(),
+                vec![
+                    "--volume".to_string(),
+                    format!("{}:/home/dev/.agents", sandbox.join(AGENTS_DIR).display()),
+                ],
+                "{harness}: .agents mount"
+            );
+        }
+    }
 
+    #[test]
+    fn dir_sync_plan_sources_agents_from_home() {
+        let home = Path::new("/home/u");
+        let host_config = Path::new("/home/u/.claude");
+        let h = Harness {
+            sync_dirs: vec!["skills".into(), "agents".into()],
+            ..Default::default()
+        };
+        // The whole point: `.agents` reads from the home dir while the harness's own
+        // subdirs — including its similarly-named `agents` — read from its config dir.
+        assert_eq!(
+            dir_sync_plan(home, host_config, &h),
+            vec![
+                (host_config, "skills"),
+                (host_config, "agents"),
+                (home, ".agents"),
+            ]
+        );
+    }
+
+    #[test]
+    fn dir_sync_plan_covers_every_harness() {
+        // A harness that syncs no config dirs of its own still gets `.agents`.
+        assert_eq!(
+            dir_sync_plan(Path::new("/h"), Path::new("/h/.codex"), &Harness::default()),
+            vec![(Path::new("/h"), ".agents")]
+        );
+    }
+
+    #[test]
+    fn agents_mount_absent_without_host_dir() {
+        let (cfg, _sandbox) = fixture_with_sandbox();
+        assert!(
+            cfg.agents_mount().is_empty(),
+            "mounted .agents with no sandbox copy"
+        );
+    }
+
+    #[test]
+    fn agents_mount_does_not_collide_with_claude_agents_dir() {
+        let (cfg, dir) = fixture_with_sandbox();
+        let sandbox = dir.path();
+        std::fs::create_dir_all(sandbox.join("agents")).unwrap();
+        std::fs::create_dir_all(sandbox.join(AGENTS_DIR)).unwrap();
+
+        let mut got = cfg.nested_mounts();
+        got.extend(cfg.agents_mount());
+        let joined = got.join(" ");
+
+        // claude's ~/.claude/agents and `.agents` differ by a dot on both sides.
+        for want in [
+            format!(
+                "{}:/home/dev/.claude/agents",
+                sandbox.join("agents").display()
+            ),
+            format!("{}:/home/dev/.agents", sandbox.join(AGENTS_DIR).display()),
+        ] {
+            assert!(joined.contains(&want), "missing mount {want:?} in {got:?}");
+        }
+        assert!(
+            !joined.contains("/home/dev/.claude/.agents"),
+            ".agents nested under the config dir: {got:?}"
+        );
+    }
+
+    // The fully-populated claude config the golden test snapshots: a sandbox with skills/ +
+    // .agents/ + settings.json + CLAUDE.md, and commands/ deliberately absent.
+    fn golden_fixture() -> (ContainerConfig, tempfile::TempDir) {
+        let dir = crate::testutil::temp_dir();
+        let sandbox = dir.path();
+        std::fs::create_dir_all(sandbox.join("skills")).unwrap();
+        std::fs::create_dir_all(sandbox.join(AGENTS_DIR)).unwrap();
+        std::fs::write(sandbox.join("settings.json"), "{}").unwrap();
+        std::fs::write(sandbox.join("CLAUDE.md"), "guide").unwrap();
         let cfg = ContainerConfig {
             engine: "container".into(),
             harness: Harness {
@@ -678,7 +814,7 @@ mod tests {
             project: "/proj".into(),
             key: "-proj".into(),
             state: "/state".into(),
-            sandbox: sandbox.path().to_string_lossy().into_owned(),
+            sandbox: sandbox.to_string_lossy().into_owned(),
             config_dir: "/home/dev/.claude".into(),
             history: "/hist".into(),
             git_mount: vec![
@@ -689,6 +825,12 @@ mod tests {
             gh_env: vec!["--env".into(), "GH_TOKEN=tok".into()],
             ..Default::default()
         };
+        (cfg, dir)
+    }
+
+    #[test]
+    fn container_run_args_golden() {
+        let (cfg, sandbox) = golden_fixture();
         let f = RunFlags {
             open_net: false,
             extra_allow: vec![],
@@ -708,6 +850,10 @@ mod tests {
         let guide = format!(
             "{}:/home/dev/.claude/CLAUDE.md",
             sandbox.path().join("CLAUDE.md").display()
+        );
+        let agents = format!(
+            "{}:/home/dev/.agents",
+            sandbox.path().join(AGENTS_DIR).display()
         );
         let expected: Vec<String> = [
             "run",
@@ -747,6 +893,8 @@ mod tests {
             guide.as_str(),
             "--volume",
             "/hist:/home/dev/.claude/projects/-proj",
+            "--volume",
+            agents.as_str(),
             "--volume",
             "/c/gitconfig:/home/dev/.gitconfig",
             "--env",
