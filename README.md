@@ -65,6 +65,10 @@ nothing from the project directory, so a cloned repo can never reconfigure the j
 [run]
 blocked_dirs = ["~", "/"]        # refuse to launch when cwd is exactly one of these
 
+[resources]
+memory = "4g"                     # nonzero integer + m/g, or "engine"
+cpus = 4                           # positive integral CPU count
+
 [tools]                          # extra tooling baked onto the harness image at build time
 apt = ["postgresql-client"]      # Debian packages
 run = ["curl -fsSL https://sh.rustup.rs | sh -s -- -y"]   # arbitrary build-time install commands
@@ -73,6 +77,16 @@ run = ["curl -fsSL https://sh.rustup.rs | sh -s -- -y"]   # arbitrary build-time
 allow = ["docs.rs"]              # extra allowlist domains
 mode  = "enforce"                # enforce | report | open
 ```
+
+Resource limits are host-owned configuration, not wrapper flags. An unset `memory` makes
+vhrn pass `--memory 4g` only to Apple's `container`; Docker keeps its engine default.
+`memory = "engine"` leaves either engine unchanged. Explicit values use the portable long
+`--memory` and `--cpus` forms. Agent arguments named `--memory` or `--cpus` still pass through
+unchanged after the harness command.
+
+The host project mount preserves project-local installed dependencies and outputs such as
+`node_modules`, `.venv`, `target`, and generated files. Package-manager caches under the
+container home last only for that invocation and are intentionally not mounted between runs.
 
 Your harness config dir (`~/.claude`, `~/.codex`) and the vendor-neutral `~/.agents` are
 copied into the container on each run, the latter at `/home/dev/.agents` for every harness.

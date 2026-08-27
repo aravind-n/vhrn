@@ -41,6 +41,13 @@ Core behavioral invariants — keep these intact:
   `ENGINE`/`VHRN_ENGINE`, else auto-detect `container` then `docker`) — keep them in sync.
   The CLIs differ (`container image delete` vs `docker image rm`; inspect output differs,
   and Apple escapes the CIDR slash in `ipv4Address`), so an engine switch isn't a string swap.
+- **Resource limits are host-owned configuration, never wrapper flags.** `[resources].memory`
+  is `"engine"` or a nonzero integer ending in `m`/`g`; `[resources].cpus` is a positive
+  integer. Use portable long `--memory`/`--cpus` engine flags. An unset memory value gets the
+  Apple `container`-only 4 GiB default; Docker retains its engine default. Agent arguments with
+  those names still pass through verbatim. Project-local dependency/install outputs persist on
+  the project mount, while package-manager caches under container home are intentionally
+  ephemeral — do not add cache mounts.
 - **Login/state persists via a container-owned store, not the disposable copy.**
   `~/.cache/vhrn/state/<harness>/` is mounted as the harness's config dir
   (`CLAUDE_CONFIG_DIR` for claude). Host credentials are copied in **only when the store is

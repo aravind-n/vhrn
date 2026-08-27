@@ -11,7 +11,7 @@ use signal_hook::iterator::Signals;
 use tracing::warn;
 
 use crate::cli::RunFlags;
-use crate::config::Config;
+use crate::config::{Config, ResourcesConfig};
 use crate::harness::Harness;
 use crate::net::Mode;
 
@@ -522,10 +522,9 @@ fn container_run_args(
     port: &str,
 ) -> Vec<String> {
     let proxy_url = format!("http://{ip}:{port}");
-    let mut args = vec![
-        "run".to_string(),
-        "-it".into(),
-        "--rm".into(),
+    let mut args = vec!["run".to_string(), "-it".into(), "--rm".into()];
+    args.extend(resource_args(&cfg.engine, &cfg.config.resources));
+    args.extend([
         "--cap-add".into(),
         "CAP_NET_ADMIN".into(),
         "--env".into(),
@@ -548,7 +547,7 @@ fn container_run_args(
         format!("{p}:{p}", p = cfg.project),
         "--workdir".into(),
         cfg.project.clone(),
-    ];
+    ]);
     if !cfg.harness.config_dir_env.is_empty() {
         args.push("--env".into());
         args.push(format!("{}={}", cfg.harness.config_dir_env, cfg.config_dir));
@@ -566,6 +565,27 @@ fn container_run_args(
     args.push(cfg.image.clone());
     args.push(cfg.harness.command.clone());
     args.extend(f.rest.iter().cloned());
+    args
+}
+
+/// Translate normalized resource config into portable engine flags. Apple container has a
+/// small default memory limit, so vhrn raises only that engine's implicit limit; Docker
+/// retains its own default unless the user configured a value.
+fn resource_args(engine: &str, resources: &ResourcesConfig) -> Vec<String> {
+    let memory = match resources.memory.as_deref() {
+        Some("engine") => None,
+        Some(memory) => Some(memory),
+        None if engine == "container" => Some("4g"),
+        None => None,
+    };
+
+    let mut args = Vec::new();
+    if let Some(memory) = memory {
+        args.extend(["--memory".to_string(), memory.to_string()]);
+    }
+    if let Some(cpus) = resources.cpus {
+        args.extend(["--cpus".to_string(), cpus.to_string()]);
+    }
     args
 }
 
@@ -733,6 +753,76 @@ mod tests {
 }"#;
         assert_eq!(first_ipv4(apple), "192.168.64.73");
         assert_eq!(first_ipv4("no address here\nsecond line"), "");
+    }
+
+    #[test]
+    fn resource_args_resolve_memory_and_cpus() {
+        let cases = [
+            (
+                "container",
+                ResourcesConfig::default(),
+                vec!["--memory", "4g"],
+            ),
+            ("docker", ResourcesConfig::default(), vec![]),
+            ("other", ResourcesConfig::default(), vec![]),
+            (
+                "container",
+                ResourcesConfig {
+                    memory: Some("engine".into()),
+                    cpus: None,
+                },
+                vec![],
+            ),
+            (
+                "docker",
+                ResourcesConfig {
+                    memory: Some("engine".into()),
+                    cpus: None,
+                },
+                vec![],
+            ),
+            (
+                "docker",
+                ResourcesConfig {
+                    memory: Some("2g".into()),
+                    cpus: None,
+                },
+                vec!["--memory", "2g"],
+            ),
+            (
+                "container",
+                ResourcesConfig {
+                    memory: Some("2g".into()),
+                    cpus: None,
+                },
+                vec!["--memory", "2g"],
+            ),
+            (
+                "container",
+                ResourcesConfig {
+                    memory: None,
+                    cpus: Some(2),
+                },
+                vec!["--memory", "4g", "--cpus", "2"],
+            ),
+            (
+                "docker",
+                ResourcesConfig {
+                    memory: Some("512m".into()),
+                    cpus: Some(4),
+                },
+                vec!["--memory", "512m", "--cpus", "4"],
+            ),
+        ];
+
+        for (engine, resources, want) in cases {
+            let got = resource_args(engine, &resources);
+            assert_eq!(got, want, "{engine}: {resources:?}");
+            assert!(
+                !got.iter().any(|arg| arg == "-m" || arg == "-c"),
+                "resource flags must use long forms: {got:?}"
+            );
+        }
     }
 
     // A ContainerConfig fixture whose sandbox has skills/ + settings.json + CLAUDE.md, but
@@ -1054,6 +1144,38 @@ mod tests {
         assert_eq!(&args[args.len() - 2..], ["--model", "gpt-5"]);
     }
 
+    #[test]
+    fn agent_resource_named_args_remain_at_the_tail() {
+        let (cfg, _dir) = golden_fixture();
+        let f = RunFlags {
+            open_net: false,
+            extra_allow: vec![],
+            rest: vec![
+                "--memory".into(),
+                "agent-memory".into(),
+                "--cpus".into(),
+                "7".into(),
+            ],
+        };
+
+        let args = container_run_args(&cfg, &f, Mode::Enforce, "10.0.0.2", "8080");
+        let image = args
+            .iter()
+            .position(|arg| arg == "vhrn-claude:latest")
+            .unwrap();
+        assert_eq!(
+            &args[image..],
+            [
+                "vhrn-claude:latest",
+                "claude",
+                "--memory",
+                "agent-memory",
+                "--cpus",
+                "7"
+            ]
+        );
+    }
+
     // The codex mount topology end to end, against the real spec. Each piece has its own
     // test above; what this pins is the combination, which is what actually regresses.
     #[test]
@@ -1091,6 +1213,8 @@ mod tests {
             "8080",
         );
         let joined = args.join(" ");
+
+        assert_eq!(&args[..5], ["run", "-it", "--rm", "--memory", "4g"]);
 
         for want in [
             "CODEX_HOME=/home/dev/.codex".to_string(),
@@ -1158,6 +1282,8 @@ mod tests {
             "run",
             "-it",
             "--rm",
+            "--memory",
+            "4g",
             "--cap-add",
             "CAP_NET_ADMIN",
             "--env",

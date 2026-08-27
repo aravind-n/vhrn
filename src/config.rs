@@ -15,6 +15,7 @@ pub(crate) struct Config {
     pub run: RunConfig,
     pub tools: ToolsConfig,
     pub net: NetConfig,
+    pub resources: ResourcesConfig,
 }
 
 /// Guards where a container may launch. `blocked_dirs` are refused as an exact resolved
@@ -46,6 +47,26 @@ pub(crate) struct NetConfig {
     pub mode: Option<String>,
 }
 
+/// Optional container resource limits. An unset value leaves the engine's default in
+/// effect, except where the run path supplies an engine-specific default.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct ResourcesConfig {
+    pub memory: Option<String>,
+    #[serde(deserialize_with = "deserialize_optional_cpus")]
+    pub cpus: Option<u32>,
+}
+
+/// Keep TOML's strict unsigned-integer parsing while giving malformed values an error
+/// that names the user-facing setting.
+fn deserialize_optional_cpus<'de, D>(deserializer: D) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <Option<u32> as serde::Deserialize>::deserialize(deserializer)
+        .map_err(|_| serde::de::Error::custom("[resources].cpus must be a positive integer"))
+}
+
 /// The lowest-precedence layer.
 fn default_config() -> Config {
     Config {
@@ -57,6 +78,7 @@ fn default_config() -> Config {
             allow: None,
             mode: Some("enforce".into()),
         },
+        resources: ResourcesConfig::default(),
     }
 }
 
@@ -79,6 +101,12 @@ fn merge_config(base: Config, over: Config) -> Config {
     if over.net.mode.is_some() {
         out.net.mode = over.net.mode;
     }
+    if over.resources.memory.is_some() {
+        out.resources.memory = over.resources.memory;
+    }
+    if over.resources.cpus.is_some() {
+        out.resources.cpus = over.resources.cpus;
+    }
     out
 }
 
@@ -92,7 +120,48 @@ pub(crate) fn load_config(config_dir: &Path) -> Result<Config> {
     if let Some(c) = read_config_file(&config_dir.join("config.toml"))? {
         cfg = merge_config(cfg, c);
     }
+    normalize_config(&mut cfg)?;
     Ok(cfg)
+}
+
+/// Validate global resource settings once, while config is loaded, so the run path can
+/// assemble engine arguments from a known-good value.
+fn normalize_config(cfg: &mut Config) -> Result<()> {
+    if let Some(memory) = &mut cfg.resources.memory {
+        *memory = normalize_memory(memory)?;
+    }
+    if cfg.resources.cpus == Some(0) {
+        bail!("[resources].cpus must be greater than zero");
+    }
+    Ok(())
+}
+
+/// Normalize a portable memory value while preserving its numeric spelling. Engines
+/// accept only a unit-bearing amount here; `engine` explicitly requests their default.
+fn normalize_memory(memory: &str) -> Result<String> {
+    if memory.eq_ignore_ascii_case("engine") {
+        return Ok("engine".to_string());
+    }
+
+    if !memory.is_ascii() || memory.len() < 2 {
+        bail!("[resources].memory must be 'engine' or a nonzero integer ending in m or g");
+    }
+    let (amount, unit) = memory.split_at(memory.len() - 1);
+    if amount.is_empty()
+        || !amount.bytes().all(|byte| byte.is_ascii_digit())
+        || !amount.bytes().any(|byte| byte != b'0')
+    {
+        bail!("[resources].memory must be 'engine' or a nonzero integer ending in m or g");
+    }
+    let Some(unit) = unit.as_bytes().first().copied() else {
+        bail!("[resources].memory must be 'engine' or a nonzero integer ending in m or g");
+    };
+    let unit = match unit {
+        b'm' | b'M' => 'm',
+        b'g' | b'G' => 'g',
+        _ => bail!("[resources].memory must be 'engine' or a nonzero integer ending in m or g"),
+    };
+    Ok(format!("{amount}{unit}"))
 }
 
 /// Parse one TOML config file; a missing file yields `None`.
@@ -186,7 +255,7 @@ mod tests {
         let config_dir = temp_dir();
         std::fs::write(
             config_dir.path().join("config.toml"),
-            "[tools]\napt = [\"ripgrep\"]\nrun = [\"curl https://example.test | sh\"]\n[net]\nmode = \"report\"\nallow = [\"global.example\"]\n",
+            "[tools]\napt = [\"ripgrep\"]\nrun = [\"curl https://example.test | sh\"]\n[net]\nmode = \"report\"\nallow = [\"global.example\"]\n[resources]\nmemory = \"04G\"\ncpus = 2\n",
         )
         .unwrap();
 
@@ -202,6 +271,8 @@ mod tests {
             cfg.run.blocked_dirs,
             Some(vec!["~".to_string(), "/".to_string()])
         ); // unset key falls through to the default
+        assert_eq!(cfg.resources.memory.as_deref(), Some("04g"));
+        assert_eq!(cfg.resources.cpus, Some(2));
     }
 
     #[test]
@@ -265,6 +336,77 @@ mod tests {
         ); // inherited
         assert_eq!(merged.tools.apt, None); // set nowhere
         assert_eq!(merged.tools.run, None);
+    }
+
+    #[test]
+    fn resource_memory_normalizes_keyword_and_units() {
+        assert_eq!(normalize_memory("ENGINE").unwrap(), "engine");
+        assert_eq!(normalize_memory("4M").unwrap(), "4m");
+        assert_eq!(normalize_memory("004G").unwrap(), "004g");
+    }
+
+    #[test]
+    fn resource_memory_rejects_malformed_and_zero_values() {
+        for memory in [
+            "", "engine ", " 4g", "4g ", "+4g", "-4g", "4.0g", "4", "4k", "g", "0m", "00G",
+            "fourg", "4㎇",
+        ] {
+            let error = normalize_memory(memory).unwrap_err();
+            assert!(
+                error.to_string().contains("[resources].memory"),
+                "{memory:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_cpus_must_be_positive() {
+        let config_dir = temp_dir();
+        std::fs::write(
+            config_dir.path().join("config.toml"),
+            "[resources]\ncpus = 0\n",
+        )
+        .unwrap();
+        let error = load_config(config_dir.path()).unwrap_err();
+        assert!(error.to_string().contains("[resources].cpus"));
+    }
+
+    #[test]
+    fn resource_cpus_reject_invalid_toml_values() {
+        for cpus in ["-1", "1.5", "4294967296", "\"2\""] {
+            let config_dir = temp_dir();
+            std::fs::write(
+                config_dir.path().join("config.toml"),
+                format!("[resources]\ncpus = {cpus}\n"),
+            )
+            .unwrap();
+            let error = load_config(config_dir.path()).unwrap_err();
+            assert!(
+                error.to_string().contains("[resources].cpus"),
+                "{cpus:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_resources_fall_through_independently() {
+        let base = Config {
+            resources: ResourcesConfig {
+                memory: Some("4g".into()),
+                cpus: Some(4),
+            },
+            ..Config::default()
+        };
+        let over = Config {
+            resources: ResourcesConfig {
+                memory: None,
+                cpus: Some(2),
+            },
+            ..Config::default()
+        };
+        let merged = merge_config(base, over);
+        assert_eq!(merged.resources.memory.as_deref(), Some("4g"));
+        assert_eq!(merged.resources.cpus, Some(2));
     }
 
     #[test]

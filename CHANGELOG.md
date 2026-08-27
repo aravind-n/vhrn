@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Host-owned `[resources]` configuration for memory and positive-integral CPU limits using
+  portable long engine flags.
+
+### Changed
+
+- Apple `container` harness runs now receive 4 GiB by default instead of the engine's 1 GiB;
+  `memory = "engine"` restores the engine default, and Docker's unset behavior is unchanged.
+
 ## [0.4.0] - 2026-07-29
 
 ### Added
