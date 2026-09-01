@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-01
+
 ### Added
 
 - Host-owned `[resources]` configuration for memory and positive-integral CPU limits using
@@ -202,7 +204,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `toolchains.tools` derived image rebuilds when its harness image updates (the base image
   identity is folded into the toolchain hash), so `vhrn update` no longer keeps the old agent.
 
-[unreleased]: https://github.com/aravind-n/vhrn/compare/v0.4.0...HEAD
+[unreleased]: https://github.com/aravind-n/vhrn/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/aravind-n/vhrn/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/aravind-n/vhrn/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/aravind-n/vhrn/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/aravind-n/vhrn/compare/v0.1.0...v0.2.0
