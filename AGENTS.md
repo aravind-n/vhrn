@@ -181,7 +181,7 @@ a `v*` tag. Three reusable workflows (`_test`, `_build-images`, `_build-binaries
   path is absent. Kept shellcheck-clean.
 - **Go** (`proxy/`): standard library only — no third-party modules, no `go.sum`. Keep it
   `gofmt`- and `go vet`-clean.
-- **Commits:** Linux-kernel style (`cli: …`, `image: …`, `Documentation: …`), concise and
+- **Commits:** Linux-kernel style (`cli: …`, `image: …`, `docs: …`), concise and
   imperative — a short subject plus at most a line or two, not verbose.
 
 ## Testing instructions
