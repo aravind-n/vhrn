@@ -79,11 +79,13 @@ present and unused.
 
 ## Working inside the container
 
-- Resource limits come only from the host-owned `[resources]` config block. `memory` accepts
-  `"engine"` or a nonzero integer ending in `m` or `g`; `cpus` is a positive integer. When
-  memory is unset, vhrn passes `--memory 4g` only to Apple `container`; Docker retains its
-  engine default. Explicit limits use long `--memory` and `--cpus` flags. They are not wrapper
-  flags, so an agent's own arguments with those names remain untouched.
+- Resource limits come only from the host-owned `[resources]` config block, with exact-path
+  `[project."<pwd -P>".resources]` overrides for one project. `memory` accepts `"engine"` or a
+  nonzero integer ending in `m` or `g`; `cpus` is a positive integer. Project fields replace only
+  the field they name, while absent fields inherit the global default. When memory is unset, vhrn
+  passes `--memory 4g` only to Apple `container`; Docker retains its engine default. Explicit
+  limits use long `--memory` and `--cpus` flags. They are not wrapper flags, so an agent's own
+  arguments with those names remain untouched.
 - The project bind mount preserves installed dependencies and build outputs such as
   `node_modules`, `.venv`, `target`, and generated files. Package-manager caches in the
   container home exist for the current invocation only and are intentionally not mounted across
@@ -91,8 +93,10 @@ present and unused.
 - There is no sudo inside the container; removing it is what keeps the egress firewall
   tamper-proof. The toolchain is baked at build time — a C/C++ toolchain (clang, gcc/g++,
   cmake) plus the common CLIs live in the base image, and you add anything else under
-  `[tools]` in your config (`apt` packages or arbitrary `run` install commands), which vhrn
-  bakes onto the harness image at install time. At runtime you can still `uv tool install
+  `[tools]` in your config (`apt` packages or arbitrary `run` install commands), or under an
+  exact-path project override. Arrays replace rather than append. vhrn prewarms the global and
+  each distinct effective project profile at install and actual update time; a run retains a lazy
+  build fallback. At runtime you can still `uv tool install
   <pkg>` for Python CLIs (PyPI is allowlisted), but you cannot apt or add system packages
   under the guard.
 - `gh` auth is forwarded as an env token (`$GH_TOKEN` or `$GITHUB_TOKEN`, else

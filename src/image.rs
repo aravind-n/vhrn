@@ -201,6 +201,27 @@ fn normalize_run(run: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The canonical identity of a tools layer. Apt is a set while run is an ordered program;
+/// keep that distinction in one type so profile planning, hashing, and building agree.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct NormalizedTools {
+    pub(crate) apt: Vec<String>,
+    pub(crate) run: Vec<String>,
+}
+
+impl NormalizedTools {
+    pub(crate) fn new(apt: &[String], run: &[String]) -> Self {
+        Self {
+            apt: normalize_apt(apt),
+            run: normalize_run(run),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.apt.is_empty() && self.run.is_empty()
+    }
+}
+
 /// The engine's local image ID (a content digest) for `image`, or None if it can't be
 /// read. Docker templates it out; Apple `container image inspect` prints JSON we scan.
 pub(crate) fn image_id(engine: &str, image: &str) -> Option<String> {
@@ -322,13 +343,19 @@ fn json_string_value(json: &str, key: &str) -> Option<String> {
 /// identity) plus the normalized apt set and the ordered run list, so a rebuilt harness image
 /// — or any change to the requested tooling — yields a fresh tag. Same inputs -> same tag,
 /// built once.
+#[cfg(test)]
 fn tools_tag(prefix: &str, base_id: &str, apt: &[String], run: &[String]) -> String {
+    let tools = NormalizedTools::new(apt, run);
+    tools_tag_for(prefix, base_id, &tools)
+}
+
+fn tools_tag_for(prefix: &str, base_id: &str, tools: &NormalizedTools) -> String {
     let mut hasher = Sha256::new();
     hasher.update(base_id.as_bytes());
     hasher.update(b"\napt\n");
-    hasher.update(normalize_apt(apt).join("\n").as_bytes());
+    hasher.update(tools.apt.join("\n").as_bytes());
     hasher.update(b"\nrun\n");
-    hasher.update(normalize_run(run).join("\n").as_bytes());
+    hasher.update(tools.run.join("\n").as_bytes());
     let hexed = hex::encode(hasher.finalize());
     format!("{prefix}-tools-{}", &hexed[..12])
 }
@@ -429,14 +456,13 @@ pub(crate) fn ensure_tools_image(
     apt: &[String],
     run: &[String],
 ) -> Result<String> {
-    let norm_apt = normalize_apt(apt);
-    let norm_run = normalize_run(run);
-    if norm_apt.is_empty() && norm_run.is_empty() {
+    let tools = NormalizedTools::new(apt, run);
+    if tools.is_empty() {
         return Ok(from_image.to_string());
     }
     // A newline inside an entry would split the generated `RUN <cmd>` line into invalid
     // Dockerfile; reject it up front with a clear message, not an opaque build parse error.
-    for entry in norm_apt.iter().chain(norm_run.iter()) {
+    for entry in tools.apt.iter().chain(tools.run.iter()) {
         if entry.contains('\n') {
             bail!(
                 "[tools] entry spans multiple lines — chain with `&&` or a trailing `\\` in one entry: {entry:?}"
@@ -446,7 +472,7 @@ pub(crate) fn ensure_tools_image(
     // Fold the base image's identity (its content digest, else the ref itself) into the
     // tag, so a rebuilt harness image forces a rebuild here even at an unchanged tag.
     let base_id = image_id(engine, from_image).unwrap_or_else(|| from_image.to_string());
-    let tag = tools_tag(tag_base, &base_id, &norm_apt, &norm_run);
+    let tag = tools_tag_for(tag_base, &base_id, &tools);
     if image_exists(engine, &tag) {
         return Ok(tag);
     }
@@ -454,14 +480,14 @@ pub(crate) fn ensure_tools_image(
     let dockerfile = tmp.join("Dockerfile");
     std::fs::write(
         &dockerfile,
-        tools_dockerfile(from_image, &norm_apt, &norm_run),
+        tools_dockerfile(from_image, &tools.apt, &tools.run),
     )?;
     let mut what = Vec::new();
-    if !norm_apt.is_empty() {
-        what.push(format!("apt: {}", norm_apt.join(", ")));
+    if !tools.apt.is_empty() {
+        what.push(format!("apt: {}", tools.apt.join(", ")));
     }
-    if !norm_run.is_empty() {
-        what.push(format!("{} run step(s)", norm_run.len()));
+    if !tools.run.is_empty() {
+        what.push(format!("{} run step(s)", tools.run.len()));
     }
     info!("provisioning tools ({}) into {tag}...", what.join("; "));
     let result = build_image(
@@ -584,6 +610,23 @@ mod tests {
             a,
             "a new base image must force a new tools tag"
         );
+    }
+
+    #[test]
+    fn normalized_tools_preserve_run_program_but_canonicalize_apt_set() {
+        let tools = NormalizedTools::new(
+            &[" jq ".into(), "ripgrep".into(), "jq".into(), String::new()],
+            &[
+                " first ".into(),
+                String::new(),
+                "first".into(),
+                "second ".into(),
+            ],
+        );
+        assert_eq!(tools.apt, vec!["jq", "ripgrep"]);
+        assert_eq!(tools.run, vec!["first", "first", "second"]);
+        let reordered = NormalizedTools::new(&tools.apt, &["second".into(), "first".into()]);
+        assert_ne!(tools, reordered, "run order and duplicates are identity");
     }
 
     #[test]

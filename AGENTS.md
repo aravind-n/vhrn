@@ -120,15 +120,20 @@ Core behavioral invariants — keep these intact:
   re-pulls a floating install only when a newer agent is published — never pulling just to
   diff; an unreachable registry is a hard error, not a blind pull. A daily `harness-images.yml`
   cron rebuilds a harness when its agent updates — both independent of a CLI release.
-- **Config precedence: flags > `~/.config/vhrn/config.toml` > defaults** (`src/config.rs`,
-  `toml` crate). Config is **host-owned only** — nothing is read from the project directory, so
-  repo content can never configure the jail. `blocked_dirs` matches the resolved cwd
-  **exactly** (not subtree), default `["~","/"]`. `[tools]` (`apt` packages + ordered `run`
-  commands) resolves to a content-addressed derived image (`vhrn-<h>-tools-<hash>`, `FROM`
-  the harness image: an apt layer then the run steps, as root with `HOME=/home/dev` and a
-  final chown — no sudo), pre-built at install/update and cached by tag. PATH is not managed
-  by vhrn — the entrypoint sources `~/.profile` at runtime so build-time installers register
-  themselves.
+- **Config precedence: flags > host XDG config (normally `~/.config/vhrn/config.toml`) > defaults**
+  (`src/config.rs`, `toml` crate). Config is **host-owned only** — nothing is read from the
+  project directory, so repo content can never configure the jail. Global `[tools]` and
+  `[resources]` are defaults; singular `[project."<absolute canonical path>"]` blocks may
+  override only their tools/resources fields, selected by an exact `pwd -P` cwd match (no
+  parent, glob, symlink alias, `~`, `.` or `..`). `blocked_dirs` is global-only and matches the
+  resolved cwd **exactly** (not subtree), default `["~","/"]`; project blocks cannot set net,
+  while top-level `[net]` remains supported pending scoped egress. `[tools]` (`apt` packages +
+  ordered `run` commands) resolves to a content-addressed derived image
+  (`vhrn-<h>-tools-<hash>`, `FROM` the harness image: an apt layer then the run steps, as root
+  with `HOME=/home/dev` and a final chown — no sudo). Install and actual updates prewarm the
+  global plus every distinct normalized project profile deterministically; failures attempt all
+  profiles, leave the base operation complete, and return nonzero. PATH is not managed by vhrn —
+  the entrypoint sources `~/.profile` at runtime so build-time installers register themselves.
 - **Shell aliases and the installed registry are host state.** `install`/`uninstall` mutate
   `~/.config/vhrn/installed` and regenerate reversible marker-delimited alias blocks in the
   bash/zsh rc files (existing files + the current shell's). fish is not an rc file: it gets a

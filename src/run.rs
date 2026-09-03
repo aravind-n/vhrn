@@ -430,7 +430,7 @@ fn prepare_container(h: &Harness) -> Result<ContainerConfig> {
 
     // Config first: a blocked cwd must abort before any host-side work.
     let config_dir_host = crate::shell::vhrn_config_dir(&home);
-    let conf = crate::config::load_config(&config_dir_host)?;
+    let conf = crate::config::load_project_config(&config_dir_host, &project_s)?;
     crate::config::check_blocked_dir(
         &project_s,
         &home.to_string_lossy(),
@@ -823,6 +823,46 @@ mod tests {
                 "resource flags must use long forms: {got:?}"
             );
         }
+    }
+
+    #[test]
+    fn exact_project_configs_select_independent_resources_and_tools() {
+        let file: crate::config::ConfigFile = toml::from_str(
+            r#"
+                [run]
+                blocked_dirs = ["/", "/blocked"]
+                [tools]
+                apt = ["jq"]
+                [resources]
+                memory = "4g"
+                cpus = 2
+                [project."/work/a".tools]
+                apt = ["ripgrep"]
+                [project."/work/a".resources]
+                memory = "8g"
+                [project."/work/b".tools]
+                run = ["install-b"]
+                [project."/work/b".resources]
+                cpus = 6
+            "#,
+        )
+        .unwrap();
+        let a = crate::config::resolve_config(&file, "/work/a").unwrap();
+        let b = crate::config::resolve_config(&file, "/work/b").unwrap();
+        assert_eq!(a.run.blocked_dirs, b.run.blocked_dirs);
+        assert_ne!(
+            resource_args("docker", &a.resources),
+            resource_args("docker", &b.resources)
+        );
+        let a_tools = crate::image::NormalizedTools::new(
+            &a.tools.apt.unwrap_or_default(),
+            &a.tools.run.unwrap_or_default(),
+        );
+        let b_tools = crate::image::NormalizedTools::new(
+            &b.tools.apt.unwrap_or_default(),
+            &b.tools.run.unwrap_or_default(),
+        );
+        assert_ne!(a_tools, b_tools);
     }
 
     // A ContainerConfig fixture whose sandbox has skills/ + settings.json + CLAUDE.md, but

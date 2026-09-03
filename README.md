@@ -73,16 +73,41 @@ cpus = 4                           # positive integral CPU count
 apt = ["postgresql-client"]      # Debian packages
 run = ["curl -fsSL https://sh.rustup.rs | sh -s -- -y"]   # arbitrary build-time install commands
 
+# Exact project overrides; use `pwd -P` for the key.
+[project."/Users/me/work/payments".resources]
+memory = "8g"
+
+[project."/Users/me/work/payments".tools]
+apt = ["postgresql-client", "jq"]
+
 [net]
 allow = ["docs.rs"]              # extra allowlist domains
 mode  = "enforce"                # enforce | report | open
 ```
+
+Global `[tools]` and `[resources]` are defaults for every project. A singular
+`[project."<absolute-canonical-path>".tools]` or `.resources` block may independently replace
+`tools.apt`, `tools.run`, `resources.memory`, or `resources.cpus`; an absent field inherits its
+global value. Arrays replace rather than append, so `apt = []` explicitly clears the global apt
+list for that project.
+
+vhrn canonicalizes the cwd once and matches the project key byte-for-byte. Entries do not apply to
+children, glob patterns, or symlink spellings; keys cannot use `~`, `.` or `..`. Use `pwd -P` to
+obtain the spelling to configure. Declared project paths need not exist when vhrn parses config or
+prewarms images. Project blocks cannot set `run.blocked_dirs` or network settings: `blocked_dirs`
+is global-only. The top-level `[net]` block remains supported while scoped egress is still pending.
 
 Resource limits are host-owned configuration, not wrapper flags. An unset `memory` makes
 vhrn pass `--memory 4g` only to Apple's `container`; Docker keeps its engine default.
 `memory = "engine"` leaves either engine unchanged. Explicit values use the portable long
 `--memory` and `--cpus` forms. Agent arguments named `--memory` or `--cpus` still pass through
 unchanged after the harness command.
+
+Install and actual image updates prewarm the global effective tools profile and every distinct
+project profile, independent of the directory from which the command is run. Equivalent normalized
+apt/run profiles build once; vhrn attempts all profiles and reports the affected paths. A failed
+profile does not undo the base install or update, but the command exits nonzero. Running a harness
+still lazily builds its selected profile if it was not already cached.
 
 The host project mount preserves project-local installed dependencies and outputs such as
 `node_modules`, `.venv`, `target`, and generated files. Package-manager caches under the

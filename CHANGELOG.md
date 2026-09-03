@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Exact-path host-owned per-project `[tools]` and `[resources]` overrides, with deterministic
+  prewarming of distinct effective tools profiles during install and actual updates.
+
 ## [0.4.1] - 2026-09-01
 
 ### Added
