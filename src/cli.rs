@@ -194,12 +194,32 @@ fn run_install(args: &[String]) -> i32 {
         return 1;
     }
 
-    // Pre-build the [tools] layer so the first run is instant. Non-fatal: a broken tools
-    // build must not block the base install — report it, finish the install, and exit
-    // nonzero at the end so a scripted install still sees the failure.
-    let tools_ok = match prewarm_tools(&engine, &registry, &h, &version) {
-        Ok(()) => true,
+    let config_dir = crate::shell::vhrn_config_dir(&home);
+    let outcome = finish_base_install(
+        || prewarm_tools(&engine, &registry, &h, &version),
+        || {
+            // Union base defaults + this harness's domains into the host allowlist,
+            // append-if-missing so later user edits are respected.
+            crate::net::seed_allowlist(&crate::run::vhrn_cache(&home), &h.allow_domains)?;
+            crate::shell::add_installed(&config_dir, &name, &version)?;
+            if let Err(e) = crate::shell::sync_aliases(
+                &config_dir,
+                &home,
+                crate::shell::current_shell().as_deref(),
+                crate::shell::xdg_config_home().as_deref(),
+            ) {
+                warn!("could not update shell aliases: {e}");
+            }
+            Ok(())
+        },
+    );
+    let tools_ok = match outcome {
         Err(e) => {
+            error!("{e}");
+            return 1;
+        }
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
             error!("{e:#}");
             error!(
                 "base install finished; fix the above, then run `vhrn {name}` to build the tools layer"
@@ -208,32 +228,23 @@ fn run_install(args: &[String]) -> i32 {
         }
     };
 
-    // Union base defaults + this harness's domains into the host allowlist,
-    // append-if-missing so later user edits are respected.
-    if let Err(e) = crate::net::seed_allowlist(&crate::run::vhrn_cache(&home), &h.allow_domains) {
-        error!("{e}");
-        return 1;
-    }
-
-    let config_dir = crate::shell::vhrn_config_dir(&home);
-    if let Err(e) = crate::shell::add_installed(&config_dir, &name, &version) {
-        error!("{e}");
-        return 1;
-    }
-    if let Err(e) = crate::shell::sync_aliases(
-        &config_dir,
-        &home,
-        crate::shell::current_shell().as_deref(),
-        crate::shell::xdg_config_home().as_deref(),
-    ) {
-        warn!("could not update shell aliases: {e}");
-    }
-
     println!(
         "Installed {name} ({version}). Restart your shell to use `{}`.",
         h.alias
     );
     i32::from(!tools_ok)
+}
+
+/// Final host-state work is intentionally not conditional on tools prewarming: a tools image
+/// is an optimization atop an already provisioned harness, while aliases and the installed
+/// registry describe that base installation. Returns the prewarm result after finalization.
+fn finish_base_install(
+    prewarm: impl FnOnce() -> Result<()>,
+    finalize: impl FnOnce() -> Result<()>,
+) -> Result<Result<()>> {
+    let prewarm_result = prewarm();
+    finalize()?;
+    Ok(prewarm_result)
 }
 
 /// Re-pull each floating harness (and its derived proxy) in place and report the agent
@@ -354,15 +365,25 @@ fn pull_update(
         error!("  {:<12} update failed: {e}", h.name);
         return false;
     }
-    on_success();
     // Rebuild the [tools] layer onto the freshly pulled base. The version move is already
     // reported; a tools-build failure exits nonzero (not a false-green) but points the retry
     // at `vhrn <harness>` — re-running `vhrn update` sees "already current" and won't rebuild.
-    if let Err(e) = prewarm_tools(engine, registry, h, version) {
+    if let Err(e) = finish_pulled_update(on_success, || prewarm_tools(engine, registry, h, version))
+    {
         error!("  {:<12} {e:#} (run `vhrn {}` to retry)", h.name, h.name);
         return false;
     }
     true
+}
+
+/// A successful pull is already a completed update. Report it before prewarming so a broken
+/// derived layer makes the command fail without obscuring the completed base-image update.
+fn finish_pulled_update(
+    on_success: impl FnOnce(),
+    prewarm: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    on_success();
+    prewarm()
 }
 
 /// A registry install we couldn't check (offline / registry down / non-OCI). Emits a
@@ -373,10 +394,39 @@ fn report_unreachable(name: &str, registry: &str) {
     // network error is recorded to the log without duplicating this line on stderr today.
 }
 
-/// Pre-build the [tools] layer (apt/run from the host config) onto the harness image at
-/// `version`, so the first run doesn't pay for it. Returns Ok(()) when nothing is declared.
-/// Callers treat a build error as non-fatal but exit nonzero, so a broken [tools] config
-/// neither bricks install/update nor passes silently.
+/// Attempt every non-empty tools profile, retaining failures rather than stopping at the
+/// first one. The injected build edge keeps profile behavior testable without an engine.
+fn prewarm_profiles(
+    file: &crate::config::ConfigFile,
+    mut build: impl FnMut(&crate::image::NormalizedTools) -> Result<()>,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for profile in crate::config::tools_profiles(file) {
+        if profile.tools.is_empty() {
+            continue;
+        }
+        if let Err(error) = build(&profile.tools) {
+            let mut sources = Vec::new();
+            if profile.global {
+                sources.push("global [tools]".to_string());
+            }
+            if !profile.projects.is_empty() {
+                sources.push(format!("projects {:?}", profile.projects));
+            }
+            failures.push(format!("{}: {error:#}", sources.join("; ")));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("building tools profiles failed: {}", failures.join("; "))
+    }
+}
+
+/// Pre-build every effective [tools] layer from the host config onto the harness image at
+/// `version`, so neither install nor update depends on the caller's cwd. Parsing deliberately
+/// avoids resource resolution: another project's malformed resource setting cannot block tools.
+/// Callers treat an error as non-fatal to base installation/update but exit nonzero afterward.
 fn prewarm_tools(
     engine: &str,
     registry: &str,
@@ -384,16 +434,13 @@ fn prewarm_tools(
     version: &str,
 ) -> Result<()> {
     let home = crate::run::home_dir()?;
-    let cfg = crate::config::load_config(&crate::shell::vhrn_config_dir(&home))?;
-    let apt = cfg.tools.apt.unwrap_or_default();
-    let run = cfg.tools.run.unwrap_or_default();
-    if apt.is_empty() && run.is_empty() {
-        return Ok(());
-    }
+    let config = crate::config::load_config_file(&crate::shell::vhrn_config_dir(&home))?;
     let from = crate::image::harness_image_ref(registry, h, version);
-    crate::image::ensure_tools_image(engine, &from, &h.image, &apt, &run)
-        .context("building the [tools] image")?;
-    Ok(())
+    prewarm_profiles(&config, |tools| {
+        crate::image::ensure_tools_image(engine, &from, &h.image, &tools.apt, &tools.run)
+            .context("building the [tools] image")
+            .map(|_| ())
+    })
 }
 
 /// Drop a harness from the installed registry and regenerate the shell aliases so its
@@ -548,6 +595,113 @@ mod tests {
     #[test]
     fn version_falls_back_to_crate_version() {
         assert_eq!(version(), env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn prewarm_profiles_skips_empty_and_attempts_every_nonempty_profile() {
+        let file: crate::config::ConfigFile = toml::from_str(
+            r#"
+                [project."/a".tools]
+                run = ["first"]
+                [project."/b".tools]
+                run = ["second"]
+            "#,
+        )
+        .unwrap();
+        let mut attempted = Vec::new();
+        let error = prewarm_profiles(&file, |tools| {
+            attempted.push(tools.run.clone());
+            if tools.run == vec!["first".to_string()] {
+                bail!("first failed")
+            }
+            bail!("second failed")
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            attempted,
+            vec![vec!["first".to_string()], vec!["second".to_string()]]
+        );
+        assert!(error.contains("projects [\"/a\"]: first failed"), "{error}");
+        assert!(
+            error.contains("projects [\"/b\"]: second failed"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn prewarm_profiles_reports_all_sources_of_one_normalized_profile() {
+        let file: crate::config::ConfigFile = toml::from_str(
+            r#"
+                [tools]
+                apt = ["jq"]
+                [project."/b".tools]
+                apt = [" jq "]
+                [project."/a".tools]
+                apt = ["jq", "jq"]
+            "#,
+        )
+        .unwrap();
+        let error = prewarm_profiles(&file, |_| bail!("build failed"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("global [tools]; projects [\"/a\", \"/b\"]"),
+            "{error}"
+        );
+        assert_eq!(error.matches("build failed").count(), 1, "{error}");
+    }
+
+    #[test]
+    fn base_install_finalizes_after_prewarm_failure() {
+        let finalized = std::cell::Cell::new(false);
+        let outcome = finish_base_install(
+            || bail!("tools failed"),
+            || {
+                finalized.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            finalized.get(),
+            "registry/alias finalization must still run"
+        );
+        assert!(outcome.is_err(), "the command must still return nonzero");
+    }
+
+    #[test]
+    fn pulled_update_reports_completion_before_prewarm_failure() {
+        let reported = std::cell::Cell::new(false);
+        let result = finish_pulled_update(|| reported.set(true), || bail!("tools failed"));
+        assert!(
+            reported.get(),
+            "the successful base update must be reported"
+        );
+        assert!(result.is_err(), "the command must still return nonzero");
+    }
+
+    #[test]
+    fn prewarm_planning_is_independent_of_the_callers_cwd() {
+        let file: crate::config::ConfigFile = toml::from_str(
+            r#"
+                [project."/one".tools]
+                run = ["one"]
+                [project."/two".tools]
+                run = ["two"]
+            "#,
+        )
+        .unwrap();
+        let mut built = Vec::new();
+        prewarm_profiles(&file, |tools| {
+            built.push(tools.run.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            built,
+            vec![vec!["one".to_string()], vec!["two".to_string()]]
+        );
     }
 
     // installed_detail resolves a label only for a floating tag, and only with an engine;

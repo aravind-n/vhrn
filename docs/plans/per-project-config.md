@@ -1,11 +1,11 @@
 # Host-owned per-project configuration
 
-Status: **design proposal, not built.** This restores project-specific tools and resource limits
-without restoring `./.vhrn.toml`, whose repository-owned contents could configure the jail before
-the container launched.
+Status: **implemented for tools and resources.** This restores project-specific tools and resource
+limits without restoring `./.vhrn.toml`, whose repository-owned contents could configure the jail
+before the container launched.
 
-This proposal depends on the scoped-egress design in `egress-allowlist-layering.md`. Network policy
-is deliberately not part of this configuration surface.
+Scoped egress remains pending (see `egress-allowlist-layering.md`). Network policy is deliberately
+not part of project configuration; top-level `[net]` remains supported until that work lands.
 
 ## Goals
 
@@ -82,9 +82,10 @@ only after selecting the current project's block would make it little more than 
 project to replace or weaken the global launch guard. Keeping it global makes the guard auditable
 and ensures project selection cannot change whether that cwd is eligible to launch.
 
-Network settings are absent by design. After the scoped-egress work lands, `[net]`, `net.allow`, and
-`net.mode` are not recognized configuration. Project-specific access is stored in the host-owned
-egress policy store and managed through `vhrn net`; it is not duplicated in TOML.
+Project network settings are rejected. After the scoped-egress work lands, `[net]`, `net.allow`, and
+`net.mode` are intended to leave this TOML surface; until then, the existing top-level `[net]` block
+remains supported. Project-specific access will be stored in the host-owned egress policy store and
+managed through `vhrn net`; it is not duplicated in project TOML.
 
 ## Project identity and matching
 
@@ -114,9 +115,18 @@ of every project:
 struct ConfigFile {
     run: RunConfig,
     tools: ToolsConfig,
-    resources: ResourcesConfig,
+    // Transitional: top-level only until scoped egress replaces TOML net settings.
+    net: NetConfig,
+    resources: ParsedResourcesConfig,
     #[serde(rename = "project")]
     projects: BTreeMap<String, ProjectOverrides>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ParsedResourcesConfig {
+    memory: Option<String>,
+    cpus: Option<i64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -137,12 +147,14 @@ struct ProjectToolsOverrides {
 #[serde(default, deny_unknown_fields)]
 struct ProjectResourcesOverrides {
     memory: Option<String>,
-    cpus: Option<u32>,
+    cpus: Option<i64>,
 }
 
 struct Config {
     run: RunConfig,
     tools: ToolsConfig,
+    // Transitional: retained from top-level TOML until scoped egress replaces it.
+    net: NetConfig,
     resources: ResourcesConfig,
 }
 ```
@@ -152,6 +164,8 @@ spelling to the singular form shown above. The parsed types deny unknown fields,
 misspelled nested field, or a forbidden `run`/`net` section is an error instead of a silently ignored
 setting. `ProjectOverrides` does not recursively contain another project map. The project-specific
 leaf types merge into the existing resolved `ToolsConfig` and `ResourcesConfig` types.
+`ParsedResourcesConfig` keeps TOML CPU values as signed 64-bit integers; the selected effective CPU
+is validated and converted to `ResourcesConfig`'s positive `u32` only after exact project selection.
 
 Refactor loading into two pure stages:
 
@@ -199,9 +213,9 @@ the selected run and translated to the existing portable `--memory` and `--cpus`
 - `tools.run` remains arbitrary host-authorized build input. Adding it to a project block does not
   make repository content executable by vhrn.
 
-## Implementation sequence
+## Implemented sequence
 
-1. Add `ConfigFile` and `ProjectOverrides`, using the singular TOML `project` rename and
+1. Added `ConfigFile` and `ProjectOverrides`, using the singular TOML `project` rename and
    project-key validation.
 2. Split parse and resolve operations; pass the already-canonical cwd into the resolver from the
    run path.
@@ -211,9 +225,9 @@ the selected run and translated to the existing portable `--memory` and `--cpus`
 5. Change install/update prewarming to enumerate and deduplicate all effective tools profiles.
 6. Update active configuration documentation and examples without adding an egress TOML surface.
 
-## Tests
+## Coverage
 
-Add pure tests covering:
+Pure tests cover:
 
 - singular `[project."..."]` deserialization and rejection of a plural `[projects]` typo;
 - exact canonical-path selection, nested-project noninheritance, symlink-spelling nonmatch, and
