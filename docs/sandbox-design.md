@@ -12,23 +12,32 @@ connection through that proxy, and the proxy only allows allowlisted domains. Ev
 else, including direct DNS, is refused. A blocked request fails with the domain named,
 like `blocked by vhrn egress policy: example.com`.
 
-The policy lives on the host, under `~/.cache/vhrn/net/`, and is mounted into the proxy
-but **never** into the container. That is what stops an in-container process from
-widening its own egress, even under skip-permissions. Edit it from the host while a
-container is running and the proxy picks up the change on its next request, no restart
-needed:
+The policy lives on the host at `${XDG_STATE_HOME:-~/.local/state}/vhrn/net`, with a store lock,
+atomic same-directory writes, and active-run leases. It is mounted
+into the proxy but **never** into the container. Five additive layers are evaluated in order:
+immutable base, selected harness, persistent global, exact canonical project, and run-only wrapper
+`--allow`. Mode belongs to each active run. This keeps an in-container process from widening its
+own egress, even under skip-permissions. The proxy rereads every required layer and mode before a
+new decision; a required-read failure enforces an empty policy. Existing tunnels stay open.
 
 ```sh
-vhrn net status                 # current mode + allowlist size
-vhrn net allow docs.rs api.x.io # add domains (takes effect immediately)
-vhrn net denied                 # domains blocked this session
-vhrn net open                   # drop the guard (allow all)
-vhrn net guard                  # re-enable enforcement
+vhrn net status --domains       # persistent scopes, active runs, and provenance
+vhrn net allow docs.rs api.x.io # global policy (live for active runs)
+vhrn net allow --project . api.x.io # exact canonical project policy
+vhrn net denied                 # denials since the last idle period
+vhrn net open                   # set every active run open
+vhrn net guard                  # set every active run enforce
 ```
 
-`vhrn install` seeds the allowlist with the base defaults plus the harness's own
-domains. Edit `~/.cache/vhrn/net/allowlist` to change it. Per-session overrides
-(`--allow`, `--open-net`) and the `[net]` config block are covered in the README.
+`--allow` and `--open-net` are run-only. `open`, `guard`, and `report` change active runs only;
+future runs default to enforce. `allow`/`deny` normalize ASCII domain input (use IDNA/punycode for
+internationalized names), and parent domains match subdomains. `deny` removes no other layer and
+reports remaining provenance. `[net]` configuration and install-time policy seeding are removed.
+Stale `[net]` yields a targeted migration error, while `vhrn net` remains usable.
+
+vhrn synchronously creates the named agent container before start/attach. On SIGTERM, cleanup
+removes the agent, then the proxy, then the run policy; a SIGKILL cannot run cleanup, so lease
+reaping removes stale active-run state later. This does not close existing proxy tunnels.
 
 ## Login and state persistence
 
@@ -131,6 +140,7 @@ present and unused.
   rather than preventing execution — which is why vhrn does not answer the trust prompt for
   you, on the host's behalf or otherwise. Treat trusting an unfamiliar repo as running its
   code, because it is.
-- Sessions run with `--open-net` (or `net.mode = "open"`), which turn the guard off.
+- Sessions launched with `--open-net`, or active runs changed to `net open`, which turn their
+  guard off.
 - A container escape under Docker, where the container shares the host's kernel. Apple
   `container` puts each container in its own lightweight VM, a stronger boundary.

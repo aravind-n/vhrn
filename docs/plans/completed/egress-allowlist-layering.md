@@ -217,12 +217,11 @@ construct `ProxyGuard` immediately after the engine reports a successful start, 
 its idempotent cleanup handle to the signal control, and only then inspect the IP or do other fallible
 work. The local guard covers errors before `start_proxy` returns.
 
-On SIGTERM, take and invoke the proxy-cleanup handle when present, run the shared policy cleanup, then
-call `process::exit`. Normal/error unwinding declares the returned `ProxyGuard` after `PolicyRun`, so
-reverse drop order stops the proxy before retiring policy. SIGINT remains delegated to the
-interactive child. Tests use injected stop/cleanup actions rather than process signals and cover
-SIGTERM before proxy creation, during post-start IP inspection, and while waiting for the agent.
-Status/live-mode operations skip post-discovery `NotFound` but propagate other errors.
+vhrn synchronously creates the named agent under the lifecycle gate before start/attach. On SIGTERM,
+cleanup removes the owned agent before proxy and policy retirement, and kills/waits the attach client.
+SIGINT remains delegated to the interactive child. SIGKILL cannot run cleanup, so leases reap stale
+active-run state.
+Status/live-mode operations can surface `NotFound` when run retirement races their discovery.
 
 Reaping uses `try_lock`: `WouldBlock` is live; success means abandoned; a missing/malformed lease is
 invalid. There is no age-based cleanup. A SIGKILLed wrapper may leave containers, but deleting its
@@ -298,8 +297,9 @@ inconsistently, so proxy text is diagnostic rather than instructional.
 
 ## Upgrade behavior
 
-There is no product migration. New code never reads or imports old
-`$XDG_CACHE_HOME/vhrn/net` (default `~/.cache/vhrn/net`). First use creates empty global and selected
+There is no product migration. The old policy lived at
+`${XDG_CACHE_HOME:-~/.cache}/vhrn/net` (normally `~/.cache/vhrn/net`). New code never reads or
+imports this old cache policy. First use creates empty global and selected
 project user layers. A retained `[net]` table is rejected with the targeted migration diagnostic;
 `vhrn net` remains available to add its domains before the user removes the stale table.
 
@@ -351,7 +351,7 @@ commands remain usable.
 ### 5. Update active documentation
 
 Update `AGENTS.md`, `README.md`, `docs/sandbox-design.md`, `docs/adding-a-harness.md`,
-`docs/plans/per-project-config.md` (remove its egress fields), CLI usage, guide text, and
+`docs/plans/completed/per-project-config.md` (remove its egress fields), CLI usage, guide text, and
 `CHANGELOG.md` under `[Unreleased]`. Update `Cargo.toml`/`Cargo.lock` for `idna` without bumping the
 crate version.
 

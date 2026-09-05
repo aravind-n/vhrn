@@ -3,8 +3,11 @@
 A harness is a spec (`src/harness.rs`) plus a thin `FROM vhrn-base` Dockerfile under
 `image/<harness>/`, and an entry in the CI publish matrix
 (`.github/workflows/_build-images.yml`) so its image lands on ghcr. The spec carries the
-image name, in-container command, shell alias, default egress domains, and the
+image name, in-container command, shell alias, immutable selected-harness egress minimum, and the
 persistence descriptors. No fork of the CLI is required.
+
+Those harness domains are one additive launch layer only. They never become an install-time union
+or a mutable persistent allowlist; global/project policy belongs to `vhrn net`.
 
 ## The rule the codex harness established
 

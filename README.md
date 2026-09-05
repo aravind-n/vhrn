@@ -10,7 +10,7 @@ Run coding agents inside a container jailed to the current project directory, wi
 
 ## Getting Started
 
-Install the CLI, then install a harness (pulls its images, seeds egress, adds a shell alias):
+Install the CLI, then install a harness (pulls its images and adds a shell alias):
 
 ```sh
 curl -fsSL https://aravind-n.github.io/vhrn/install.sh | sh
@@ -34,8 +34,9 @@ one. Either login persists across runs and serves every project. For non-interac
 when set. vhrn defaults to hiding them from commands the agent spawns; set
 `[shell_environment_policy]` in your host config and yours wins.
 
-Harnesses share one egress allowlist, so installing a second one widens egress for the
-first. `vhrn net status` shows the current list.
+Each run composes immutable base and selected-harness domains with optional persistent global and
+exact-project domains, then run-only wrapper domains. Installing a harness never changes egress
+policy.
 
 ## Usage
 
@@ -48,12 +49,28 @@ vhrn <harness> --allow docs.rs   # add domains to the allowlist for this session
 vhrn <harness> --open-net        # drop the guard for this session (all egress)
 vhrn <harness> -- --help         # harness's own help (-- stops wrapper flag parsing)
 
+vhrn net status [--domains]      # persistent scopes and active runs (with provenance)
+vhrn net allow docs.rs            # persist a global domain
+vhrn net allow --project . api.x.io # persist a domain for this canonical project
+vhrn net deny api.x.io             # remove from the global mutable scope
+vhrn net deny --project . api.x.io # remove from this project's mutable scope
+vhrn net denied                  # denials since the last idle period
+vhrn net open|guard|report       # change mode for active runs only
+
 vhrn list                        # known + installed harnesses
 vhrn update [<harness>]          # re-pull installed harnesses when a newer agent is published
 vhrn uninstall <harness>         # drop the alias/registry entry (--image also deletes the image)
 ```
 
 Wrapper flags (`--open-net`, `--allow`) go after the harness name, before the agent's own flags.
+They never persist. `open`, `guard`, and `report` affect active runs only; when idle they report
+`no active runs; future runs default to enforce`.
+
+`allow` and `deny` accept ASCII domain names only. vhrn trims and lowercases input, accepts a
+leading `*.` and leading/trailing dots as the same domain, and matches a parent domain's subdomains.
+Use an IDNA/punycode spelling for an internationalized domain rather than storing Unicode. A denied
+batch is atomic: every requested domain must be present in the selected scope. Status and deny
+output identify remaining sources rather than treating deny as a negative override.
 
 ## Configuration
 
@@ -80,9 +97,6 @@ memory = "8g"
 [project."/Users/me/work/payments".tools]
 apt = ["postgresql-client", "jq"]
 
-[net]
-allow = ["docs.rs"]              # extra allowlist domains
-mode  = "enforce"                # enforce | report | open
 ```
 
 Global `[tools]` and `[resources]` are defaults for every project. A singular
@@ -94,8 +108,13 @@ list for that project.
 vhrn canonicalizes the cwd once and matches the project key byte-for-byte. Entries do not apply to
 children, glob patterns, or symlink spellings; keys cannot use `~`, `.` or `..`. Use `pwd -P` to
 obtain the spelling to configure. Declared project paths need not exist when vhrn parses config or
-prewarms images. Project blocks cannot set `run.blocked_dirs` or network settings: `blocked_dirs`
-is global-only. The top-level `[net]` block remains supported while scoped egress is still pending.
+prewarms images. Project blocks cannot set `run.blocked_dirs`; it is global-only.
+
+`[net]` has been removed from configuration. A retained top-level `[net]` produces a targeted
+error: first move persistent domains with `vhrn net allow`, then remove `[net]` and retry. `vhrn
+net` itself remains usable while that configuration error blocks other commands. For a clean reset,
+stop active runs, remove `${XDG_STATE_HOME:-~/.local/state}/vhrn/net`, and recreate only the global
+or project domains you want with `vhrn net allow`; this is a reset, not an automatic migration.
 
 Resource limits are host-owned configuration, not wrapper flags. An unset `memory` makes
 vhrn pass `--memory 4g` only to Apple's `container`; Docker keeps its engine default.
