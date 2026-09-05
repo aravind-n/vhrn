@@ -126,8 +126,8 @@ Core behavioral invariants — keep these intact:
   `[resources]` are defaults; singular `[project."<absolute canonical path>"]` blocks may
   override only their tools/resources fields, selected by an exact `pwd -P` cwd match (no
   parent, glob, symlink alias, `~`, `.` or `..`). `blocked_dirs` is global-only and matches the
-  resolved cwd **exactly** (not subtree), default `["~","/"]`; project blocks cannot set net,
-  while top-level `[net]` remains supported pending scoped egress. `[tools]` (`apt` packages +
+  resolved cwd **exactly** (not subtree), default `["~","/"]`; project blocks cannot set net.
+  `[tools]` (`apt` packages +
   ordered `run` commands) resolves to a content-addressed derived image
   (`vhrn-<h>-tools-<hash>`, `FROM` the harness image: an apt layer then the run steps, as root
   with `HOME=/home/dev` and a final chown — no sudo). Install and actual updates prewarm the
@@ -231,12 +231,12 @@ exfiltrating freely. Guard these:
   alter the firewall. **This is why sudo was removed — do not reintroduce it.** If `nft`
   can't run, the entrypoint **aborts** rather than fall through to an unguarded session. The
   container must run with `--cap-add CAP_NET_ADMIN` or `nft` fails with a netlink error.
-- **Egress policy is host-owned.** The allowlist, mode, and deny-log live in
-  `~/.cache/vhrn/net/` and are mounted **only into the proxy, never the container** — that
-  is what stops an in-container process from widening its own egress, even under
-  skip-permissions. `vhrn net …` mutates them from the host (atomic same-dir temp + rename);
-  `install` unions base + harness domains in (append-if-missing); config `net.allow`/
-  `net.mode` fold in at run (`--open-net` wins). The container can never widen its own egress.
+- **Egress policy is host-owned.** `${XDG_STATE_HOME:-~/.local/state}/vhrn/net` holds locked,
+  atomically written state mounted **only into the proxy, never the container**. Each run
+  composes immutable base, selected harness, global, exact-project, and run-only `--allow` layers;
+  mode is per active run. `vhrn net` mutates only global/project layers, while `--allow` and
+  `--open-net` are run-only. `vhrn net open` changes every active run; future runs are unaffected.
+  Keep policy outside config and install: `[net]` and install seeding are removed.
 - **The container stays ephemeral (`--rm`).** A fresh, tamper-proof firewall every boot — a
   security feature. Persistence is a property of what's mounted; do **not** move to a
   persistent "container machine."
@@ -252,7 +252,7 @@ exfiltrating freely. Guard these:
   curates those trees, and anything they link in is a deliberate choice.
 - **Threat model** (full version in `docs/sandbox-design.md`): protects the host filesystem
   and against casual exfiltration. Does **not** cover exfiltration to an allowed domain,
-  sessions run with `--open-net`/`net.mode = "open"`, executable config inside a repo the
+  sessions launched with `--open-net` or changed with `net open`, executable config inside a repo the
   user has **trusted** (a project `.codex/config.toml`, a project skill), or a container
   escape under Docker (Docker shares the host kernel; Apple `container` gives each container
   its own lightweight VM).

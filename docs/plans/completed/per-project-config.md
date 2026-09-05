@@ -3,8 +3,9 @@
 Status: **complete.** Project-specific tools and resource limits are selected by exact canonical
 path from the host-owned XDG configuration.
 
-Scoped egress is separate work tracked in `egress-allowlist-layering.md`. Network policy is not part
-of project configuration; top-level `[net]` remains supported until that work lands.
+Scoped egress is separate completed work tracked in
+[`egress-allowlist-layering.md`](egress-allowlist-layering.md). Network policy is not part of
+project configuration; `[net]` is removed in favor of `vhrn net` scopes.
 
 ## Goals
 
@@ -81,10 +82,9 @@ only after selecting the current project's block would make it little more than 
 project to replace or weaken the global launch guard. Keeping it global makes the guard auditable
 and ensures project selection cannot change whether that cwd is eligible to launch.
 
-Project network settings are rejected. After the scoped-egress work lands, `[net]`, `net.allow`, and
-`net.mode` are intended to leave this TOML surface; until then, the existing top-level `[net]` block
-remains supported. Project-specific access will be stored in the host-owned egress policy store and
-managed through `vhrn net`; it is not duplicated in project TOML.
+Project network settings are rejected. `[net]`, `net.allow`, and `net.mode` are absent from this
+TOML surface. Project-specific access lives in the host-owned egress policy store and is managed
+through `vhrn net`; it is not duplicated in project TOML.
 
 ## Project identity and matching
 
@@ -114,8 +114,6 @@ of every project:
 struct ConfigFile {
     run: RunConfig,
     tools: ToolsConfig,
-    // Transitional: top-level only until scoped egress replaces TOML net settings.
-    net: NetConfig,
     resources: ParsedResourcesConfig,
     #[serde(rename = "project")]
     projects: BTreeMap<String, ProjectOverrides>,

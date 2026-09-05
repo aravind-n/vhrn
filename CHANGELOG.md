@@ -12,6 +12,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Exact-path host-owned per-project `[tools]` and `[resources]` overrides, with deterministic
   prewarming of distinct effective tools profiles during install and actual updates.
 
+- Scoped global and exact-project `vhrn net allow`/`deny`, plus active-run/domain provenance in
+  `net status --domains` and remaining-source reports from `deny`.
+
+### Changed
+
+- Effective egress now derives from immutable base and selected-harness domains, persistent global
+  and exact-project domains, and run-only wrapper layers. Policy state moved to
+  `${XDG_STATE_HOME:-~/.local/state}/vhrn/net`.
+
+- `net open`, `guard`, and `report` affect active runs only; future runs default to enforcement.
+  Documentation now describes scoped policy and a clean reset path. Policy state is host-owned,
+  proxy-only, live-reloaded with fail-closed reads, and uses narrowed directory/file permissions
+  instead of legacy world-writable policy storage.
+
+### Removed
+
+- `[net]` configuration egress settings and install-time allowlist seeding.
+
+### Fixed
+
+- `--allow` no longer persists, and `--open-net` no longer affects other or future runs. `net
+  open`, `guard`, and `report` no longer change future defaults (and intentionally affect all
+  active runs).
+
+- SIGTERM deterministically cleans the owned agent before its proxy and policy.
+
 ## [0.4.1] - 2026-09-01
 
 ### Added
@@ -181,7 +207,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defaults; nothing is read from the project directory. Per-project settings that lived in
   `./.vhrn.toml` (`toolchains.tools`, `net.allow`, `net.mode`, `run.blocked_dirs`) must move
   into the global config — a host-owned `[project."<path>"]` form is planned (see
-  `docs/plans/per-project-config.md`).
+  `docs/plans/completed/per-project-config.md`).
 
 ## [0.1.0] - 2026-07-23
 

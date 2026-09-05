@@ -1,11 +1,11 @@
 # Pi harness support
 
 Status: **implementation-ready, deferred.** This plan records the researched behavior and the
-decisions for adding Pi to vhrn. Do not implement it until both
-[`egress-allowlist-layering.md`](egress-allowlist-layering.md) and
-[`per-project-config.md`](per-project-config.md) have landed. Rebase this plan against their actual
-interfaces before starting; they remain the sources of truth for public-domain policy, policy
-scopes, canonical project identity, and host-owned project configuration.
+decisions for adding Pi to vhrn. The completed
+[`egress allowlist layering`](completed/egress-allowlist-layering.md) and
+[`per-project configuration`](completed/per-project-config.md) plans define the current policy
+scopes, canonical project identity, and host-owned configuration; rebase against their implemented
+interfaces before starting.
 
 ## Researched behavior
 
