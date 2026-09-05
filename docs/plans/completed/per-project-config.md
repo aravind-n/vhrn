@@ -1,11 +1,10 @@
 # Host-owned per-project configuration
 
-Status: **implemented for tools and resources.** This restores project-specific tools and resource
-limits without restoring `./.vhrn.toml`, whose repository-owned contents could configure the jail
-before the container launched.
+Status: **complete.** Project-specific tools and resource limits are selected by exact canonical
+path from the host-owned XDG configuration.
 
-Scoped egress remains pending (see `egress-allowlist-layering.md`). Network policy is deliberately
-not part of project configuration; top-level `[net]` remains supported until that work lands.
+Scoped egress is separate work tracked in `egress-allowlist-layering.md`. Network policy is not part
+of project configuration; top-level `[net]` remains supported until that work lands.
 
 ## Goals
 
@@ -16,9 +15,9 @@ not part of project configuration; top-level `[net]` remains supported until tha
 - Preserve install/update prewarming for content-addressed tools images.
 - Keep the resolved run configuration small and directly usable by the run path.
 
-## Non-goals
+## Constraints and non-goals
 
-- No config file inside a project.
+- The host XDG configuration is the sole persistent configuration source.
 - No prefix, glob, repository-root, or parent-directory inheritance.
 - No `~` expansion in project keys.
 - No project override for `run.blocked_dirs`.
