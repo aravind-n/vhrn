@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"vhrn/proxy/egress"
@@ -20,17 +21,27 @@ func env(k, def string) string {
 	return def
 }
 
+func allowPaths(plural, singular string) []string {
+	if plural != "" {
+		return strings.Split(plural, ",")
+	}
+	if singular != "" {
+		return []string{singular}
+	}
+	return []string{"/etc/vhrn/allowlist"}
+}
+
 func main() {
-	allowPath := env("VHRN_ALLOWLIST", "/etc/vhrn/allowlist")
+	paths := allowPaths(os.Getenv("VHRN_ALLOWLISTS"), os.Getenv("VHRN_ALLOWLIST"))
 	modePath := env("VHRN_MODE_FILE", "/etc/vhrn/mode")
 	listen := env("VHRN_PROXY_LISTEN", ":8080")
 
-	policy := egress.NewPolicy(allowPath, modePath)
+	policy := egress.NewPolicyPaths(paths, modePath)
 	dialer := egress.SafeDialer{Timeout: 10 * time.Second}
 	denyLog := egress.NewDenyLog(env("VHRN_DENY_LOG", ""))
 	proxy := egress.NewProxy(policy, dialer, denyLog)
 
-	log.Printf("vhrn egress proxy on %s (allowlist=%s mode=%s)", listen, allowPath, modePath)
+	log.Printf("vhrn egress proxy on %s (allowlists=%s mode=%s)", listen, strings.Join(paths, ","), modePath)
 	srv := &http.Server{
 		Addr:              listen,
 		Handler:           proxy,

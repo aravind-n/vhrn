@@ -8,7 +8,7 @@ const USAGE: &str = r"vhrn runs coding agents in a container jailed to the curre
 default-deny network egress.
 
 Usage:
-  vhrn install <harness>                  build images, seed egress, add a shell alias
+  vhrn install <harness>                  provision images and add a shell alias
   vhrn uninstall <harness>                remove the alias/registry entry (--image drops the image)
   vhrn <harness> [flags] [-- ] [args...]  run a harness in the container
   vhrn list                               show known and installed harnesses
@@ -33,8 +33,9 @@ or `\claude` still reaches the real binary. Examples:
   vhrn claude -- --help            # the agent's own help, not this one
 
 net subcommands:
-  net status               current mode and allowlist size
-  net allow <domain>...    add domains to the allowlist (effective now)
+  net status [--domains]   show persistent and active policy
+  net allow [--project <path>] <domain>... add persistent domains
+  net deny [--project <path>] <domain>...  remove persistent domains
   net denied               domains blocked this session
   net open                 drop the guard (allow everything)
   net guard                re-enable enforcement
@@ -144,8 +145,7 @@ fn installed_detail(engine: Option<&str>, registry: &str, name: &str, tag: &str)
         .map_or_else(|| tag.to_string(), |v| format!("{tag} → {v}"))
 }
 
-/// Pull a harness's image and the matching-version proxy from the registry, union its
-/// egress domains into the allowlist, record the harness+version in the installed
+/// Pull a harness's image and the matching-version proxy from the registry, record the harness+version in the installed
 /// registry, and write shell aliases. `--local` uses images already built by `make`
 /// instead of pulling (for development/offline).
 fn run_install(args: &[String]) -> i32 {
@@ -198,9 +198,6 @@ fn run_install(args: &[String]) -> i32 {
     let outcome = finish_base_install(
         || prewarm_tools(&engine, &registry, &h, &version),
         || {
-            // Union base defaults + this harness's domains into the host allowlist,
-            // append-if-missing so later user edits are respected.
-            crate::net::seed_allowlist(&crate::run::vhrn_cache(&home), &h.allow_domains)?;
             crate::shell::add_installed(&config_dir, &name, &version)?;
             if let Err(e) = crate::shell::sync_aliases(
                 &config_dir,
@@ -540,28 +537,49 @@ fn parse_run_flags(args: &[String]) -> Result<RunFlags> {
             let Some(v) = args.get(i) else {
                 bail!("--allow needs a domain");
             };
-            f.extra_allow.extend(split_domains(v));
+            f.extra_allow.extend(parse_domains(v)?);
             i += 1;
         } else if let Some(v) = a.strip_prefix("--allow=") {
-            f.extra_allow.extend(split_domains(v));
+            f.extra_allow.extend(parse_domains(v)?);
             i += 1;
         } else if a == "--" {
             f.rest.extend_from_slice(&args[i + 1..]);
-            return Ok(f);
+            return Ok(finalize_run_flags(f));
         } else {
             f.rest.extend_from_slice(&args[i..]);
-            return Ok(f);
+            return Ok(finalize_run_flags(f));
         }
     }
-    Ok(f)
+    Ok(finalize_run_flags(f))
 }
 
-/// Split a comma-separated `--allow` value, dropping empty fields.
-fn split_domains(s: &str) -> Vec<String> {
-    s.split(',')
-        .filter(|p| !p.is_empty())
-        .map(String::from)
-        .collect()
+fn finalize_run_flags(mut flags: RunFlags) -> RunFlags {
+    let mut unique = Vec::new();
+    for domain in flags.extra_allow {
+        if !unique.contains(&domain) {
+            unique.push(domain);
+        }
+    }
+    flags.extra_allow = unique;
+    flags
+}
+
+/// Normalize comma-separated wrapper additions before the run is published.
+fn parse_domains(s: &str) -> Result<Vec<String>> {
+    if s.is_empty() {
+        bail!("--allow needs a domain");
+    }
+    let mut domains = Vec::new();
+    for value in s.split(',') {
+        if value.is_empty() {
+            bail!("--allow contains an empty domain");
+        }
+        let domain = crate::net::normalize_domain(value).map_err(anyhow::Error::msg)?;
+        if !domains.contains(&domain) {
+            domains.push(domain);
+        }
+    }
+    Ok(domains)
 }
 
 #[cfg(test)]
@@ -759,5 +777,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn wrapper_allow_validation_is_strict_and_stable() {
+        assert_eq!(
+            parse_domains("*.Example.COM.,example.com").unwrap(),
+            vec!["example.com"]
+        );
+        for value in [
+            "",
+            "a.example,",
+            "https://example.com",
+            "example.com:443",
+            "a.example\nb.example",
+        ] {
+            assert!(parse_domains(value).is_err(), "{value:?}");
+        }
+        assert!(
+            parse_domains("bücher.example")
+                .unwrap_err()
+                .to_string()
+                .contains("xn--bcher-kva")
+        );
     }
 }

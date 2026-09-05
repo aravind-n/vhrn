@@ -14,7 +14,6 @@ use anyhow::{Result, bail};
 pub(crate) struct Config {
     pub run: RunConfig,
     pub tools: ToolsConfig,
-    pub net: NetConfig,
     pub resources: ResourcesConfig,
 }
 
@@ -35,16 +34,6 @@ pub(crate) struct RunConfig {
 pub(crate) struct ToolsConfig {
     pub apt: Option<Vec<String>>,
     pub run: Option<Vec<String>>,
-}
-
-/// Folds into the egress policy: extra allowlist domains and the guard mode. `mode`
-/// stays a raw `Option<String>` — an unknown value is tolerated here and mapped to
-/// enforce (with a warning) at run time, so we don't parse it into an enum yet.
-#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct NetConfig {
-    pub allow: Option<Vec<String>>,
-    pub mode: Option<String>,
 }
 
 /// Optional container resource limits. An unset value leaves the engine's default in
@@ -71,7 +60,6 @@ pub(crate) struct ParsedResourcesConfig {
 pub(crate) struct ConfigFile {
     pub(crate) run: RunConfig,
     pub(crate) tools: ToolsConfig,
-    pub(crate) net: NetConfig,
     pub(crate) resources: ParsedResourcesConfig,
     #[serde(rename = "project")]
     pub(crate) projects: BTreeMap<String, ProjectOverrides>,
@@ -115,10 +103,6 @@ fn default_config() -> Config {
             blocked_dirs: Some(vec!["~".into(), "/".into()]),
         },
         tools: ToolsConfig::default(),
-        net: NetConfig {
-            allow: None,
-            mode: Some("enforce".into()),
-        },
         resources: ResourcesConfig::default(),
     }
 }
@@ -135,12 +119,6 @@ fn merge_config(base: Config, over: Config) -> Config {
     }
     if over.tools.run.is_some() {
         out.tools.run = over.tools.run;
-    }
-    if over.net.allow.is_some() {
-        out.net.allow = over.net.allow;
-    }
-    if over.net.mode.is_some() {
-        out.net.mode = over.net.mode;
     }
     if over.resources.memory.is_some() {
         out.resources.memory = over.resources.memory;
@@ -172,7 +150,6 @@ pub(crate) fn resolve_config(file: &ConfigFile, project: &str) -> Result<Config>
     let global = Config {
         run: file.run.clone(),
         tools: file.tools.clone(),
-        net: file.net.clone(),
         resources: ResourcesConfig {
             memory: file.resources.memory.clone(),
             cpus: None,
@@ -305,6 +282,14 @@ fn read_config_file(path: &Path) -> Result<Option<ConfigFile>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
+    let value: toml::Value =
+        toml::from_str(&data).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    if value.get("net").is_some() {
+        bail!(
+            "{}: [net] is removed; first move persistent domains with `vhrn net allow`, then remove [net] and retry",
+            path.display()
+        );
+    }
     let cfg: ConfigFile =
         toml::from_str(&data).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
     Ok(Some(cfg))
@@ -402,13 +387,11 @@ mod tests {
         let config_dir = temp_dir();
         std::fs::write(
             config_dir.path().join("config.toml"),
-            "[tools]\napt = [\"ripgrep\"]\nrun = [\"curl https://example.test | sh\"]\n[net]\nmode = \"report\"\nallow = [\"global.example\"]\n[resources]\nmemory = \"04G\"\ncpus = 2\n",
+            "[tools]\napt = [\"ripgrep\"]\nrun = [\"curl https://example.test | sh\"]\n[resources]\nmemory = \"04G\"\ncpus = 2\n",
         )
         .unwrap();
 
         let cfg = resolve_config(&load_config_file(config_dir.path()).unwrap(), "").unwrap();
-        assert_eq!(cfg.net.allow, Some(vec!["global.example".to_string()])); // from global config
-        assert_eq!(cfg.net.mode, Some("report".to_string()));
         assert_eq!(cfg.tools.apt, Some(vec!["ripgrep".to_string()]));
         assert_eq!(
             cfg.tools.run,
@@ -423,12 +406,26 @@ mod tests {
     }
 
     #[test]
+    fn top_level_net_has_a_targeted_migration_error() {
+        let config_dir = temp_dir();
+        std::fs::write(
+            config_dir.path().join("config.toml"),
+            "[net]\nallow = [\"x.example\"]\n",
+        )
+        .unwrap();
+        let error = load_config_file(config_dir.path()).unwrap_err().to_string();
+        assert!(error.contains("[net] is removed"));
+        assert!(error.contains("vhrn net allow"));
+        assert!(toml::from_str::<ConfigFile>("[project.\"/x\".net]\nallow=[]").is_err());
+    }
+
+    #[test]
     fn project_table_is_singular_and_strict() {
         for text in [
             "[projects.\"/work/x\"]\n",
             "unknown = true\n",
             "[project.\"/work/x\".run]\nblocked_dirs = []\n",
-            "[project.\"/work/x\".net]\nmode = \"open\"\n",
+            "[project.\"/work/x\".unknown]\nmode = \"open\"\n",
             "[project.\"/work/x\".tools]\nunknown = []\n",
             "[project.\"/work/x\".project.\"/work/y\"]\n",
         ] {
@@ -610,20 +607,18 @@ mod tests {
     #[test]
     fn merge_overlays_only_set_fields() {
         let over = Config {
-            net: NetConfig {
-                allow: Some(vec!["x".into()]),
-                mode: None,
+            tools: ToolsConfig {
+                apt: Some(vec!["x".into()]),
+                run: None,
             },
             ..Config::default()
         };
         let merged = merge_config(default_config(), over);
-        assert_eq!(merged.net.allow, Some(vec!["x".to_string()])); // set in over
-        assert_eq!(merged.net.mode.as_deref(), Some("enforce")); // inherited from default
+        assert_eq!(merged.tools.apt, Some(vec!["x".to_string()]));
         assert_eq!(
             merged.run.blocked_dirs,
             Some(vec!["~".to_string(), "/".to_string()])
         ); // inherited
-        assert_eq!(merged.tools.apt, None); // set nowhere
         assert_eq!(merged.tools.run, None);
     }
 

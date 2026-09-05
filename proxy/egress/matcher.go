@@ -4,10 +4,31 @@ import "strings"
 
 // normEntry canonicalises an allowlist entry: lowercase, no surrounding space,
 // no leading "*." or ".", no trailing dot.
-func normEntry(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	s = strings.TrimPrefix(s, "*.")
-	return strings.Trim(s, ".")
+func normEntry(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "*.") {
+		s = s[2:]
+	}
+	s = strings.Trim(s, ".")
+	var hasAlnum bool
+	for _, b := range []byte(s) {
+		if b >= 'A' && b <= 'Z' {
+			hasAlnum = true
+			continue
+		}
+		if b >= 'a' && b <= 'z' || b >= '0' && b <= '9' {
+			hasAlnum = true
+			continue
+		}
+		if b != '-' && b != '_' && b != '.' {
+			return "", false
+		}
+	}
+	s = strings.ToLower(s)
+	if s == "" || !hasAlnum || strings.Contains(s, "..") {
+		return "", false
+	}
+	return s, true
 }
 
 // normHost canonicalises a request host for comparison.
