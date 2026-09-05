@@ -10,7 +10,7 @@ pub(crate) struct Harness {
     pub command: String, // in-container argv[0], e.g. "claude"
     pub alias: String,   // shell alias installed for it
 
-    /// Default egress domains unioned into the host allowlist at install time.
+    /// Immutable selected-harness egress minimum captured in each launch snapshot.
     pub allow_domains: Vec<String>,
 
     // Persistence — the three home-dir buckets (see persist.rs): a

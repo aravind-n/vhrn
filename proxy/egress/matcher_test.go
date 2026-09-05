@@ -31,16 +31,32 @@ func TestHostAllowed(t *testing.T) {
 }
 
 func TestNormEntry(t *testing.T) {
-	cases := map[string]string{
-		"  GitHub.com ": "github.com",
-		"*.example.com": "example.com",
-		".example.com":  "example.com",
-		"example.com.":  "example.com",
-		"":              "",
+	cases := map[string]struct {
+		want  string
+		valid bool
+	}{
+		"  GitHub.com ":  {"github.com", true},
+		"*.example.com":  {"example.com", true},
+		".example.com":   {"example.com", true},
+		"example.com.":   {"example.com", true},
+		"":               {"", false},
+		"bad/host":       {"", false},
+		"FOO.COM":        {"foo.com", true},
+		"a_b.example":    {"a_b.example", true},
+		"example..com":   {"", false},
+		"https://x":      {"", false},
+		"x:443":          {"", false},
+		"x # comment":    {"", false},
+		"x\ny":           {"", false},
+		"x\x1by":         {"", false},
+		"bücher.example": {"", false},
+		"foo*bar":        {"", false},
+		"---":            {"", false},
 	}
 	for in, want := range cases {
-		if got := normEntry(in); got != want {
-			t.Errorf("normEntry(%q) = %q, want %q", in, got, want)
+		got, valid := normEntry(in)
+		if got != want.want || valid != want.valid {
+			t.Errorf("normEntry(%q) = (%q, %v), want (%q, %v)", in, got, valid, want.want, want.valid)
 		}
 	}
 }

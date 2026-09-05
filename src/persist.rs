@@ -299,12 +299,13 @@ pub(crate) fn write_container_guide(
     dst: &Path,
     h: &Harness,
     open_net: bool,
+    project_shell: &[u8],
 ) -> std::io::Result<()> {
     if h.guide.file.is_empty() {
         return Ok(()); // this harness takes no derived guide
     }
     let host = first_non_empty(real_config, &h.guide.sources);
-    let body = compose_guide(&host, h.guide.first, open_net);
+    let body = compose_guide(&host, h.guide.first, open_net, project_shell);
     std::fs::write(dst.join(&h.guide.file), body)
 }
 
@@ -325,7 +326,7 @@ fn first_non_empty(real_config: &Path, sources: &[String]) -> Vec<u8> {
 /// Order vhrn's guide against the host's own instructions. Guide-first matters where the
 /// agent caps the instruction chain by bytes and truncates the tail — the guide must not be
 /// the part that gets cut.
-fn compose_guide(host: &[u8], guide_first: bool, open_net: bool) -> Vec<u8> {
+fn compose_guide(host: &[u8], guide_first: bool, open_net: bool, project_shell: &[u8]) -> Vec<u8> {
     let net = if open_net {
         CONTAINER_GUIDE_OPEN
     } else {
@@ -337,6 +338,11 @@ fn compose_guide(host: &[u8], guide_first: bool, open_net: bool) -> Vec<u8> {
     }
     b.extend_from_slice(CONTAINER_GUIDE_HEADER.as_bytes());
     b.extend_from_slice(net.as_bytes());
+    if !open_net {
+        b.extend_from_slice(b"  Ask the user to run `vhrn net allow --project ");
+        b.extend_from_slice(project_shell);
+        b.extend_from_slice(b" <domain>` for this project. They may instead run `vhrn net allow <domain>` globally. Prefer project access; never open the whole network.\n");
+    }
     if guide_first {
         b.extend_from_slice(host);
     }
@@ -360,9 +366,8 @@ const CONTAINER_GUIDE_OPEN: &str =
     "- **Network egress is unrestricted this session** (the guard is off via `--open-net`).\n";
 
 // A denial surfaces as whatever the agent's HTTP client makes of a refused CONNECT — often
-// after its own retries, and often indistinguishable from a flaky network. Say so, or the
-// agent burns the session retrying instead of naming the host to the user.
-const CONTAINER_GUIDE_GUARD: &str = "- **Network egress is allowlisted (default-deny).** A blocked request fails with\n  an error naming the domain, but it may arrive only after retries and may read as\n  an ordinary connection or timeout error rather than a policy denial — retrying\n  will not help. You cannot change the allowlist from inside the container; tell\n  the user the exact host(s) and ask them to run `vhrn net allow <host>` on the\n  host, then retry — no restart is needed.\n";
+// after its own retries, and often indistinguishable from a flaky network.
+const CONTAINER_GUIDE_GUARD: &str = "- **Network egress is allowlisted (default-deny).** A blocked request names the\n  hostname, though it may arrive after retries as an ordinary connection or timeout\n  error. Retry will not help. You cannot change the allowlist from inside the container;\n  tell the user the exact blocked hostname and ask for access on the host, then retry —\n  no restart is needed.\n";
 
 #[cfg(test)]
 mod tests {
@@ -711,7 +716,7 @@ mod tests {
         let dst = temp_dir();
         std::fs::write(host.path().join("CLAUDE.md"), "HOST").unwrap();
 
-        write_container_guide(host.path(), dst.path(), &claude(), false).unwrap();
+        write_container_guide(host.path(), dst.path(), &claude(), false, b"'/project'").unwrap();
         let got = std::fs::read_to_string(dst.path().join("CLAUDE.md")).unwrap();
         assert!(
             got.starts_with("HOST"),
@@ -721,7 +726,7 @@ mod tests {
 
         // Same body, opposite order: the guide must survive a truncated tail.
         std::fs::write(host.path().join("AGENTS.md"), "HOST").unwrap();
-        write_container_guide(host.path(), dst.path(), &chained(), false).unwrap();
+        write_container_guide(host.path(), dst.path(), &chained(), false, b"'/project'").unwrap();
         let got = std::fs::read_to_string(dst.path().join("AGENTS.override.md")).unwrap();
         assert!(
             got.starts_with("\n# vhrn environment"),
@@ -739,23 +744,23 @@ mod tests {
         };
 
         // Neither source present: the guide still lands, on its own.
-        write_container_guide(host.path(), dst.path(), &chained(), false).unwrap();
+        write_container_guide(host.path(), dst.path(), &chained(), false, b"'/project'").unwrap();
         assert!(read(dst.path()).ends_with('\n'));
 
         // Only the fallback has content.
         std::fs::write(host.path().join("AGENTS.md"), "FALLBACK").unwrap();
-        write_container_guide(host.path(), dst.path(), &chained(), false).unwrap();
+        write_container_guide(host.path(), dst.path(), &chained(), false, b"'/project'").unwrap();
         assert!(read(dst.path()).ends_with("FALLBACK"));
 
         // An *empty* override must not shadow a populated fallback — only the first
         // non-empty file wins, so existence alone is not enough to end the search.
         std::fs::write(host.path().join("AGENTS.override.md"), "").unwrap();
-        write_container_guide(host.path(), dst.path(), &chained(), false).unwrap();
+        write_container_guide(host.path(), dst.path(), &chained(), false, b"'/project'").unwrap();
         assert!(read(dst.path()).ends_with("FALLBACK"));
 
         // Populated override wins.
         std::fs::write(host.path().join("AGENTS.override.md"), "OVERRIDE").unwrap();
-        write_container_guide(host.path(), dst.path(), &chained(), false).unwrap();
+        write_container_guide(host.path(), dst.path(), &chained(), false, b"'/project'").unwrap();
         assert!(read(dst.path()).ends_with("OVERRIDE"));
     }
 
@@ -764,11 +769,11 @@ mod tests {
         let host = temp_dir();
         let dst = temp_dir();
 
-        write_container_guide(host.path(), dst.path(), &claude(), false).unwrap();
+        write_container_guide(host.path(), dst.path(), &claude(), false, b"'/project'").unwrap();
         let guarded = std::fs::read_to_string(dst.path().join("CLAUDE.md")).unwrap();
         assert!(guarded.contains("vhrn net allow"), "guard text missing");
 
-        write_container_guide(host.path(), dst.path(), &claude(), true).unwrap();
+        write_container_guide(host.path(), dst.path(), &claude(), true, b"'/project'").unwrap();
         let open = std::fs::read_to_string(dst.path().join("CLAUDE.md")).unwrap();
         assert!(open.contains("unrestricted"), "open-net text missing");
         assert!(
@@ -777,12 +782,73 @@ mod tests {
         );
 
         // A harness with no guide file writes nothing at all.
-        write_container_guide(host.path(), dst.path(), &Harness::default(), false).unwrap();
+        write_container_guide(
+            host.path(),
+            dst.path(),
+            &Harness::default(),
+            false,
+            b"'/project'",
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_dir(dst.path()).unwrap().count(),
             1,
             "a harness with no guide should leave no extra file"
         );
+    }
+
+    #[test]
+    fn guide_names_the_exact_project_in_bytes_for_both_harness_orders() {
+        let host = temp_dir();
+        let dst = temp_dir();
+        let project_dir = host.path().join("project space ' quote");
+        std::fs::create_dir(&project_dir).unwrap();
+        let project = crate::net::ProjectIdentity::from_path(&project_dir).unwrap();
+        let project_shell = project.shell_quote();
+        assert!(project_shell.windows(4).any(|bytes| bytes == b"'\\''"));
+
+        for name in ["claude", "codex"] {
+            let harness = crate::harness::lookup_harness(name).unwrap();
+            std::fs::write(host.path().join(&harness.guide.sources[0]), "HOST").unwrap();
+            write_container_guide(host.path(), dst.path(), &harness, false, &project_shell)
+                .unwrap();
+            let guide = std::fs::read(dst.path().join(&harness.guide.file)).unwrap();
+            assert!(
+                guide
+                    .windows(project_shell.len())
+                    .any(|part| part == project_shell)
+            );
+            // APFS rejects invalid UTF-8 names, but guide rendering remains byte-oriented.
+            let invalid = b"'/project/\xff'";
+            let invalid_guide = compose_guide(b"", harness.guide.first, false, invalid);
+            assert!(
+                invalid_guide
+                    .windows(invalid.len())
+                    .any(|part| part == invalid)
+            );
+            assert!(!guide.windows(3).any(|part| part == b"\xef\xbf\xbd"));
+            assert!(
+                guide
+                    .windows(b"never open the whole network".len())
+                    .any(|part| part == b"never open the whole network")
+            );
+            if harness.guide.first {
+                assert!(guide.starts_with(b"\n# vhrn environment"));
+            } else {
+                assert!(guide.starts_with(b"HOST"));
+            }
+            write_container_guide(host.path(), dst.path(), &harness, true, &project_shell).unwrap();
+            let open = std::fs::read(dst.path().join(&harness.guide.file)).unwrap();
+            assert!(
+                open.windows(b"guard is off".len())
+                    .any(|part| part == b"guard is off")
+            );
+            assert!(
+                !open
+                    .windows(b"vhrn net allow".len())
+                    .any(|part| part == b"vhrn net allow")
+            );
+        }
     }
 
     #[test]

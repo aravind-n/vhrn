@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -49,6 +51,23 @@ pub(crate) fn vhrn_cache(home: &Path) -> PathBuf {
     vhrn_cache_from(home, std::env::var("XDG_CACHE_HOME").ok().as_deref())
 }
 
+/// The XDG state root for vhrn. Relative XDG values are deliberately ignored: state
+/// must never accidentally become relative to a project being jailed.
+#[allow(dead_code)] // Consumed by the scoped egress policy store.
+pub(crate) fn vhrn_state_from(home: &Path, xdg_state: Option<&str>) -> PathBuf {
+    let base = match xdg_state {
+        Some(value) if !value.is_empty() && Path::new(value).is_absolute() => PathBuf::from(value),
+        _ => home.join(".local/state"),
+    };
+    base.join("vhrn")
+}
+
+/// The XDG state root for vhrn, reading `XDG_STATE_HOME` at the edge.
+#[allow(dead_code)]
+pub(crate) fn vhrn_state(home: &Path) -> PathBuf {
+    vhrn_state_from(home, std::env::var("XDG_STATE_HOME").ok().as_deref())
+}
+
 /// The disposable config copy for one harness (`<cache>/sandbox/<harness>`). Per-harness so
 /// one harness's `rsync --delete` never runs on a directory another's live container has
 /// mounted — the same split `state/<harness>` already has.
@@ -70,7 +89,7 @@ pub(crate) fn look_path(name: &str) -> bool {
 }
 
 /// Set a path's unix permission bits (safe — the crate forbids unsafe). Used for the
-/// world-writable policy dir/log and the private state dir and credentials.
+/// policy/log files and the private state dir and credentials.
 pub(crate) fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
@@ -119,6 +138,104 @@ pub(crate) struct Proxy {
     name: String,
 }
 
+type CleanupAction = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Clone)]
+struct ProxyCleanup {
+    action: CleanupAction,
+    done: Arc<AtomicBool>,
+}
+
+impl ProxyCleanup {
+    fn new(action: CleanupAction) -> Self {
+        Self {
+            action,
+            done: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn run(&self) {
+        if !self.done.swap(true, Ordering::AcqRel) {
+            (self.action)();
+        }
+    }
+}
+
+/// Owns the proxy lifetime. Every clone of its cleanup action shares one stop.
+struct ProxyGuard {
+    cleanup: ProxyCleanup,
+    proxy: Proxy,
+}
+
+impl Drop for ProxyGuard {
+    fn drop(&mut self) {
+        self.cleanup.run();
+    }
+}
+
+fn proxy_guard(proxy: &Proxy) -> ProxyGuard {
+    let cleanup_proxy = proxy.clone();
+    let cleanup = ProxyCleanup::new(Arc::new(move || cleanup_proxy.stop()));
+    ProxyGuard {
+        cleanup,
+        proxy: proxy.clone(),
+    }
+}
+
+/// Shared between the run path and the signal thread. The proxy action is installed as
+/// soon as the engine has created it, before any inspection can fail.
+struct SignalControl {
+    policy: crate::net::PolicyCleanup,
+    proxy: Mutex<Option<ProxyCleanup>>,
+}
+
+impl SignalControl {
+    fn install_proxy(&self, cleanup: ProxyCleanup) {
+        *lock_cleanup(&self.proxy) = Some(cleanup);
+    }
+
+    fn terminate(&self) {
+        run_termination(&self.proxy, || {
+            let _ = self.policy.retire();
+        });
+    }
+}
+
+fn run_termination<F>(proxy: &Mutex<Option<ProxyCleanup>>, policy: F)
+where
+    F: FnOnce(),
+{
+    if let Some(proxy) = lock_cleanup(proxy).take() {
+        proxy.run();
+    }
+    policy();
+}
+
+fn lock_cleanup(
+    slot: &Mutex<Option<ProxyCleanup>>,
+) -> std::sync::MutexGuard<'_, Option<ProxyCleanup>> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn install_signal_control(policy: crate::net::PolicyCleanup) -> Result<Arc<SignalControl>> {
+    let mut signals = Signals::new([SIGINT, SIGTERM])?;
+    let control = Arc::new(SignalControl {
+        policy,
+        proxy: Mutex::new(None),
+    });
+    let signal_control = Arc::clone(&control);
+    std::thread::spawn(move || {
+        for sig in signals.forever() {
+            if sig == SIGTERM {
+                signal_control.terminate();
+                std::process::exit(1);
+            }
+        }
+    });
+    Ok(control)
+}
+
 impl Proxy {
     fn stop(&self) {
         let _ = Command::new(&self.engine)
@@ -157,27 +274,65 @@ impl Proxy {
 /// Launch the detached proxy sidecar and resolve its IP (engines differ; retry until
 /// it has one). `policy_dir` is the host-side net policy dir, mounted into the proxy
 /// only — never the container.
-pub(crate) fn start_proxy(
+fn start_proxy(
     engine: &str,
     image: &str,
     policy_dir: &Path,
+    run_id: &str,
+    project_key: &str,
     port: &str,
-) -> Result<(Proxy, String)> {
+    control: &SignalControl,
+) -> Result<(ProxyGuard, String)> {
+    start_proxy_with(
+        engine,
+        image,
+        policy_dir,
+        run_id,
+        project_key,
+        port,
+        |cleanup| control.install_proxy(cleanup),
+        Proxy::inspect_ip,
+    )
+}
+
+fn proxy_args(policy_dir: &Path, run_id: &str, project_key: &str, port: &str) -> Vec<String> {
+    vec![
+        "--volume".into(),
+        format!("{}:/etc/vhrn:ro", policy_dir.display()),
+        "--volume".into(),
+        format!("{}:/var/log/vhrn", policy_dir.join("log").display()),
+        "--env".into(),
+        format!(
+            "VHRN_ALLOWLISTS=/etc/vhrn/runs/{run_id}/base.allow,/etc/vhrn/runs/{run_id}/harness.allow,/etc/vhrn/allow.local,/etc/vhrn/projects/{project_key}/allow.local,/etc/vhrn/runs/{run_id}/run.allow"
+        ),
+        "--env".into(),
+        format!("VHRN_MODE_FILE=/etc/vhrn/runs/{run_id}/mode"),
+        "--env".into(),
+        "VHRN_DENY_LOG=/var/log/vhrn/denied.log".into(),
+        "--env".into(),
+        format!("VHRN_PROXY_LISTEN=:{port}"),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)] // injected lifecycle seams avoid a real engine in tests
+fn start_proxy_with<F, I>(
+    engine: &str,
+    image: &str,
+    policy_dir: &Path,
+    run_id: &str,
+    project_key: &str,
+    port: &str,
+    publish: F,
+    inspect: I,
+) -> Result<(ProxyGuard, String)>
+where
+    F: FnOnce(ProxyCleanup),
+    I: Fn(&Proxy) -> String,
+{
     let name = format!("vhrn-proxy-{}", std::process::id());
     let status = Command::new(engine)
         .args(["run", "-d", "--rm", "--name", &name])
-        .arg("--volume")
-        .arg(format!("{}:/etc/vhrn", policy_dir.display()))
-        .args([
-            "--env",
-            "VHRN_ALLOWLIST=/etc/vhrn/allowlist",
-            "--env",
-            "VHRN_MODE_FILE=/etc/vhrn/mode",
-            "--env",
-            "VHRN_DENY_LOG=/etc/vhrn/denied.log",
-        ])
-        .arg("--env")
-        .arg(format!("VHRN_PROXY_LISTEN=:{port}"))
+        .args(proxy_args(policy_dir, run_id, project_key, port))
         .arg(image)
         .stdout(Stdio::null()) // discard the container id; keep our stdout clean
         .stderr(Stdio::inherit())
@@ -187,22 +342,37 @@ pub(crate) fn start_proxy(
     }
     let proxy = Proxy {
         engine: engine.to_string(),
-        name,
+        name: name.clone(),
     };
 
+    let guard = proxy_guard(&proxy);
+    finish_started_proxy(guard, publish, inspect, std::thread::sleep)
+}
+
+fn finish_started_proxy<F, I, S>(
+    guard: ProxyGuard,
+    publish: F,
+    inspect: I,
+    sleep: S,
+) -> Result<(ProxyGuard, String)>
+where
+    F: FnOnce(ProxyCleanup),
+    I: Fn(&Proxy) -> String,
+    S: Fn(Duration),
+{
+    publish(guard.cleanup.clone());
     let mut ip = String::new();
     for _ in 0..30 {
-        ip = proxy.inspect_ip();
+        ip = inspect(&guard.proxy);
         if !ip.is_empty() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(300));
+        sleep(Duration::from_millis(300));
     }
     if ip.is_empty() {
-        proxy.stop();
-        bail!("proxy failed to start (is the {image:?} image built?)");
+        bail!("proxy started but did not receive an IP address");
     }
-    Ok((proxy, ip))
+    Ok((guard, ip))
 }
 
 /// The first dotted quad on the first line mentioning `ipv4Address` in the engine's
@@ -245,24 +415,6 @@ fn match_quad(b: &[u8], start: usize) -> Option<usize> {
     Some(i)
 }
 
-/// Keep the sidecar from leaking if vhrn is signaled. SIGTERM tears down the sidecar
-/// and exits; SIGINT is left to the interactive child (the agent) — the parent stays
-/// alive to wait and clean up on exit.
-pub(crate) fn stop_on_signal(proxy: Proxy) {
-    let Ok(mut signals) = Signals::new([SIGINT, SIGTERM]) else {
-        return; // best-effort
-    };
-    std::thread::spawn(move || {
-        for sig in signals.forever() {
-            if sig == SIGTERM {
-                proxy.stop();
-                std::process::exit(1);
-            }
-            // SIGINT: do nothing; the engine's -it forwards it to the agent.
-        }
-    });
-}
-
 /// The unprivileged container user's home; all container-side paths hang off it.
 const CONTAINER_HOME: &str = "/home/dev";
 
@@ -281,15 +433,16 @@ pub(crate) struct ContainerConfig {
     pub image: String, // resolved container image ref (registry ref, or bare local name)
     pub version: String, // installed image version (a tag, or "local")
     pub project: String, // physical cwd (pwd -P)
-    pub key: String,   // history key: [^A-Za-z0-9] -> '-'
-    pub cache: String, // ~/.cache/vhrn
-    pub state: String, // <cache>/state/<harness> -> the container's persistent config dir
-    pub sandbox: String, // <cache>/sandbox/<harness> -> disposable synced config
-    pub config_dir: String, // container config dir, e.g. /home/dev/.claude
+    pub policy_project: Option<crate::net::ProjectIdentity>, // exact canonical bytes
+    pub policy_state: PathBuf,
+    pub key: String,         // history key: [^A-Za-z0-9] -> '-'
+    pub state: String,       // <cache>/state/<harness> -> the container's persistent config dir
+    pub sandbox: String,     // <cache>/sandbox/<harness> -> disposable synced config
+    pub config_dir: String,  // container config dir, e.g. /home/dev/.claude
     pub host_config: String, // host config dir, e.g. ~/.claude
-    pub history: String, // <host_config>/projects/<key>; empty unless the harness shares it
-    pub sessions: String, // <cache>/state/<harness>-sessions/<key>; empty = not partitioned
-    pub config: Config, // merged defaults + global + project config
+    pub history: String,     // <host_config>/projects/<key>; empty unless the harness shares it
+    pub sessions: String,    // <cache>/state/<harness>-sessions/<key>; empty = not partitioned
+    pub config: Config,      // merged defaults + global + project config
     pub git_mount: Vec<String>,
     pub gh_env: Vec<String>,
     pub term_env: Vec<String>,
@@ -425,6 +578,7 @@ fn dir_sync_plan<'a>(
 fn prepare_container(h: &Harness) -> Result<ContainerConfig> {
     let home = home_dir()?;
     let project = std::fs::canonicalize(std::env::current_dir()?)?; // pwd -P
+    let policy_project = crate::net::ProjectIdentity::from_canonical(project.clone())?;
     let project_s = project.to_string_lossy().into_owned();
     let engine = detect_engine()?;
 
@@ -493,8 +647,9 @@ fn prepare_container(h: &Harness) -> Result<ContainerConfig> {
         image,
         version,
         project: project_s,
+        policy_project: Some(policy_project),
+        policy_state: vhrn_state(&home),
         key,
-        cache: cache.to_string_lossy().into_owned(),
         state: state.to_string_lossy().into_owned(),
         sandbox: sandbox.to_string_lossy().into_owned(),
         config_dir: format!("{CONTAINER_HOME}/{}", h.state_dir),
@@ -589,28 +744,35 @@ fn resource_args(engine: &str, resources: &ResourcesConfig) -> Vec<String> {
     args
 }
 
-/// Stop the sidecar on any normal/error return.
-struct ProxyGuard(Proxy);
-impl Drop for ProxyGuard {
-    fn drop(&mut self) {
-        self.0.stop();
-    }
-}
-
-/// Seed the egress policy, start the proxy sidecar, then run the jailed container with all
+/// Publish the egress policy, start the proxy sidecar, then run the jailed container with all
 /// egress pinned to the proxy. The container run inherits the terminal; its exit status is
 /// returned verbatim as the process exit code.
 fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
     let port = env_or("VHRN_PROXY_PORT", "8080");
-    let cfg_mode = cfg.config.net.mode.clone().unwrap_or_default();
-    let mode = crate::net::resolve_mode(&cfg_mode, f.open_net);
-    if !f.open_net && !cfg_mode.is_empty() && cfg_mode != mode.as_str() {
-        warn!("invalid net mode {cfg_mode:?}; using {}", mode.as_str());
-    }
-
-    let config_allow = cfg.config.net.allow.clone().unwrap_or_default();
-    let policy_dir =
-        crate::net::prepare_policy(Path::new(&cfg.cache), mode, &config_allow, &f.extra_allow)?;
+    let mode = if f.open_net {
+        Mode::Open
+    } else {
+        Mode::Enforce
+    };
+    let project = cfg
+        .policy_project
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing canonical project identity"))?;
+    let store = crate::net::PolicyStore::new(&cfg.policy_state);
+    let policy_run = store.publish_run(
+        &cfg.harness.name,
+        &project,
+        &cfg.harness.allow_domains,
+        &f.extra_allow,
+        mode,
+    )?;
+    let signal_control = install_signal_control(policy_run.cleanup_handle())?;
+    let policy_dir = store.root().to_path_buf();
+    let run_id = policy_run
+        .id()
+        .and_then(|id| id.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid policy run id"))?
+        .to_string();
 
     // The guide lands wherever the harness reads it from: the disposable sandbox, or the
     // state dir for an agent that resolves it under its own config dir.
@@ -619,11 +781,13 @@ fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
     } else {
         &cfg.sandbox
     };
+    let project_shell = project.shell_quote();
     if let Err(e) = crate::persist::write_container_guide(
         Path::new(&cfg.host_config),
         Path::new(guide_dst),
         &cfg.harness,
         mode == Mode::Open,
+        &project_shell,
     ) {
         warn!("could not write container {}: {e}", cfg.harness.guide.file);
     }
@@ -653,9 +817,15 @@ fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
             &crate::image::proxy_tag(crate::cli::version(), &cfg.version),
         ),
     );
-    let (proxy, ip) = start_proxy(&cfg.engine, &proxy_image, &policy_dir, &port)?;
-    let _guard = ProxyGuard(proxy.clone());
-    stop_on_signal(proxy);
+    let (_proxy, ip) = start_proxy(
+        &cfg.engine,
+        &proxy_image,
+        &policy_dir,
+        &run_id,
+        project.key(),
+        &port,
+        &signal_control,
+    )?;
 
     // Security banner for --open-net: a direct stderr write, not a tracing event, so
     // no RUST_LOG level can silence the token-exposure caution.
@@ -723,6 +893,27 @@ mod tests {
     }
 
     #[test]
+    fn vhrn_state_resolution() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            vhrn_state_from(home, Some("/x/state")),
+            Path::new("/x/state/vhrn")
+        );
+        assert_eq!(
+            vhrn_state_from(home, Some("relative")),
+            Path::new("/home/u/.local/state/vhrn")
+        );
+        assert_eq!(
+            vhrn_state_from(home, Some("")),
+            Path::new("/home/u/.local/state/vhrn")
+        );
+        assert_eq!(
+            vhrn_state_from(home, None),
+            Path::new("/home/u/.local/state/vhrn")
+        );
+    }
+
+    #[test]
     fn sandbox_dir_is_per_harness() {
         let cache = Path::new("/c/vhrn");
         assert_eq!(
@@ -753,6 +944,156 @@ mod tests {
 }"#;
         assert_eq!(first_ipv4(apple), "192.168.64.73");
         assert_eq!(first_ipv4("no address here\nsecond line"), "");
+    }
+
+    #[test]
+    fn proxy_args_mount_the_policy_layers_without_leaking_host_paths() {
+        let args = proxy_args(
+            Path::new("/state,with-comma/net"),
+            "12-34",
+            "project-key",
+            "8080",
+        );
+        let want = vec![
+                "--volume", "/state,with-comma/net:/etc/vhrn:ro",
+                "--volume", "/state,with-comma/net/log:/var/log/vhrn",
+                "--env", "VHRN_ALLOWLISTS=/etc/vhrn/runs/12-34/base.allow,/etc/vhrn/runs/12-34/harness.allow,/etc/vhrn/allow.local,/etc/vhrn/projects/project-key/allow.local,/etc/vhrn/runs/12-34/run.allow",
+                "--env", "VHRN_MODE_FILE=/etc/vhrn/runs/12-34/mode",
+                "--env", "VHRN_DENY_LOG=/var/log/vhrn/denied.log",
+                "--env", "VHRN_PROXY_LISTEN=:8080",
+            ].into_iter().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(args, want);
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("VHRN_") && arg.contains("/state,with-comma/net")),
+            "host policy root leaked into proxy environment: {args:?}"
+        );
+    }
+
+    #[test]
+    fn cleanup_action_is_idempotent() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_action = Arc::clone(&calls);
+        let cleanup = ProxyCleanup::new(Arc::new(move || {
+            calls_for_action.fetch_add(1, Ordering::Relaxed);
+        }));
+        let clone = cleanup.clone();
+        cleanup.run();
+        clone.run();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn termination_runs_proxy_before_policy_once() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let proxy_order = Arc::clone(&order);
+        let proxy = ProxyCleanup::new(Arc::new(move || proxy_order.lock().unwrap().push("proxy")));
+        let policy = Arc::new(AtomicBool::new(false));
+        let policy_once = Arc::clone(&policy);
+        let policy_order = Arc::clone(&order);
+        let slot = Mutex::new(Some(proxy));
+        run_termination(&slot, move || {
+            if !policy_once.swap(true, Ordering::AcqRel) {
+                policy_order.lock().unwrap().push("policy");
+            }
+        });
+        let policy_once = Arc::clone(&policy);
+        let policy_order = Arc::clone(&order);
+        run_termination(&slot, move || {
+            if !policy_once.swap(true, Ordering::AcqRel) {
+                policy_order.lock().unwrap().push("policy");
+            }
+        });
+        assert_eq!(*order.lock().unwrap(), ["proxy", "policy"]);
+    }
+
+    fn test_guard(cleanup: ProxyCleanup) -> ProxyGuard {
+        ProxyGuard {
+            cleanup,
+            proxy: Proxy {
+                engine: "unused".into(),
+                name: "unused".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn finish_started_proxy_publishes_before_inspection_and_retires_once_on_error() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let action_calls = Arc::clone(&calls);
+        let guard = test_guard(ProxyCleanup::new(Arc::new(move || {
+            action_calls.fetch_add(1, Ordering::Relaxed);
+        })));
+        let slot = Arc::new(Mutex::new(None));
+        let publish_slot = Arc::clone(&slot);
+        let inspect_slot = Arc::clone(&slot);
+        let result = finish_started_proxy(
+            guard,
+            move |cleanup| *lock_cleanup(&publish_slot) = Some(cleanup),
+            move |_| {
+                assert!(lock_cleanup(&inspect_slot).is_some());
+                String::new()
+            },
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        lock_cleanup(&slot).as_ref().unwrap().run();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn finish_started_proxy_allows_termination_during_inspection() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let proxy_order = Arc::clone(&order);
+        let guard = test_guard(ProxyCleanup::new(Arc::new(move || {
+            proxy_order.lock().unwrap().push("proxy");
+        })));
+        let slot = Arc::new(Mutex::new(None));
+        let publish_slot = Arc::clone(&slot);
+        let inspect_slot = Arc::clone(&slot);
+        let policy_once = Arc::new(AtomicBool::new(false));
+        let policy_for_inspect = Arc::clone(&policy_once);
+        let policy_order = Arc::clone(&order);
+        let result = finish_started_proxy(
+            guard,
+            move |cleanup| *lock_cleanup(&publish_slot) = Some(cleanup),
+            move |_| {
+                run_termination(&inspect_slot, || {
+                    if !policy_for_inspect.swap(true, Ordering::AcqRel) {
+                        policy_order.lock().unwrap().push("policy");
+                    }
+                });
+                String::new()
+            },
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert_eq!(*order.lock().unwrap(), ["proxy", "policy"]);
+    }
+
+    #[test]
+    fn returned_guard_keeps_waiting_cleanup_ordered_and_idempotent() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let proxy_order = Arc::clone(&order);
+        let guard = test_guard(ProxyCleanup::new(Arc::new(move || {
+            proxy_order.lock().unwrap().push("proxy");
+        })));
+        let slot = Arc::new(Mutex::new(None));
+        let publish_slot = Arc::clone(&slot);
+        let (guard, ip) = finish_started_proxy(
+            guard,
+            move |cleanup| *lock_cleanup(&publish_slot) = Some(cleanup),
+            |_| "10.0.0.2".into(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(ip, "10.0.0.2");
+        let policy_order = Arc::clone(&order);
+        run_termination(&slot, move || policy_order.lock().unwrap().push("policy"));
+        drop(guard);
+        assert_eq!(*order.lock().unwrap(), ["proxy", "policy"]);
     }
 
     #[test]
@@ -1282,6 +1623,10 @@ mod tests {
             "AGENTS.override.md:", // the guide rides inside the state mount
             "/home/dev/.codex/projects", // no native history layout to share
             "/home/dev/.codex/skills", // container state: the agent installs its own
+            "/etc/vhrn",
+            "/var/log/vhrn",
+            "VHRN_ALLOWLIST",
+            "VHRN_MODE_FILE",
         ] {
             assert!(
                 !joined.contains(absent),
@@ -1376,5 +1721,11 @@ mod tests {
         .collect();
 
         assert_eq!(args, expected);
+        assert!(!args.iter().any(|arg| {
+            arg.contains("/etc/vhrn")
+                || arg.contains("/var/log/vhrn")
+                || arg.starts_with("VHRN_ALLOWLIST")
+                || arg.starts_with("VHRN_MODE_FILE")
+        }));
     }
 }
