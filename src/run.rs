@@ -186,6 +186,12 @@ fn proxy_guard(proxy: &Proxy) -> ProxyGuard {
 /// soon as the engine has created it, before any inspection can fail.
 struct SignalControl {
     policy: crate::net::PolicyCleanup,
+    terminating: AtomicBool,
+    teardown: Mutex<()>,
+    agent_client: Arc<Mutex<Option<std::process::Child>>>,
+    client_cleanup: Mutex<Option<ProxyCleanup>>,
+    agent_cleanup_failed: Mutex<Option<Arc<AtomicBool>>>,
+    agent: Mutex<Option<ProxyCleanup>>,
     proxy: Mutex<Option<ProxyCleanup>>,
 }
 
@@ -194,10 +200,238 @@ impl SignalControl {
         *lock_cleanup(&self.proxy) = Some(cleanup);
     }
 
+    fn finish_agent(&self) {
+        finish_agent_lifecycle(
+            &self.teardown,
+            &self.client_cleanup,
+            &self.agent_client,
+            &self.agent,
+            &self.agent_cleanup_failed,
+        );
+    }
+
     fn terminate(&self) {
-        run_termination(&self.proxy, || {
-            let _ = self.policy.retire();
-        });
+        self.terminating.store(true, Ordering::Release);
+        if !run_gated_teardown(
+            &self.teardown,
+            &self.client_cleanup,
+            &self.agent,
+            &self.proxy,
+            || {
+                let _ = self.policy.retire();
+            },
+            || {
+                !lock_cleanup_failed(&self.agent_cleanup_failed)
+                    .take()
+                    .is_some_and(|failed| failed.load(Ordering::Acquire))
+            },
+        ) {
+            eprintln!(
+                "vhrn: agent cleanup could not be confirmed; proxy and policy were retired to revoke egress"
+            );
+        }
+    }
+
+    fn create_agent(
+        &self,
+        engine: &str,
+        args: &[String],
+        cleanup: ProxyCleanup,
+        cleanup_failed: Arc<AtomicBool>,
+    ) -> Result<()> {
+        create_agent_with(
+            &self.teardown,
+            &self.terminating,
+            &self.agent,
+            &self.agent_cleanup_failed,
+            cleanup,
+            cleanup_failed,
+            || {
+                let status = Command::new(engine)
+                    .args(args)
+                    .stdout(Stdio::null())
+                    .status()?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    bail!("agent container creation failed ({status})")
+                }
+            },
+        )
+    }
+
+    fn start_agent(&self, engine: &str, args: &[String]) -> Result<()> {
+        begin_agent_attach(&self.teardown, &self.terminating, &self.agent, || {
+            let child = Command::new(engine).args(args).spawn().map_err(|error| {
+                anyhow::anyhow!("could not start and attach agent container: {error}")
+            })?;
+            *lock_child(&self.agent_client) = Some(child);
+            let client = Arc::clone(&self.agent_client);
+            *lock_cleanup(&self.client_cleanup) = Some(ProxyCleanup::new(Arc::new(move || {
+                if let Some(mut child) = lock_child(&client).take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            })));
+            Ok(())
+        })
+    }
+
+    fn wait_agent(&self) -> Result<std::process::ExitStatus> {
+        loop {
+            let status = {
+                let mut child = lock_child(&self.agent_client);
+                let Some(child) = child.as_mut() else {
+                    bail!("agent engine client was terminated");
+                };
+                child.try_wait()?
+            };
+            if let Some(status) = status {
+                return Ok(status);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+fn create_agent_with<T>(
+    gate: &Mutex<()>,
+    terminating: &AtomicBool,
+    agent: &Mutex<Option<ProxyCleanup>>,
+    cleanup_failed: &Mutex<Option<Arc<AtomicBool>>>,
+    cleanup: ProxyCleanup,
+    failed: Arc<AtomicBool>,
+    create: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _teardown = lock_teardown(gate);
+    if terminating.load(Ordering::Acquire) {
+        bail!("termination requested before agent creation");
+    }
+    let created = create()?;
+    *lock_cleanup(agent) = Some(cleanup);
+    *lock_cleanup_failed(cleanup_failed) = Some(failed);
+    if terminating.load(Ordering::Acquire) {
+        if let Some(agent) = lock_cleanup(agent).take() {
+            agent.run();
+        }
+        bail!("termination requested during agent creation");
+    }
+    Ok(created)
+}
+
+fn begin_agent_attach<T>(
+    gate: &Mutex<()>,
+    terminating: &AtomicBool,
+    agent: &Mutex<Option<ProxyCleanup>>,
+    start: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _teardown = lock_teardown(gate);
+    if terminating.load(Ordering::Acquire) {
+        if let Some(agent) = lock_cleanup(agent).take() {
+            agent.run();
+        }
+        bail!("termination requested before agent attach");
+    }
+    match start() {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if let Some(agent) = lock_cleanup(agent).take() {
+                agent.run();
+            }
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+fn begin_agent_launch<T>(
+    gate: &Mutex<()>,
+    terminating: &AtomicBool,
+    slot: &Mutex<Option<ProxyCleanup>>,
+    cleanup: ProxyCleanup,
+    spawn: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _teardown = lock_teardown(gate);
+    if terminating.load(Ordering::Acquire) {
+        bail!("termination requested before agent launch");
+    }
+    *lock_cleanup(slot) = Some(cleanup);
+    match spawn() {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            disarm_cleanup(slot);
+            Err(error)
+        }
+    }
+}
+
+fn lock_teardown(gate: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    gate.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn run_gated_teardown<F, C>(
+    gate: &Mutex<()>,
+    client: &Mutex<Option<ProxyCleanup>>,
+    agent: &Mutex<Option<ProxyCleanup>>,
+    proxy: &Mutex<Option<ProxyCleanup>>,
+    policy: F,
+    confirmed: C,
+) -> bool
+where
+    F: FnOnce(),
+    C: FnOnce() -> bool,
+{
+    let _teardown = lock_teardown(gate);
+    if let Some(client) = lock_cleanup(client).take() {
+        client.run();
+    }
+    if let Some(agent) = lock_cleanup(agent).take() {
+        agent.run();
+    }
+    let confirmed = confirmed();
+    run_termination(proxy, policy);
+    confirmed
+}
+
+fn lock_child(
+    slot: &Mutex<Option<std::process::Child>>,
+) -> std::sync::MutexGuard<'_, Option<std::process::Child>> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn lock_cleanup_failed(
+    slot: &Mutex<Option<Arc<AtomicBool>>>,
+) -> std::sync::MutexGuard<'_, Option<Arc<AtomicBool>>> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn disarm_cleanup(slot: &Mutex<Option<ProxyCleanup>>) {
+    let _ = lock_cleanup(slot).take();
+}
+
+/// Finish a normally-returned engine client under the same gate as termination. The child
+/// has already been reaped by `wait_agent`; clear both client ownership records before
+/// stopping the named container, since a detach can leave that container behind.
+fn finish_agent_lifecycle(
+    gate: &Mutex<()>,
+    client_cleanup: &Mutex<Option<ProxyCleanup>>,
+    agent_client: &Mutex<Option<std::process::Child>>,
+    agent: &Mutex<Option<ProxyCleanup>>,
+    agent_cleanup_failed: &Mutex<Option<Arc<AtomicBool>>>,
+) {
+    let _teardown = lock_teardown(gate);
+    disarm_cleanup(client_cleanup);
+    let _ = lock_child(agent_client).take();
+    finish_agent_cleanup_locked(agent);
+    let _ = lock_cleanup_failed(agent_cleanup_failed).take();
+}
+
+fn finish_agent_cleanup_locked(slot: &Mutex<Option<ProxyCleanup>>) {
+    if let Some(agent) = lock_cleanup(slot).take() {
+        agent.run();
     }
 }
 
@@ -222,6 +456,12 @@ fn install_signal_control(policy: crate::net::PolicyCleanup) -> Result<Arc<Signa
     let mut signals = Signals::new([SIGINT, SIGTERM])?;
     let control = Arc::new(SignalControl {
         policy,
+        terminating: AtomicBool::new(false),
+        teardown: Mutex::new(()),
+        agent_client: Arc::new(Mutex::new(None)),
+        client_cleanup: Mutex::new(None),
+        agent_cleanup_failed: Mutex::new(None),
+        agent: Mutex::new(None),
         proxy: Mutex::new(None),
     });
     let signal_control = Arc::clone(&control);
@@ -234,6 +474,152 @@ fn install_signal_control(policy: crate::net::PolicyCleanup) -> Result<Arc<Signa
         }
     });
     Ok(control)
+}
+
+fn agent_name() -> String {
+    format!("vhrn-agent-{}", std::process::id())
+}
+
+fn agent_cleanup(engine: &str, name: &str, failed: Arc<AtomicBool>) -> ProxyCleanup {
+    let engine = engine.to_string();
+    let name = name.to_string();
+    ProxyCleanup::new(Arc::new(move || {
+        if let Err(error) = stop_and_confirm_agent(&engine, &name) {
+            failed.store(true, Ordering::Release);
+            eprintln!("vhrn: could not confirm agent container {name:?} stopped: {error}");
+        }
+    }))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AgentInspect {
+    Present,
+    Absent,
+    EngineError(String),
+}
+
+fn classify_agent_inspect(success: bool, status: Option<i32>, stderr: &[u8]) -> AgentInspect {
+    if success {
+        return AgentInspect::Present;
+    }
+
+    let diagnostic = String::from_utf8_lossy(stderr);
+    let folded = diagnostic.to_ascii_lowercase();
+    if folded.contains("not found")
+        || folded.contains("notfound")
+        || folded.contains("no such object")
+        || folded.contains("no such container")
+    {
+        return AgentInspect::Absent;
+    }
+
+    let sanitized = diagnostic
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    AgentInspect::EngineError(if sanitized.is_empty() {
+        format!(
+            "inspect exited unsuccessfully (status {}) without an absence diagnostic",
+            status.map_or_else(|| "signal".to_string(), |code| code.to_string())
+        )
+    } else {
+        format!(
+            "inspect exited unsuccessfully (status {}): {sanitized}",
+            status.map_or_else(|| "signal".to_string(), |code| code.to_string())
+        )
+    })
+}
+
+fn inspect_agent(engine: &str, name: &str) -> Result<AgentInspect> {
+    let output = Command::new(engine)
+        .args(["inspect", name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()?;
+    Ok(classify_agent_inspect(
+        output.status.success(),
+        output.status.code(),
+        &output.stderr,
+    ))
+}
+
+fn stop_agent(engine: &str, name: &str, command: &str) -> Result<()> {
+    let _ = Command::new(engine)
+        .args([command, name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()?;
+    Ok(())
+}
+
+fn agent_force_remove_args(engine: &str, name: &str) -> Vec<String> {
+    if engine == "container" {
+        vec!["delete".into(), "--force".into(), name.into()]
+    } else {
+        vec!["rm".into(), "--force".into(), name.into()]
+    }
+}
+
+fn remove_status_error(status: Option<i32>, stderr: &[u8]) -> Result<()> {
+    let state = classify_agent_inspect(false, status, stderr);
+    match state {
+        AgentInspect::Absent => Ok(()),
+        AgentInspect::EngineError(error) => bail!("force-remove failed: {error}"),
+        AgentInspect::Present => unreachable!("unsuccessful remove cannot classify as present"),
+    }
+}
+
+fn force_remove_agent(engine: &str, name: &str) -> Result<()> {
+    let output = Command::new(engine)
+        .args(agent_force_remove_args(engine, name))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        remove_status_error(output.status.code(), &output.stderr)
+    }
+}
+
+fn stop_and_confirm_agent(engine: &str, name: &str) -> Result<()> {
+    stop_agent(engine, name, "stop")?;
+    match inspect_agent(engine, name)? {
+        AgentInspect::Absent => Ok(()),
+        AgentInspect::EngineError(error) => {
+            bail!("could not confirm whether container is absent after stop: {error}")
+        }
+        AgentInspect::Present => {
+            stop_agent(engine, name, "kill")?;
+            match inspect_agent(engine, name)? {
+                AgentInspect::Absent => Ok(()),
+                AgentInspect::Present => {
+                    force_remove_agent(engine, name)?;
+                    match inspect_agent(engine, name)? {
+                        AgentInspect::Absent => Ok(()),
+                        AgentInspect::Present => bail!(
+                            "container remains after stop, kill, and force-remove; remove {name:?} manually"
+                        ),
+                        AgentInspect::EngineError(error) => {
+                            bail!(
+                                "could not confirm whether container is absent after force-remove: {error}"
+                            )
+                        }
+                    }
+                }
+                AgentInspect::EngineError(error) => {
+                    bail!("could not confirm whether container is absent after kill: {error}")
+                }
+            }
+        }
+    }
 }
 
 impl Proxy {
@@ -723,6 +1109,25 @@ fn container_run_args(
     args
 }
 
+/// Convert the established run-shaped argv into a synchronous create without changing the
+/// resource, mount, image, or agent-argument ordering.
+fn agent_create_args(run_args: &[String], name: &str) -> Vec<String> {
+    let mut args = run_args.to_vec();
+    assert_eq!(args.first().map(String::as_str), Some("run"));
+    args[0] = "create".to_string();
+    args.splice(1..1, ["--name".to_string(), name.to_string()]);
+    args
+}
+
+fn agent_start_args(name: &str) -> Vec<String> {
+    vec![
+        "start".to_string(),
+        "--attach".to_string(),
+        "--interactive".to_string(),
+        name.to_string(),
+    ]
+}
+
 /// Translate normalized resource config into portable engine flags. Apple container has a
 /// small default memory limit, so vhrn raises only that engine's implicit limit; Docker
 /// retains its own default unless the user configured a value.
@@ -844,8 +1249,17 @@ fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
         }
     }
 
-    let args = container_run_args(&cfg, f, mode, &ip, &port);
-    let status = Command::new(&cfg.engine).args(&args).status()?;
+    let name = agent_name();
+    let run_args = container_run_args(&cfg, f, mode, &ip, &port);
+    let create_args = agent_create_args(&run_args, &name);
+    let attach_args = agent_start_args(&name);
+    let agent_cleanup_failed = Arc::new(AtomicBool::new(false));
+    let agent = agent_cleanup(&cfg.engine, &name, Arc::clone(&agent_cleanup_failed));
+    signal_control.create_agent(&cfg.engine, &create_args, agent, agent_cleanup_failed)?;
+    signal_control.start_agent(&cfg.engine, &attach_args)?;
+    let status = signal_control.wait_agent();
+    signal_control.finish_agent();
+    let status = status?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -985,6 +1399,58 @@ mod tests {
     }
 
     #[test]
+    fn agent_inspect_classification_only_accepts_explicit_absence() {
+        assert_eq!(
+            classify_agent_inspect(true, Some(0), b""),
+            AgentInspect::Present
+        );
+        for diagnostic in [
+            b"not found: container vhrn-agent".as_slice(),
+            b"notFound: container vhrn-agent".as_slice(),
+            b"Error response from daemon: No such object: vhrn-agent".as_slice(),
+            b"Error: No such container: vhrn-agent".as_slice(),
+        ] {
+            assert_eq!(
+                classify_agent_inspect(false, Some(1), diagnostic),
+                AgentInspect::Absent,
+                "absence diagnostic: {:?}",
+                String::from_utf8_lossy(diagnostic)
+            );
+        }
+        assert_eq!(
+            classify_agent_inspect(false, Some(1), b""),
+            AgentInspect::EngineError(
+                "inspect exited unsuccessfully (status 1) without an absence diagnostic".into()
+            )
+        );
+        assert_eq!(
+            classify_agent_inspect(
+                false,
+                Some(125),
+                b"permission denied\n\x1b[31mengine\x1b[0m"
+            ),
+            AgentInspect::EngineError(
+                "inspect exited unsuccessfully (status 125): permission denied  [31mengine [0m"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn force_remove_argv_and_confirmation_errors_are_explicit() {
+        assert_eq!(
+            agent_force_remove_args("container", "vhrn-agent-test"),
+            ["delete", "--force", "vhrn-agent-test"]
+        );
+        assert_eq!(
+            agent_force_remove_args("docker", "vhrn-agent-test"),
+            ["rm", "--force", "vhrn-agent-test"]
+        );
+        assert!(remove_status_error(Some(1), b"No such container: vhrn-agent-test").is_ok());
+        assert!(remove_status_error(Some(125), b"permission denied").is_err());
+    }
+
+    #[test]
     fn termination_runs_proxy_before_policy_once() {
         let order = Arc::new(Mutex::new(Vec::new()));
         let proxy_order = Arc::clone(&order);
@@ -1006,6 +1472,494 @@ mod tests {
             }
         });
         assert_eq!(*order.lock().unwrap(), ["proxy", "policy"]);
+    }
+
+    #[test]
+    fn sigterm_stops_agent_before_proxy_and_policy() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let agent_order = Arc::clone(&order);
+        let agent = ProxyCleanup::new(Arc::new(move || agent_order.lock().unwrap().push("agent")));
+        let proxy_order = Arc::clone(&order);
+        let proxy = ProxyCleanup::new(Arc::new(move || proxy_order.lock().unwrap().push("proxy")));
+        let policy_order = Arc::clone(&order);
+        let gate = Mutex::new(());
+        let clients = Mutex::new(None);
+        let agents = Mutex::new(Some(agent));
+        let proxies = Mutex::new(Some(proxy));
+        run_gated_teardown(
+            &gate,
+            &clients,
+            &agents,
+            &proxies,
+            move || policy_order.lock().unwrap().push("policy"),
+            || true,
+        );
+        run_gated_teardown(&gate, &clients, &agents, &proxies, || {}, || true);
+        assert_eq!(*order.lock().unwrap(), ["agent", "proxy", "policy"]);
+    }
+
+    #[test]
+    fn unconfirmed_agent_cleanup_still_revokes_proxy_and_policy() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let gate = Mutex::new(());
+        let clients = Mutex::new(None);
+        let agent_order = Arc::clone(&order);
+        let agents = Mutex::new(Some(ProxyCleanup::new(Arc::new(move || {
+            agent_order.lock().unwrap().push("agent");
+        }))));
+        let proxy_order = Arc::clone(&order);
+        let proxies = Mutex::new(Some(ProxyCleanup::new(Arc::new(move || {
+            proxy_order.lock().unwrap().push("proxy");
+        }))));
+        let policy_order = Arc::clone(&order);
+        assert!(!run_gated_teardown(
+            &gate,
+            &clients,
+            &agents,
+            &proxies,
+            move || policy_order.lock().unwrap().push("policy"),
+            || false,
+        ));
+        assert_eq!(*order.lock().unwrap(), ["agent", "proxy", "policy"]);
+        assert!(lock_cleanup(&proxies).is_none());
+    }
+
+    #[test]
+    fn engine_client_return_clears_client_ownership_then_stops_surviving_agent() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let gate = Mutex::new(());
+        let clients = Mutex::new(Some(ProxyCleanup::new(Arc::new({
+            let order = Arc::clone(&order);
+            move || order.lock().unwrap().push("client")
+        }))));
+        let child = Mutex::new(None);
+        let failed = Mutex::new(Some(Arc::new(AtomicBool::new(false))));
+        let agent_order = Arc::clone(&order);
+        let agents = Mutex::new(Some(ProxyCleanup::new(Arc::new(move || {
+            agent_order.lock().unwrap().push("agent");
+        }))));
+        // Client return does not prove --rm removed a detached agent.
+        finish_agent_lifecycle(&gate, &clients, &child, &agents, &failed);
+        finish_agent_lifecycle(&gate, &clients, &child, &agents, &failed);
+        assert!(lock_cleanup(&clients).is_none());
+        assert!(lock_child(&child).is_none());
+        assert!(lock_cleanup_failed(&failed).is_none());
+        let proxy_order = Arc::clone(&order);
+        let proxies = Mutex::new(Some(ProxyCleanup::new(Arc::new(move || {
+            proxy_order.lock().unwrap().push("proxy");
+        }))));
+        let policy_order = Arc::clone(&order);
+        run_gated_teardown(
+            &gate,
+            &clients,
+            &agents,
+            &proxies,
+            move || policy_order.lock().unwrap().push("policy"),
+            || true,
+        );
+        assert_eq!(*order.lock().unwrap(), ["agent", "proxy", "policy"]);
+    }
+
+    #[test]
+    fn normal_finish_waits_for_the_entire_sigterm_teardown() {
+        use std::sync::mpsc;
+
+        let gate = Arc::new(Mutex::new(()));
+        let clients = Arc::new(Mutex::new(None));
+        let agent_client = Arc::new(Mutex::new(None));
+        let agents = Arc::new(Mutex::new(None));
+        let proxies = Arc::new(Mutex::new(None));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (agent_started, agent_started_rx) = mpsc::channel();
+        let (release_agent, release_agent_rx) = mpsc::channel();
+        let release_agent_rx = Mutex::new(release_agent_rx);
+        let agent_order = Arc::clone(&order);
+        *lock_cleanup(&agents) = Some(ProxyCleanup::new(Arc::new(move || {
+            agent_order.lock().unwrap().push("agent");
+            agent_started.send(()).unwrap();
+            release_agent_rx.lock().unwrap().recv().unwrap();
+        })));
+        let proxy_order = Arc::clone(&order);
+        *lock_cleanup(&proxies) = Some(ProxyCleanup::new(Arc::new(move || {
+            proxy_order.lock().unwrap().push("proxy");
+        })));
+
+        let signal_gate = Arc::clone(&gate);
+        let signal_clients = Arc::clone(&clients);
+        let signal_agents = Arc::clone(&agents);
+        let signal_proxies = Arc::clone(&proxies);
+        let policy_order = Arc::clone(&order);
+        let signal = std::thread::spawn(move || {
+            run_gated_teardown(
+                &signal_gate,
+                &signal_clients,
+                &signal_agents,
+                &signal_proxies,
+                move || {
+                    policy_order.lock().unwrap().push("policy");
+                },
+                || true,
+            );
+        });
+        agent_started_rx.recv().unwrap();
+
+        let (normal_done, normal_done_rx) = mpsc::channel();
+        let normal_gate = Arc::clone(&gate);
+        let normal_clients = Arc::clone(&clients);
+        let normal_agent_client = Arc::clone(&agent_client);
+        let normal_agents = Arc::clone(&agents);
+        let normal_failed = Arc::new(Mutex::new(None));
+        let normal_failed_for_finish = Arc::clone(&normal_failed);
+        let normal = std::thread::spawn(move || {
+            finish_agent_lifecycle(
+                &normal_gate,
+                &normal_clients,
+                &normal_agent_client,
+                &normal_agents,
+                &normal_failed_for_finish,
+            );
+            normal_done.send(()).unwrap();
+        });
+        assert!(normal_done_rx.try_recv().is_err());
+        release_agent.send(()).unwrap();
+        signal.join().unwrap();
+        normal_done_rx.recv().unwrap();
+        normal.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), ["agent", "proxy", "policy"]);
+    }
+
+    #[test]
+    fn termination_before_registration_prevents_spawn() {
+        let gate = Mutex::new(());
+        let terminating = AtomicBool::new(true);
+        let slot = Mutex::new(None);
+        let calls = Arc::new(AtomicBool::new(false));
+        let calls_for_spawn = Arc::clone(&calls);
+        let cleanup = ProxyCleanup::new(Arc::new(|| {}));
+        assert!(
+            begin_agent_launch(&gate, &terminating, &slot, cleanup, move || {
+                calls_for_spawn.store(true, Ordering::Release);
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!calls.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn synchronous_create_observes_termination_before_attach() {
+        use std::sync::mpsc;
+
+        let gate = Arc::new(Mutex::new(()));
+        let terminating = Arc::new(AtomicBool::new(false));
+        let agents = Arc::new(Mutex::new(None));
+        let failed_slot = Arc::new(Mutex::new(None));
+        let clients = Arc::new(Mutex::new(None));
+        let proxies = Arc::new(Mutex::new(None));
+        let resource = Arc::new(AtomicBool::new(false));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (create_started, create_started_rx) = mpsc::channel();
+        let (release_create, release_create_rx) = mpsc::channel();
+
+        let create_gate = Arc::clone(&gate);
+        let create_terminating = Arc::clone(&terminating);
+        let create_agents = Arc::clone(&agents);
+        let create_failed_slot = Arc::clone(&failed_slot);
+        let create_resource = Arc::clone(&resource);
+        let cleanup_resource = Arc::clone(&resource);
+        let cleanup_order = Arc::clone(&order);
+        let create = std::thread::spawn(move || {
+            create_agent_with(
+                &create_gate,
+                &create_terminating,
+                &create_agents,
+                &create_failed_slot,
+                ProxyCleanup::new(Arc::new(move || {
+                    assert!(cleanup_resource.swap(false, Ordering::AcqRel));
+                    cleanup_order.lock().unwrap().push("agent");
+                })),
+                Arc::new(AtomicBool::new(false)),
+                || {
+                    create_started.send(()).unwrap();
+                    release_create_rx.recv().unwrap();
+                    create_resource.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
+        });
+        create_started_rx.recv().unwrap();
+        let proxy_order = Arc::clone(&order);
+        *lock_cleanup(&proxies) = Some(ProxyCleanup::new(Arc::new(move || {
+            proxy_order.lock().unwrap().push("proxy");
+        })));
+        let signal_gate = Arc::clone(&gate);
+        let signal_terminating = Arc::clone(&terminating);
+        let signal_clients = Arc::clone(&clients);
+        let signal_agents = Arc::clone(&agents);
+        let signal_proxies = Arc::clone(&proxies);
+        let policy_order = Arc::clone(&order);
+        let (signal_requested, signal_requested_rx) = mpsc::channel();
+        let signal = std::thread::spawn(move || {
+            signal_terminating.store(true, Ordering::Release);
+            signal_requested.send(()).unwrap();
+            run_gated_teardown(
+                &signal_gate,
+                &signal_clients,
+                &signal_agents,
+                &signal_proxies,
+                move || policy_order.lock().unwrap().push("policy"),
+                || true,
+            );
+        });
+        signal_requested_rx.recv().unwrap();
+        release_create.send(()).unwrap();
+        assert!(create.join().unwrap().is_err());
+        signal.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), ["agent", "proxy", "policy"]);
+        assert!(!resource.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn termination_between_create_and_attach_cleans_without_starting_attach() {
+        let gate = Mutex::new(());
+        let terminating = AtomicBool::new(false);
+        let agents = Mutex::new(None);
+        let failed_slot = Mutex::new(None);
+        let resource = Arc::new(AtomicBool::new(false));
+        let cleanup_resource = Arc::clone(&resource);
+        create_agent_with(
+            &gate,
+            &terminating,
+            &agents,
+            &failed_slot,
+            ProxyCleanup::new(Arc::new(move || {
+                assert!(cleanup_resource.swap(false, Ordering::AcqRel));
+            })),
+            Arc::new(AtomicBool::new(false)),
+            || {
+                resource.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .unwrap();
+        terminating.store(true, Ordering::Release);
+        let attached = AtomicBool::new(false);
+        assert!(
+            begin_agent_attach(&gate, &terminating, &agents, || {
+                attached.store(true, Ordering::Release);
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!attached.load(Ordering::Acquire));
+        assert!(!resource.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn failed_create_does_not_publish_or_clean_agent_ownership() {
+        let gate = Mutex::new(());
+        let terminating = AtomicBool::new(false);
+        let agents = Mutex::new(None);
+        let failed_slot = Mutex::new(None);
+        let called = Arc::new(AtomicBool::new(false));
+        let cleanup_called = Arc::clone(&called);
+        let create = create_agent_with(
+            &gate,
+            &terminating,
+            &agents,
+            &failed_slot,
+            ProxyCleanup::new(Arc::new(move || {
+                cleanup_called.store(true, Ordering::Release);
+            })),
+            Arc::new(AtomicBool::new(false)),
+            || -> Result<()> { bail!("name collision") },
+        );
+        let attach_started = AtomicBool::new(false);
+        if create.is_ok() {
+            attach_started.store(true, Ordering::Release);
+        }
+        assert!(create.is_err());
+        assert!(lock_cleanup(&agents).is_none());
+        assert!(lock_cleanup_failed(&failed_slot).is_none());
+        assert!(!called.load(Ordering::Acquire));
+        assert!(!attach_started.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn termination_waits_for_registered_spawn_then_cleans_created_agent() {
+        use std::sync::mpsc;
+        let gate = Arc::new(Mutex::new(()));
+        let terminating = Arc::new(AtomicBool::new(false));
+        let slot = Arc::new(Mutex::new(None));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (spawn_started, spawn_started_rx) = mpsc::channel();
+        let (release_spawn, release_spawn_rx) = mpsc::channel();
+        let cleanup_order = Arc::clone(&order);
+        let launch_gate = Arc::clone(&gate);
+        let launch_term = Arc::clone(&terminating);
+        let launch_slot = Arc::clone(&slot);
+        let spawn_slot = Arc::clone(&slot);
+        let launch = std::thread::spawn(move || {
+            begin_agent_launch(
+                &launch_gate,
+                &launch_term,
+                &launch_slot,
+                ProxyCleanup::new(Arc::new(move || {
+                    cleanup_order.lock().unwrap().push("agent");
+                })),
+                || {
+                    assert!(lock_cleanup(&spawn_slot).is_some());
+                    spawn_started.send(()).unwrap();
+                    release_spawn_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+        });
+        spawn_started_rx.recv().unwrap();
+        let signal_gate = Arc::clone(&gate);
+        let clients = Arc::new(Mutex::new(None));
+        let signal_clients = Arc::clone(&clients);
+        let signal_slot = Arc::clone(&slot);
+        let signal_term = Arc::clone(&terminating);
+        let signal_order = Arc::clone(&order);
+        let (termination_requested, termination_requested_rx) = mpsc::channel();
+        let signal = std::thread::spawn(move || {
+            signal_term.store(true, Ordering::Release);
+            termination_requested.send(()).unwrap();
+            run_gated_teardown(
+                &signal_gate,
+                &signal_clients,
+                &signal_slot,
+                &Mutex::new(None),
+                move || {
+                    signal_order.lock().unwrap().push("policy");
+                },
+                || true,
+            );
+        });
+        termination_requested_rx.recv().unwrap();
+        assert!(order.lock().unwrap().is_empty());
+        release_spawn.send(()).unwrap();
+        launch.join().unwrap().unwrap();
+        signal.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), ["agent", "policy"]);
+    }
+
+    #[test]
+    fn teardown_reads_confirmation_failure_after_blocked_launch_releases_gate() {
+        use std::sync::mpsc;
+
+        let gate = Arc::new(Mutex::new(()));
+        let terminating = Arc::new(AtomicBool::new(false));
+        let agents = Arc::new(Mutex::new(None));
+        let clients = Arc::new(Mutex::new(None));
+        let proxies = Arc::new(Mutex::new(None));
+        let failure_slot = Arc::new(Mutex::new(None));
+        let failed = Arc::new(AtomicBool::new(false));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (launch_holds_gate, launch_holds_gate_rx) = mpsc::channel();
+        let (release_launch, release_launch_rx) = mpsc::channel();
+
+        let launch_gate = Arc::clone(&gate);
+        let launch_terminating = Arc::clone(&terminating);
+        let launch_agents = Arc::clone(&agents);
+        let launch_failure_slot = Arc::clone(&failure_slot);
+        let launch_failed = Arc::clone(&failed);
+        let agent_order = Arc::clone(&order);
+        let launch = std::thread::spawn(move || {
+            begin_agent_launch(
+                &launch_gate,
+                &launch_terminating,
+                &launch_agents,
+                ProxyCleanup::new(Arc::new(move || {
+                    launch_failed.store(true, Ordering::Release);
+                    agent_order.lock().unwrap().push("agent");
+                })),
+                || {
+                    launch_holds_gate.send(()).unwrap();
+                    release_launch_rx.recv().unwrap();
+                    *lock_cleanup_failed(&launch_failure_slot) = Some(Arc::clone(&failed));
+                    Ok(())
+                },
+            )
+        });
+        launch_holds_gate_rx.recv().unwrap();
+
+        let proxy_order = Arc::clone(&order);
+        *lock_cleanup(&proxies) = Some(ProxyCleanup::new(Arc::new(move || {
+            proxy_order.lock().unwrap().push("proxy");
+        })));
+        let signal_gate = Arc::clone(&gate);
+        let signal_terminating = Arc::clone(&terminating);
+        let signal_clients = Arc::clone(&clients);
+        let signal_agents = Arc::clone(&agents);
+        let signal_proxies = Arc::clone(&proxies);
+        let signal_failure_slot = Arc::clone(&failure_slot);
+        let policy_order = Arc::clone(&order);
+        let (signal_started, signal_started_rx) = mpsc::channel();
+        let signal = std::thread::spawn(move || {
+            signal_terminating.store(true, Ordering::Release);
+            signal_started.send(()).unwrap();
+            run_gated_teardown(
+                &signal_gate,
+                &signal_clients,
+                &signal_agents,
+                &signal_proxies,
+                move || policy_order.lock().unwrap().push("policy"),
+                || {
+                    !lock_cleanup_failed(&signal_failure_slot)
+                        .take()
+                        .is_some_and(|failed| failed.load(Ordering::Acquire))
+                },
+            )
+        });
+        signal_started_rx.recv().unwrap();
+        assert!(order.lock().unwrap().is_empty());
+        release_launch.send(()).unwrap();
+        launch.join().unwrap().unwrap();
+        assert!(!signal.join().unwrap());
+        assert_eq!(*order.lock().unwrap(), ["agent", "proxy", "policy"]);
+        assert!(lock_cleanup(&proxies).is_none());
+    }
+
+    #[test]
+    fn starting_teardown_waits_for_daemon_creation_then_confirms_absence_before_policy() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let resource_alive = Arc::new(AtomicBool::new(false));
+        let client_order = Arc::clone(&order);
+        let client_resource = Arc::clone(&resource_alive);
+        let agent_order = Arc::clone(&order);
+        let agent_resource = Arc::clone(&resource_alive);
+        let proxy_order = Arc::clone(&order);
+        let policy_order = Arc::clone(&order);
+        let gate = Mutex::new(());
+        let clients = Mutex::new(Some(ProxyCleanup::new(Arc::new(move || {
+            // The daemon creates the named resource only after the CLI spawn returned.
+            client_resource.store(true, Ordering::Release);
+            client_order.lock().unwrap().push("client-wait");
+        }))));
+        let agents = Mutex::new(Some(ProxyCleanup::new(Arc::new(move || {
+            assert!(agent_resource.swap(false, Ordering::AcqRel));
+            agent_order.lock().unwrap().push("agent-confirmed-absent");
+        }))));
+        let proxies = Mutex::new(Some(ProxyCleanup::new(Arc::new(move || {
+            proxy_order.lock().unwrap().push("proxy");
+        }))));
+        run_gated_teardown(
+            &gate,
+            &clients,
+            &agents,
+            &proxies,
+            move || {
+                assert!(!resource_alive.load(Ordering::Acquire));
+                policy_order.lock().unwrap().push("policy");
+            },
+            || true,
+        );
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["client-wait", "agent-confirmed-absent", "proxy", "policy"]
+        );
     }
 
     fn test_guard(cleanup: ProxyCleanup) -> ProxyGuard {
@@ -1555,6 +2509,30 @@ mod tests {
                 "7"
             ]
         );
+    }
+
+    #[test]
+    fn agent_create_and_start_argv_preserve_run_payload_for_both_engines() {
+        let (mut cfg, _dir) = golden_fixture();
+        for engine in ["docker", "container"] {
+            cfg.engine = engine.into();
+            let run = container_run_args(
+                &cfg,
+                &RunFlags::default(),
+                Mode::Enforce,
+                "10.0.0.2",
+                "8080",
+            );
+            let create = agent_create_args(&run, "vhrn-agent-test");
+            assert_eq!(create[0], "create", "{engine}");
+            assert_eq!(&create[1..3], ["--name", "vhrn-agent-test"], "{engine}");
+            assert_eq!(&create[3..], &run[1..], "{engine}");
+            assert_eq!(
+                agent_start_args("vhrn-agent-test"),
+                ["start", "--attach", "--interactive", "vhrn-agent-test"],
+                "{engine}"
+            );
+        }
     }
 
     // The codex mount topology end to end, against the real spec. Each piece has its own
