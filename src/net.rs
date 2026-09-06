@@ -3,8 +3,10 @@
 //! remains the only widening path. Modes are per-published-run files.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -76,6 +78,111 @@ pub(crate) enum LayerSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedDomain {
     pub(crate) domain: String,
+    pub(crate) sources: Vec<LayerSource>,
+}
+
+/// An explicit host-loopback endpoint.  Local inference policy deliberately names an
+/// authority rather than a hostname: numeric loopback addresses remain distinct.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct LoopbackAuthority {
+    host: LoopbackHost,
+    port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LoopbackHost {
+    Localhost,
+    Ipv4([u8; 4]),
+    Ipv6Loopback,
+}
+
+impl fmt::Display for LoopbackAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.host {
+            LoopbackHost::Localhost => write!(formatter, "localhost:{}", self.port),
+            LoopbackHost::Ipv4(octets) => write!(
+                formatter,
+                "{}.{}.{}.{}:{}",
+                octets[0], octets[1], octets[2], octets[3], self.port
+            ),
+            LoopbackHost::Ipv6Loopback => write!(formatter, "[::1]:{}", self.port),
+        }
+    }
+}
+
+impl LoopbackAuthority {
+    pub(crate) fn parse(input: &str) -> std::result::Result<Self, String> {
+        if input.is_empty() || input.trim() != input || !input.is_ascii() {
+            return Err(format!("invalid loopback authority {input:?}"));
+        }
+        let (host, port) = input
+            .rsplit_once(':')
+            .ok_or_else(|| format!("invalid loopback authority {input:?}"))?;
+        let port = parse_loopback_port(port, input)?;
+        let host = if host.eq_ignore_ascii_case("localhost") {
+            LoopbackHost::Localhost
+        } else if let Some(ipv6) = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+        {
+            let ipv6 = std::net::Ipv6Addr::from_str(ipv6)
+                .map_err(|_| format!("invalid loopback authority {input:?}"))?;
+            if !ipv6.is_loopback() {
+                return Err(format!("invalid loopback authority {input:?}"));
+            }
+            LoopbackHost::Ipv6Loopback
+        } else {
+            LoopbackHost::Ipv4(parse_loopback_ipv4(host, input)?)
+        };
+        Ok(Self { host, port })
+    }
+}
+
+/// Normalize an explicit loopback host and port for durable policy storage.
+#[allow(dead_code)] // Parsed by the CLI layer in the following ship step.
+pub(crate) fn normalize_loopback_authority(input: &str) -> std::result::Result<String, String> {
+    LoopbackAuthority::parse(input).map(|authority| authority.to_string())
+}
+
+fn parse_loopback_port(port: &str, input: &str) -> std::result::Result<u16, String> {
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("invalid loopback authority {input:?}"));
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| format!("invalid loopback authority {input:?}"))?;
+    if port == 0 {
+        return Err(format!("invalid loopback authority {input:?}"));
+    }
+    Ok(port)
+}
+
+fn parse_loopback_ipv4(host: &str, input: &str) -> std::result::Result<[u8; 4], String> {
+    let parts: Vec<_> = host.split('.').collect();
+    if parts.len() != 4 {
+        return Err(format!("invalid loopback authority {input:?}"));
+    }
+    let mut octets = [0; 4];
+    for (index, part) in parts.into_iter().enumerate() {
+        if part.is_empty()
+            || !part.bytes().all(|byte| byte.is_ascii_digit())
+            || (part.len() > 1 && part.starts_with('0'))
+        {
+            return Err(format!("invalid loopback authority {input:?}"));
+        }
+        octets[index] = part
+            .parse::<u8>()
+            .map_err(|_| format!("invalid loopback authority {input:?}"))?;
+    }
+    if octets[0] != 127 {
+        return Err(format!("invalid loopback authority {input:?}"));
+    }
+    Ok(octets)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedLoopbackAuthority {
+    pub(crate) authority: LoopbackAuthority,
     pub(crate) sources: Vec<LayerSource>,
 }
 
@@ -201,6 +308,9 @@ pub(crate) struct PolicyStore {
 
 #[allow(dead_code)]
 impl PolicyStore {
+    pub(crate) fn from_root(root: PathBuf) -> Self {
+        Self { root }
+    }
     pub(crate) fn new(state: &Path) -> Self {
         Self {
             root: state.join("net"),
@@ -209,11 +319,30 @@ impl PolicyStore {
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
+    pub(crate) fn loopback_allows_live(
+        &self,
+        project: &ProjectIdentity,
+        run_id: &str,
+        authority: &LoopbackAuthority,
+    ) -> std::io::Result<bool> {
+        // These files are deliberately read on every CONNECT: grants and revocations are live.
+        let global = read_loopback_authorities(&self.global_loopback())?;
+        let project_file = self.projects().join(project.key()).join("loopback.allow");
+        let project_authorities = read_loopback_authorities(&project_file)?;
+        let run_file = self.runs().join(run_id).join("loopback.allow");
+        let run = read_loopback_authorities(&run_file)?;
+        Ok(global.contains(authority)
+            || project_authorities.contains(authority)
+            || run.contains(authority))
+    }
     fn lock_path(&self) -> PathBuf {
         self.root.join("policy.lock")
     }
     fn global(&self) -> PathBuf {
         self.root.join("allow.local")
+    }
+    fn global_loopback(&self) -> PathBuf {
+        self.root.join("loopback.allow")
     }
     fn projects(&self) -> PathBuf {
         self.root.join("projects")
@@ -242,6 +371,20 @@ impl PolicyStore {
     }
     fn ensure_files(&self) -> std::io::Result<()> {
         Self::file_if_absent(&self.global(), b"", 0o644)?;
+        Self::file_if_absent(&self.global_loopback(), b"", 0o644)?;
+        for entry in std::fs::read_dir(self.projects())? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                Self::file_if_absent(&entry.path().join("loopback.allow"), b"", 0o644)?;
+            }
+        }
+        for entry in std::fs::read_dir(self.runs())? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() && !entry.file_name().to_string_lossy().starts_with('.')
+            {
+                Self::file_if_absent(&entry.path().join("loopback.allow"), b"", 0o644)?;
+            }
+        }
         Self::ensure_log(&self.log())
     }
     fn mkdir(path: &Path) -> std::io::Result<()> {
@@ -306,7 +449,10 @@ impl PolicyStore {
         file.unlock()?;
         result
     }
-    fn project_file_locked(&self, project: &ProjectIdentity) -> std::io::Result<PathBuf> {
+    fn project_files_locked(
+        &self,
+        project: &ProjectIdentity,
+    ) -> std::io::Result<(PathBuf, PathBuf)> {
         let dir = self.projects().join(&project.key);
         Self::mkdir(&dir)?;
         let metadata = dir.join("path");
@@ -323,7 +469,16 @@ impl PolicyStore {
         set_mode(&metadata, 0o600)?;
         let allow = dir.join("allow.local");
         Self::file_if_absent(&allow, b"", 0o644)?;
-        Ok(allow)
+        let loopback = dir.join("loopback.allow");
+        Self::file_if_absent(&loopback, b"", 0o644)?;
+        Ok((allow, loopback))
+    }
+    fn project_file_locked(&self, project: &ProjectIdentity) -> std::io::Result<PathBuf> {
+        self.project_files_locked(project).map(|(allow, _)| allow)
+    }
+    fn project_loopback_file_locked(&self, project: &ProjectIdentity) -> std::io::Result<PathBuf> {
+        self.project_files_locked(project)
+            .map(|(_, loopback)| loopback)
     }
     pub(crate) fn mutate_global(&self, add: &[String], remove: &[String]) -> std::io::Result<()> {
         let (add, remove) = normalize_batch(add, remove)?;
@@ -339,6 +494,107 @@ impl PolicyStore {
         self.locked(|| {
             let file = self.project_file_locked(project)?;
             Self::mutate_file_locked(&file, &add, &remove)
+        })
+    }
+    pub(crate) fn mutate_loopback_global(
+        &self,
+        add: &[String],
+        remove: &[String],
+    ) -> std::io::Result<()> {
+        let (add, remove) = normalize_loopback_batch(add, remove)?;
+        self.locked(|| Self::mutate_loopback_file_locked(&self.global_loopback(), &add, &remove))
+    }
+    pub(crate) fn mutate_loopback_project(
+        &self,
+        project: &ProjectIdentity,
+        add: &[String],
+        remove: &[String],
+    ) -> std::io::Result<()> {
+        let (add, remove) = normalize_loopback_batch(add, remove)?;
+        self.locked(|| {
+            let file = self.project_loopback_file_locked(project)?;
+            Self::mutate_loopback_file_locked(&file, &add, &remove)
+        })
+    }
+    pub(crate) fn deny_loopback(
+        &self,
+        project: Option<&ProjectIdentity>,
+        authorities: &[String],
+    ) -> std::io::Result<DenyLoopbackReport> {
+        let authorities = normalize_loopback_authorities(authorities)?;
+        self.locked(|| {
+            let snapshot = self.snapshot_locked()?;
+            let (selected, selected_authorities, selected_label) = match project {
+                None => (
+                    Some(self.global_loopback()),
+                    snapshot.loopback.clone(),
+                    "global".to_owned(),
+                ),
+                Some(project) => {
+                    let stored = snapshot
+                        .projects
+                        .iter()
+                        .find(|entry| entry.key == project.key && entry.path == project.bytes);
+                    let selected =
+                        stored.map(|entry| self.projects().join(&entry.key).join("loopback.allow"));
+                    (
+                        selected,
+                        stored.map_or_else(Vec::new, |entry| entry.loopback.clone()),
+                        format!("project:{}", quote_path_bytes(&project.bytes)),
+                    )
+                }
+            };
+            let missing: Vec<_> = authorities
+                .iter()
+                .filter(|authority| !selected_authorities.contains(*authority))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                return Ok(DenyLoopbackReport {
+                    selected: selected_label.clone(),
+                    missing: missing
+                        .into_iter()
+                        .map(|authority| DenyLoopbackEntry {
+                            authority: authority.to_string(),
+                            sources: other_loopback_sources(
+                                &snapshot,
+                                project,
+                                &authority,
+                                &selected_label,
+                            ),
+                        })
+                        .collect(),
+                    remaining: Vec::new(),
+                });
+            }
+            let selected = selected.expect("a nonempty selected policy must have a file");
+            let remove: HashSet<_> = authorities.iter().cloned().collect();
+            let mut retained = selected_authorities;
+            retained.retain(|authority| !remove.contains(authority));
+            write_loopback_authorities(&selected, &retained)?;
+            let mut after = snapshot;
+            match project {
+                None => after.loopback = retained,
+                Some(project) => {
+                    after
+                        .projects
+                        .iter_mut()
+                        .find(|entry| entry.key == project.key)
+                        .expect("selected project is in snapshot")
+                        .loopback = retained;
+                }
+            }
+            Ok(DenyLoopbackReport {
+                selected: selected_label,
+                missing: Vec::new(),
+                remaining: authorities
+                    .into_iter()
+                    .map(|authority| DenyLoopbackEntry {
+                        authority: authority.to_string(),
+                        sources: other_loopback_sources(&after, project, &authority, ""),
+                    })
+                    .collect(),
+            })
         })
     }
 
@@ -453,6 +709,31 @@ impl PolicyStore {
         domains.retain(|d| !remove.contains(d));
         write_atomic(file, domains_text(&domains).as_bytes(), 0o644)
     }
+    fn mutate_loopback_file_locked(
+        file: &Path,
+        add: &[LoopbackAuthority],
+        remove: &HashSet<LoopbackAuthority>,
+    ) -> std::io::Result<()> {
+        let mut authorities = read_loopback_authorities(file)?;
+        for authority in add {
+            if !authorities.contains(authority) {
+                authorities.push(authority.clone());
+            }
+        }
+        let missing: Vec<_> = remove
+            .iter()
+            .filter(|authority| !authorities.contains(*authority))
+            .map(ToString::to_string)
+            .collect();
+        if !missing.is_empty() {
+            return Err(invalid_input(format!(
+                "loopback authorities not allowed: {}",
+                missing.join(", ")
+            )));
+        }
+        authorities.retain(|authority| !remove.contains(authority));
+        write_loopback_authorities(file, &authorities)
+    }
     pub(crate) fn resolved(
         &self,
         harness: &str,
@@ -500,6 +781,45 @@ impl PolicyStore {
         layer(run.to_vec(), LayerSource::Run(run_id.to_string()))?;
         Ok(output)
     }
+    pub(crate) fn resolved_loopback(
+        &self,
+        project: Option<&ProjectIdentity>,
+        run_id: &str,
+        run: &[String],
+    ) -> std::io::Result<Vec<ResolvedLoopbackAuthority>> {
+        let run = normalize_loopback_authorities(run)?;
+        self.ensure()?;
+        let mut output: Vec<ResolvedLoopbackAuthority> = Vec::new();
+        let mut index = std::collections::HashMap::<LoopbackAuthority, usize>::new();
+        let mut layer = |authorities: Vec<LoopbackAuthority>, source: LayerSource| {
+            for authority in authorities {
+                if let Some(index) = index.get(&authority) {
+                    output[*index].sources.push(source.clone());
+                } else {
+                    index.insert(authority.clone(), output.len());
+                    output.push(ResolvedLoopbackAuthority {
+                        authority,
+                        sources: vec![source.clone()],
+                    });
+                }
+            }
+        };
+        layer(
+            read_loopback_authorities(&self.global_loopback())?,
+            LayerSource::Global,
+        );
+        if let Some(project) = project {
+            let file = self.projects().join(&project.key).join("loopback.allow");
+            if file.exists() {
+                layer(
+                    read_loopback_authorities(&file)?,
+                    LayerSource::Project(project.path.clone()),
+                );
+            }
+        }
+        layer(run, LayerSource::Run(run_id.to_owned()));
+        Ok(output)
+    }
     pub(crate) fn denied_domains(&self) -> std::io::Result<Vec<String>> {
         self.ensure()?;
         if !std::fs::symlink_metadata(self.log())?.file_type().is_file() {
@@ -523,6 +843,7 @@ impl PolicyStore {
     fn snapshot_locked(&self) -> std::io::Result<PolicySnapshot> {
         self.reap_runs_locked()?;
         let global = read_domains(&self.global())?;
+        let loopback = read_loopback_authorities(&self.global_loopback())?;
         let projects = self.projects_locked()?;
         let mut runs = Vec::new();
         for entry in std::fs::read_dir(self.runs())? {
@@ -538,12 +859,14 @@ impl PolicyStore {
                 &name.to_string_lossy(),
                 &entry.path(),
                 &global,
+                &loopback,
                 &projects,
             )?);
         }
         runs.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(PolicySnapshot {
             global,
+            loopback,
             projects,
             runs,
         })
@@ -565,6 +888,7 @@ impl PolicyStore {
                 key,
                 path,
                 domains: read_domains(&entry.path().join("allow.local"))?,
+                loopback: read_loopback_authorities(&entry.path().join("loopback.allow"))?,
             });
         }
         projects.sort_by(|a, b| a.path.cmp(&b.path));
@@ -575,6 +899,7 @@ impl PolicyStore {
         id: &str,
         path: &Path,
         global: &[String],
+        loopback: &[LoopbackAuthority],
         projects: &[PolicyProject],
     ) -> std::io::Result<ActiveRun> {
         let harness = read_trimmed(&path.join("harness"), "run harness")?;
@@ -599,6 +924,7 @@ impl PolicyStore {
         let base = read_domains(&path.join("base.allow"))?;
         let harness_domains = read_domains(&path.join("harness.allow"))?;
         let run = read_domains(&path.join("run.allow"))?;
+        let run_loopback = read_loopback_authorities(&path.join("loopback.allow"))?;
         let effective = resolve_layers([
             (base, LayerSource::Base),
             (harness_domains, LayerSource::Harness(harness.clone())),
@@ -609,6 +935,14 @@ impl PolicyStore {
             ),
             (run, LayerSource::Run(id.to_owned())),
         ])?;
+        let effective_loopback = resolve_loopback_layers([
+            (loopback.to_vec(), LayerSource::Global),
+            (
+                project.loopback.clone(),
+                LayerSource::Project(path_from_bytes(&project_path)),
+            ),
+            (run_loopback, LayerSource::Run(id.to_owned())),
+        ]);
         Ok(ActiveRun {
             id: id.to_owned(),
             harness,
@@ -616,6 +950,7 @@ impl PolicyStore {
             project_path,
             mode,
             effective,
+            effective_loopback,
         })
     }
 
@@ -684,10 +1019,12 @@ impl PolicyStore {
         project: &ProjectIdentity,
         harness_domains: &[String],
         run_domains: &[String],
+        run_loopback: &[String],
         mode: Mode,
     ) -> std::io::Result<PolicyRun> {
         let harness_domains = normalize_domains(harness_domains)?;
         let run_domains = normalize_domains(run_domains)?;
+        let run_loopback = normalize_loopback_authorities(run_loopback)?;
         self.locked(|| {
             self.reap_runs_locked()?;
             self.project_file_locked(project)?;
@@ -727,6 +1064,7 @@ impl PolicyStore {
                 )?;
                 write_domains(&temporary.join("harness.allow"), &harness_domains)?;
                 write_domains(&temporary.join("run.allow"), &run_domains)?;
+                write_loopback_authorities(&temporary.join("loopback.allow"), &run_loopback)?;
                 write_atomic(
                     &temporary.join("mode"),
                     format!("{}\n", mode.as_str()).as_bytes(),
@@ -877,6 +1215,7 @@ pub(crate) struct ActiveRun {
     pub(crate) project_path: Vec<u8>,
     pub(crate) mode: String,
     pub(crate) effective: Vec<ResolvedDomain>,
+    pub(crate) effective_loopback: Vec<ResolvedLoopbackAuthority>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -884,11 +1223,13 @@ pub(crate) struct PolicyProject {
     pub(crate) key: String,
     pub(crate) path: Vec<u8>,
     pub(crate) domains: Vec<String>,
+    pub(crate) loopback: Vec<LoopbackAuthority>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PolicySnapshot {
     pub(crate) global: Vec<String>,
+    pub(crate) loopback: Vec<LoopbackAuthority>,
     pub(crate) projects: Vec<PolicyProject>,
     pub(crate) runs: Vec<ActiveRun>,
 }
@@ -904,6 +1245,19 @@ pub(crate) struct DenyReport {
     pub(crate) selected: String,
     pub(crate) missing: Vec<DenyDomainReport>,
     pub(crate) remaining: Vec<DenyDomainReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DenyLoopbackEntry {
+    pub(crate) authority: String,
+    pub(crate) sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DenyLoopbackReport {
+    pub(crate) selected: String,
+    pub(crate) missing: Vec<DenyLoopbackEntry>,
+    pub(crate) remaining: Vec<DenyLoopbackEntry>,
 }
 
 fn other_sources(
@@ -953,6 +1307,47 @@ fn other_sources(
     sources
 }
 
+fn other_loopback_sources(
+    snapshot: &PolicySnapshot,
+    selected_project: Option<&ProjectIdentity>,
+    authority: &LoopbackAuthority,
+    selected_label: &str,
+) -> Vec<String> {
+    let mut sources = Vec::new();
+    let mut add = |source: String| {
+        if source != selected_label && !sources.contains(&source) {
+            sources.push(source);
+        }
+    };
+    if snapshot.loopback.contains(authority) {
+        add("global".into());
+    }
+    if selected_project.is_none() {
+        for project in &snapshot.projects {
+            if project.loopback.contains(authority) {
+                add(format!("project:{}", quote_path_bytes(&project.path)));
+            }
+        }
+    }
+    for run in &snapshot.runs {
+        if selected_project.is_some_and(|selected| selected.key != run.project_key) {
+            continue;
+        }
+        if let Some(resolved) = run
+            .effective_loopback
+            .iter()
+            .find(|value| value.authority == *authority)
+        {
+            for source in &resolved.sources {
+                if let LayerSource::Run(id) = source {
+                    add(format!("run:{id}"));
+                }
+            }
+        }
+    }
+    sources
+}
+
 fn path_from_bytes(bytes: &[u8]) -> PathBuf {
     use std::os::unix::ffi::OsStringExt;
     PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()))
@@ -989,6 +1384,27 @@ fn resolve_layers<const N: usize>(
     Ok(output)
 }
 
+fn resolve_loopback_layers<const N: usize>(
+    layers: [(Vec<LoopbackAuthority>, LayerSource); N],
+) -> Vec<ResolvedLoopbackAuthority> {
+    let mut output: Vec<ResolvedLoopbackAuthority> = Vec::new();
+    let mut index = std::collections::HashMap::<LoopbackAuthority, usize>::new();
+    for (authorities, source) in layers {
+        for authority in authorities {
+            if let Some(index) = index.get(&authority) {
+                output[*index].sources.push(source.clone());
+            } else {
+                index.insert(authority.clone(), output.len());
+                output.push(ResolvedLoopbackAuthority {
+                    authority,
+                    sources: vec![source.clone()],
+                });
+            }
+        }
+    }
+    output
+}
+
 fn invalid_input(error: String) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
 }
@@ -1023,6 +1439,49 @@ fn normalize_domains(domains: &[String]) -> std::io::Result<Vec<String>> {
         }
     }
     Ok(result)
+}
+fn normalize_loopback_batch(
+    add: &[String],
+    remove: &[String],
+) -> std::io::Result<(Vec<LoopbackAuthority>, HashSet<LoopbackAuthority>)> {
+    Ok((
+        normalize_loopback_authorities(add)?,
+        remove
+            .iter()
+            .map(|authority| LoopbackAuthority::parse(authority).map_err(invalid_input))
+            .collect::<std::io::Result<HashSet<_>>>()?,
+    ))
+}
+fn normalize_loopback_authorities(
+    authorities: &[String],
+) -> std::io::Result<Vec<LoopbackAuthority>> {
+    let mut result = Vec::new();
+    for authority in authorities {
+        let authority = LoopbackAuthority::parse(authority).map_err(invalid_input)?;
+        if !result.contains(&authority) {
+            result.push(authority);
+        }
+    }
+    Ok(result)
+}
+fn read_loopback_authorities(path: &Path) -> std::io::Result<Vec<LoopbackAuthority>> {
+    normalize_loopback_authorities(
+        &std::fs::read_to_string(path)?
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+    )
+}
+fn write_loopback_authorities(
+    path: &Path,
+    authorities: &[LoopbackAuthority],
+) -> std::io::Result<()> {
+    let mut text = String::new();
+    for authority in authorities {
+        use std::fmt::Write;
+        writeln!(text, "{authority}").expect("writing to a String cannot fail");
+    }
+    write_atomic(path, text.as_bytes(), 0o644)
 }
 fn read_denied(path: &Path) -> std::io::Result<std::collections::HashSet<String>> {
     Ok(std::fs::read_to_string(path)?
@@ -1152,35 +1611,46 @@ fn run_net_with_store(store: &PolicyStore, args: &[String]) -> CommandResult {
     };
 
     match cmd {
-        "status" if !rest.is_empty() && rest != ["--domains"] => {
-            usage("usage: vhrn net status [--domains]")
+        "status"
+            if rest
+                .iter()
+                .any(|arg| arg != "--domains" && arg != "--local") =>
+        {
+            usage("usage: vhrn net status [--domains] [--local]")
         }
         "status" => match store.snapshot() {
             Ok(snapshot) => {
                 let mut out = format!(
-                    "global: {} domain(s)\nprojects: {} project(s), {} domain(s)\n",
+                    "global: {} domain(s), {} local authority(s)\nprojects: {} project(s), {} domain(s), {} local authority(s)\n",
                     snapshot.global.len(),
+                    snapshot.loopback.len(),
                     snapshot.projects.len(),
                     snapshot
                         .projects
                         .iter()
                         .map(|p| p.domains.len())
                         .sum::<usize>(),
+                    snapshot
+                        .projects
+                        .iter()
+                        .map(|p| p.loopback.len())
+                        .sum::<usize>(),
                 );
                 for run in &snapshot.runs {
                     out.push_str(&format!(
-                        "run {}: harness={} project={} mode={} effective={}\n",
+                        "run {}: harness={} project={} mode={} effective={} domain(s), {} local authority(s)\n",
                         run.id,
                         run.harness,
                         quote_path_bytes(&run.project_path),
                         run.mode,
                         run.effective.len(),
+                        run.effective_loopback.len(),
                     ));
                 }
                 if snapshot.runs.is_empty() {
                     out.push_str("no active runs; future runs default to enforce\n");
                 }
-                if rest == ["--domains"] {
+                if rest.contains(&"--domains".to_string()) {
                     out.push_str("global domains:\n");
                     if snapshot.global.is_empty() {
                         out.push_str("  (none)\n");
@@ -1216,6 +1686,33 @@ fn run_net_with_store(store: &PolicyStore, args: &[String]) -> CommandResult {
                         }
                     }
                 }
+                if rest.contains(&"--local".to_string()) {
+                    out.push_str("global local authorities:\n");
+                    append_loopback(&mut out, &snapshot.loopback);
+                    for project in &snapshot.projects {
+                        out.push_str(&format!(
+                            "project {} local authorities:\n",
+                            quote_path_bytes(&project.path)
+                        ));
+                        append_loopback(&mut out, &project.loopback);
+                    }
+                    for run in &snapshot.runs {
+                        out.push_str(&format!("run {} local authorities:\n", run.id));
+                        if run.effective_loopback.is_empty() {
+                            out.push_str("  (none)\n");
+                        } else {
+                            for authority in &run.effective_loopback {
+                                let sources = authority
+                                    .sources
+                                    .iter()
+                                    .map(source_label)
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                out.push_str(&format!("  {} [{}]\n", authority.authority, sources));
+                            }
+                        }
+                    }
+                }
                 ok(out)
             }
             Err(e) => failure(e),
@@ -1234,16 +1731,25 @@ fn run_net_with_store(store: &PolicyStore, args: &[String]) -> CommandResult {
             ok(domains.into_iter().map(|d| format!("{d}\n")).collect())
         }
         "allow" | "deny" => {
-            let (project_path, domains) = match parse_scope(rest) {
+            let (project_path, target) = match parse_scope(rest) {
                 Ok(v) => v,
                 Err(e) => {
                     return usage(&e);
                 }
             };
-            let domains = match normalize_domains(&domains) {
-                Ok(v) => v,
-                Err(e) => {
-                    return failure(e);
+            let target = match target {
+                PolicyTarget::Domains(domains) => PolicyTarget::Domains(domains),
+                PolicyTarget::Loopback(authorities) => {
+                    let authorities = match normalize_loopback_authorities(&authorities) {
+                        Ok(authorities) => authorities,
+                        Err(error) => return failure(error),
+                    };
+                    PolicyTarget::Loopback(
+                        authorities
+                            .into_iter()
+                            .map(|authority| authority.to_string())
+                            .collect(),
+                    )
                 }
             };
             let project = match project_path {
@@ -1253,24 +1759,50 @@ fn run_net_with_store(store: &PolicyStore, args: &[String]) -> CommandResult {
                 },
                 None => None,
             };
+            if let PolicyTarget::Domains(domains) = &target {
+                let domains = match normalize_domains(domains) {
+                    Ok(v) => v,
+                    Err(e) => return failure(e),
+                };
+                if cmd == "deny" {
+                    return match store.deny(project.as_ref(), &domains) {
+                        Ok(report) if !report.missing.is_empty() => {
+                            failure(format_deny_missing(&report))
+                        }
+                        Ok(report) => ok(format_deny_success(&report)),
+                        Err(error) => failure(error),
+                    };
+                }
+                let result = match (cmd, project.as_ref()) {
+                    ("allow", None) => store.mutate_global(&domains, &[]),
+                    ("allow", Some(p)) => store.mutate_project(p, &domains, &[]),
+                    _ => unreachable!(),
+                };
+                return result.map_or_else(failure, |()| {
+                    ok(format!("{}: {}\n", cmd, domains.join(" ")))
+                });
+            }
+            let PolicyTarget::Loopback(authorities) = target else {
+                unreachable!();
+            };
             if cmd == "deny" {
-                return match store.deny(project.as_ref(), &domains) {
+                return match store.deny_loopback(project.as_ref(), &authorities) {
                     Ok(report) if !report.missing.is_empty() => {
-                        failure(format_deny_missing(&report))
+                        failure(format_deny_loopback_missing(&report))
                     }
-                    Ok(report) => ok(format_deny_success(&report)),
+                    Ok(report) => ok(format_deny_loopback_success(&report)),
                     Err(error) => failure(error),
                 };
             }
             let result = match (cmd, project.as_ref()) {
-                ("allow", None) => store.mutate_global(&domains, &[]),
-                ("allow", Some(p)) => store.mutate_project(p, &domains, &[]),
+                ("allow", None) => store.mutate_loopback_global(&authorities, &[]),
+                ("allow", Some(p)) => store.mutate_loopback_project(p, &authorities, &[]),
                 _ => unreachable!(),
             };
             if let Err(e) = result {
                 return failure(e);
             }
-            ok(format!("{}: {}\n", cmd, domains.join(" ")))
+            ok(format!("{}: {}\n", cmd, authorities.join(" ")))
         }
         "open" => {
             if !rest.is_empty() {
@@ -1338,8 +1870,69 @@ fn format_deny_success(report: &DenyReport) -> String {
     output
 }
 
-fn parse_scope(args: &[String]) -> std::result::Result<(Option<String>, Vec<String>), String> {
-    let (project, domains) = if args.first().is_some_and(|a| a == "--project") {
+fn format_deny_loopback_missing(report: &DenyLoopbackReport) -> String {
+    report
+        .missing
+        .iter()
+        .map(|entry| {
+            if entry.sources.is_empty() {
+                format!("{} is not allowed by {}", entry.authority, report.selected)
+            } else {
+                format!(
+                    "{} is not allowed by {}; allowed by {}",
+                    entry.authority,
+                    report.selected,
+                    entry.sources.join(", ")
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_deny_loopback_success(report: &DenyLoopbackReport) -> String {
+    use std::fmt::Write;
+    let mut output = format!(
+        "deny: {}\n",
+        report
+            .remaining
+            .iter()
+            .map(|entry| entry.authority.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    for entry in &report.remaining {
+        if !entry.sources.is_empty() {
+            let _ = writeln!(
+                output,
+                "{} remains allowed by {}",
+                entry.authority,
+                entry.sources.join(", ")
+            );
+        }
+    }
+    output
+}
+
+fn append_loopback(output: &mut String, authorities: &[LoopbackAuthority]) {
+    use std::fmt::Write;
+
+    if authorities.is_empty() {
+        output.push_str("  (none)\n");
+        return;
+    }
+    for authority in authorities {
+        let _ = writeln!(output, "  {authority}");
+    }
+}
+
+enum PolicyTarget {
+    Domains(Vec<String>),
+    Loopback(Vec<String>),
+}
+
+fn parse_scope(args: &[String]) -> std::result::Result<(Option<String>, PolicyTarget), String> {
+    let (project, values) = if args.first().is_some_and(|a| a == "--project") {
         let Some(path) = args.get(1) else {
             return Err("usage: vhrn net allow|deny [--project <path>] <domain>...".into());
         };
@@ -1347,10 +1940,23 @@ fn parse_scope(args: &[String]) -> std::result::Result<(Option<String>, Vec<Stri
     } else {
         (None, args.to_vec())
     };
-    if domains.is_empty() || domains.iter().any(|domain| domain.starts_with('-')) {
+    if values.first().is_some_and(|value| value == "--local") {
+        let authorities = values[1..].to_vec();
+        if authorities.is_empty()
+            || authorities
+                .iter()
+                .any(|authority| authority.starts_with('-'))
+        {
+            return Err(
+                "usage: vhrn net allow|deny [--project <path>] --local <host:port>...".into(),
+            );
+        }
+        return Ok((project, PolicyTarget::Loopback(authorities)));
+    }
+    if values.is_empty() || values.iter().any(|domain| domain.starts_with('-')) {
         return Err("usage: vhrn net allow|deny [--project <path>] <domain>...".into());
     }
-    Ok((project, domains))
+    Ok((project, PolicyTarget::Domains(values)))
 }
 
 fn mode_result(store: &PolicyStore, mode: Mode) -> CommandResult {
@@ -1403,6 +2009,282 @@ mod tests {
     }
 
     #[test]
+    fn loopback_authorities_match_shared_fixture() {
+        for line in include_str!("../testdata/loopback-authorities.tsv").lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let fields: Vec<_> = line.split('\t').collect();
+            match fields.as_slice() {
+                ["valid", input, expected] => {
+                    assert_eq!(
+                        normalize_loopback_authority(input).unwrap(),
+                        *expected,
+                        "{line}"
+                    );
+                }
+                ["invalid", input] => {
+                    assert!(normalize_loopback_authority(input).is_err(), "{line}");
+                }
+                _ => panic!("invalid loopback fixture row: {line}"),
+            }
+        }
+    }
+
+    #[test]
+    fn loopback_policy_is_scoped_live_and_preserves_domain_policy() {
+        let state = crate::testutil::temp_dir();
+        let project_dir = crate::testutil::temp_dir();
+        let project = ProjectIdentity::from_path(project_dir.path()).unwrap();
+        let store = PolicyStore::new(state.path());
+
+        store
+            .mutate_global(&["domain.example".into()], &[])
+            .unwrap();
+        let global_domain = std::fs::read(store.global()).unwrap();
+        let project_domain = store.projects().join(&project.key).join("allow.local");
+        store
+            .mutate_project(&project, &["project.example".into()], &[])
+            .unwrap();
+        let project_domain_contents = std::fs::read(&project_domain).unwrap();
+        std::fs::remove_file(store.global_loopback()).unwrap();
+        std::fs::remove_file(store.projects().join(&project.key).join("loopback.allow")).unwrap();
+        store.ensure().unwrap();
+        assert_eq!(std::fs::read(store.global()).unwrap(), global_domain);
+        assert_eq!(
+            std::fs::read(&project_domain).unwrap(),
+            project_domain_contents
+        );
+        assert_eq!(
+            read_loopback_authorities(&store.global_loopback()).unwrap(),
+            Vec::new()
+        );
+
+        store
+            .mutate_loopback_global(&["LOCALHOST:001234".into()], &[])
+            .unwrap();
+        store
+            .mutate_loopback_project(&project, &["127.0.0.2:80".into()], &[])
+            .unwrap();
+        let run = store
+            .publish_run(
+                "codex",
+                &project,
+                &[],
+                &[],
+                &["[0:0:0:0:0:0:0:1]:00443".into()],
+                Mode::Enforce,
+            )
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .loopback
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["localhost:1234"]
+        );
+        assert_eq!(snapshot.projects[0].loopback[0].to_string(), "127.0.0.2:80");
+        assert_eq!(
+            snapshot.runs[0]
+                .effective_loopback
+                .iter()
+                .map(|entry| entry.authority.to_string())
+                .collect::<Vec<_>>(),
+            ["localhost:1234", "127.0.0.2:80", "[::1]:443"]
+        );
+        assert_eq!(
+            snapshot.runs[0].effective_loopback[0].sources,
+            vec![LayerSource::Global]
+        );
+
+        store
+            .mutate_loopback_global(&["127.0.0.1:8000".into()], &[])
+            .unwrap();
+        let active = store.active_runs().unwrap();
+        assert!(
+            active[0]
+                .effective_loopback
+                .iter()
+                .any(|entry| entry.authority.to_string() == "127.0.0.1:8000")
+        );
+        drop(run);
+    }
+
+    #[test]
+    fn loopback_batch_validation_is_atomic() {
+        let state = crate::testutil::temp_dir();
+        let store = PolicyStore::new(state.path());
+        let invalid = store
+            .mutate_loopback_global(&["localhost:1234".into(), "not-local:80".into()], &[])
+            .unwrap_err();
+        assert_eq!(invalid.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!store.root().exists());
+
+        store
+            .mutate_loopback_global(&["localhost:1234".into(), "127.0.0.1:80".into()], &[])
+            .unwrap();
+        let before = std::fs::read(store.global_loopback()).unwrap();
+        let missing = store
+            .mutate_loopback_global(&[], &["localhost:1234".into(), "[::1]:443".into()])
+            .unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(store.global_loopback()).unwrap(), before);
+    }
+
+    #[test]
+    fn net_local_commands_are_scoped_and_report_live_provenance() {
+        let fresh_state = crate::testutil::temp_dir();
+        let fresh = PolicyStore::new(fresh_state.path());
+        let mixed = run_net_with_store(
+            &fresh,
+            &[
+                "allow".into(),
+                "domain.example".into(),
+                "--local".into(),
+                "localhost:1234".into(),
+            ],
+        );
+        assert_eq!(mixed.code, 2);
+        assert!(!fresh.root().exists());
+
+        let state = crate::testutil::temp_dir();
+        let project_dir = crate::testutil::temp_dir();
+        let project = ProjectIdentity::from_path(project_dir.path()).unwrap();
+        let store = PolicyStore::new(state.path());
+        let allow = run_net_with_store(
+            &store,
+            &[
+                "allow".into(),
+                "--project".into(),
+                project.path.display().to_string(),
+                "--local".into(),
+                "LOCALHOST:001234".into(),
+                "127.0.0.1:80".into(),
+            ],
+        );
+        assert_eq!(allow.code, 0);
+        assert_eq!(allow.stdout, "allow: localhost:1234 127.0.0.1:80\n");
+        let run = store
+            .publish_run(
+                "codex",
+                &project,
+                &[],
+                &[],
+                &["[::1]:443".into()],
+                Mode::Enforce,
+            )
+            .unwrap();
+        let status = run_net_with_store(
+            &store,
+            &["status".into(), "--domains".into(), "--local".into()],
+        );
+        assert_eq!(status.code, 0);
+        assert!(status.stdout.contains("project \""));
+        assert!(status.stdout.contains("localhost:1234"));
+        assert!(status.stdout.contains("[::1]:443 [run:"));
+
+        let denied = run_net_with_store(
+            &store,
+            &[
+                "deny".into(),
+                "--project".into(),
+                project.path.display().to_string(),
+                "--local".into(),
+                "localhost:1234".into(),
+            ],
+        );
+        assert_eq!(denied.code, 0);
+        let absent = project_dir.path().join("absent");
+        std::fs::create_dir(&absent).unwrap();
+        let missing = run_net_with_store(
+            &store,
+            &[
+                "deny".into(),
+                "--project".into(),
+                absent.display().to_string(),
+                "--local".into(),
+                "127.0.0.1:80".into(),
+            ],
+        );
+        assert_eq!(missing.code, 1);
+        let absent_id = ProjectIdentity::from_path(&absent).unwrap();
+        assert!(!store.projects().join(absent_id.key()).exists());
+        drop(run);
+    }
+
+    #[test]
+    fn local_deny_reports_remaining_global_project_and_run_sources() {
+        let state = crate::testutil::temp_dir();
+        let project_dir = crate::testutil::temp_dir();
+        let project = ProjectIdentity::from_path(project_dir.path()).unwrap();
+        let store = PolicyStore::new(state.path());
+        let authority = "localhost:1234".to_string();
+        store
+            .mutate_loopback_global(std::slice::from_ref(&authority), &[])
+            .unwrap();
+        store
+            .mutate_loopback_project(&project, std::slice::from_ref(&authority), &[])
+            .unwrap();
+        let run = store
+            .publish_run(
+                "codex",
+                &project,
+                &[],
+                &[],
+                std::slice::from_ref(&authority),
+                Mode::Enforce,
+            )
+            .unwrap();
+
+        let project_deny = store
+            .deny_loopback(Some(&project), std::slice::from_ref(&authority))
+            .unwrap();
+        assert!(project_deny.missing.is_empty());
+        assert_eq!(project_deny.remaining[0].sources.len(), 2);
+        assert!(
+            project_deny.remaining[0]
+                .sources
+                .contains(&"global".to_string())
+        );
+        assert!(
+            project_deny.remaining[0]
+                .sources
+                .iter()
+                .any(|source| source.starts_with("run:"))
+        );
+
+        let absent = project_dir.path().join("absent");
+        std::fs::create_dir(&absent).unwrap();
+        let absent_id = ProjectIdentity::from_path(&absent).unwrap();
+        let missing = store
+            .deny_loopback(Some(&absent_id), std::slice::from_ref(&authority))
+            .unwrap();
+        assert_eq!(missing.missing[0].sources, vec!["global"]);
+        assert!(!store.projects().join(absent_id.key()).exists());
+
+        store
+            .mutate_loopback_project(&project, std::slice::from_ref(&authority), &[])
+            .unwrap();
+        let global_deny = store.deny_loopback(None, &[authority]).unwrap();
+        assert!(global_deny.missing.is_empty());
+        assert!(
+            global_deny.remaining[0]
+                .sources
+                .iter()
+                .any(|source| source.starts_with("project:"))
+        );
+        assert!(
+            global_deny.remaining[0]
+                .sources
+                .iter()
+                .any(|source| source.starts_with("run:"))
+        );
+        drop(run);
+    }
+
+    #[test]
     fn injected_net_edge_validates_before_creating_state_and_formats_idle() {
         let state = crate::testutil::temp_dir();
         let store = PolicyStore::new(state.path());
@@ -1440,7 +2322,7 @@ mod tests {
         assert_eq!(status.code, 0);
         assert_eq!(
             status.stdout,
-            "global: 0 domain(s)\nprojects: 0 project(s), 0 domain(s)\n".to_owned()
+            "global: 0 domain(s), 0 local authority(s)\nprojects: 0 project(s), 0 domain(s), 0 local authority(s)\n".to_owned()
                 + "no active runs; future runs default to enforce\n"
         );
         assert!(status.stderr.is_empty());
@@ -1604,10 +2486,24 @@ mod tests {
             .mutate_project(&second, &["github.com".into()], &[])
             .unwrap();
         let first_run = store
-            .publish_run("codex", &first, &[], &["github.com".into()], Mode::Enforce)
+            .publish_run(
+                "codex",
+                &first,
+                &[],
+                &["github.com".into()],
+                &[],
+                Mode::Enforce,
+            )
             .unwrap();
         let second_run = store
-            .publish_run("codex", &second, &[], &["github.com".into()], Mode::Enforce)
+            .publish_run(
+                "codex",
+                &second,
+                &[],
+                &["github.com".into()],
+                &[],
+                Mode::Enforce,
+            )
             .unwrap();
 
         let report = store.deny(Some(&first), &["github.com".into()]).unwrap();
@@ -1710,24 +2606,26 @@ mod tests {
                 &first,
                 &["harness.example".into()],
                 &["run.example".into()],
+                &[],
                 Mode::Report,
             )
             .unwrap();
         let two = store
-            .publish_run("b", &second, &[], &[], Mode::Enforce)
+            .publish_run("b", &second, &[], &[], &[], Mode::Enforce)
             .unwrap();
         let snapshot = store.snapshot().unwrap();
         let output = run_net_with_store(&store, &["status".into(), "--domains".into()]);
         assert_eq!(output.code, 0);
-        let mut expected = "global: 1 domain(s)\nprojects: 2 project(s), 1 domain(s)\n".to_owned();
+        let mut expected = "global: 1 domain(s), 0 local authority(s)\nprojects: 2 project(s), 1 domain(s), 0 local authority(s)\n".to_owned();
         for run in &snapshot.runs {
             expected.push_str(&format!(
-                "run {}: harness={} project={} mode={} effective={}\n",
+                "run {}: harness={} project={} mode={} effective={} domain(s), {} local authority(s)\n",
                 run.id,
                 run.harness,
                 quote_path_bytes(&run.project_path),
                 run.mode,
                 run.effective.len(),
+                run.effective_loopback.len(),
             ));
         }
         expected.push_str("global domains:\n  global.example\n");
@@ -1764,7 +2662,7 @@ mod tests {
         let project = ProjectIdentity::from_path(project_dir.path()).unwrap();
         let store = PolicyStore::new(state.path());
         let run = store
-            .publish_run("empty", &project, &[], &[], Mode::Enforce)
+            .publish_run("empty", &project, &[], &[], &[], Mode::Enforce)
             .unwrap();
         let id = run.id().unwrap().to_string_lossy().into_owned();
         write_domains(&store.runs().join(&id).join("base.allow"), &[]).unwrap();
@@ -1775,8 +2673,8 @@ mod tests {
         assert_eq!(
             result.stdout,
             format!(
-                "global: 0 domain(s)\nprojects: 1 project(s), 0 domain(s)\n\
-                 run {id}: harness=empty project={} mode=enforce effective=0\n\
+                "global: 0 domain(s), 0 local authority(s)\nprojects: 1 project(s), 0 domain(s), 0 local authority(s)\n\
+                 run {id}: harness=empty project={} mode=enforce effective=0 domain(s), 0 local authority(s)\n\
                  global domains:\n  (none)\n\
                  project {}:\n  (none)\n\
                  run {id} domains:\n  (none)\n",
@@ -1813,6 +2711,14 @@ mod tests {
             0o644
         );
         assert_eq!(
+            std::fs::metadata(store.root().join("loopback.allow"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        assert_eq!(
             std::fs::metadata(store.root().join("log/denied.log"))
                 .unwrap()
                 .permissions()
@@ -1821,7 +2727,7 @@ mod tests {
             0o622
         );
         let run = store
-            .publish_run("codex", &project, &[], &[], Mode::Enforce)
+            .publish_run("codex", &project, &[], &[], &[], Mode::Enforce)
             .unwrap();
         let published = store.root().join("runs").join(run.id().unwrap());
         assert!(published.is_dir());
@@ -1835,6 +2741,14 @@ mod tests {
         );
         assert_eq!(
             std::fs::metadata(published.join("mode"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        assert_eq!(
+            std::fs::metadata(published.join("loopback.allow"))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -1931,7 +2845,7 @@ mod tests {
         );
         assert!(
             store
-                .publish_run("codex", &id, &[], &[], Mode::Enforce)
+                .publish_run("codex", &id, &[], &[], &[], Mode::Enforce)
                 .is_err()
         );
         assert_eq!(std::fs::read(store.log()).unwrap(), b"denial stays\n");
@@ -1941,7 +2855,7 @@ mod tests {
         std::fs::remove_file(store.log()).unwrap();
         symlink(&target, store.log()).unwrap();
         let run = store
-            .publish_run("codex", &id, &[], &[], Mode::Enforce)
+            .publish_run("codex", &id, &[], &[], &[], Mode::Enforce)
             .unwrap();
         assert!(
             !std::fs::symlink_metadata(store.log())
@@ -1973,7 +2887,7 @@ mod tests {
         let store = PolicyStore::new(state.path());
         let project = ProjectIdentity::from_path(project_dir.path()).unwrap();
         let run = store
-            .publish_run("codex", &project, &[], &[], Mode::Enforce)
+            .publish_run("codex", &project, &[], &[], &[], Mode::Enforce)
             .unwrap();
         assert_eq!(store.set_active_mode(Mode::Report).unwrap(), 1);
         let active = store.active_runs().unwrap();
@@ -2003,6 +2917,7 @@ mod tests {
                 &ProjectIdentity::from_path(one.path()).unwrap(),
                 &[],
                 &[],
+                &[],
                 Mode::Enforce,
             )
             .unwrap();
@@ -2010,6 +2925,7 @@ mod tests {
             .publish_run(
                 "b",
                 &ProjectIdentity::from_path(two.path()).unwrap(),
+                &[],
                 &[],
                 &[],
                 Mode::Enforce,

@@ -14,14 +14,14 @@ pub(crate) struct Harness {
     pub allow_domains: Vec<String>,
 
     // Persistence — the three home-dir buckets (see persist.rs): a
-    // container-owned state dir, bootstrap-only forwarded credentials, and disposable
+    // container-owned state dir, bootstrap-only seed files, and disposable
     // synced config layered back on top each run.
     pub state_dir: String, // container-home-relative persistent dir, e.g. ".claude"
     pub config_dir_env: String, // env var pointing the agent's config dir at state_dir
     pub host_config: String, // host-home-relative dir to sync/bootstrap FROM
     pub sync_dirs: Vec<String>, // disposable synced subdirs, e.g. skills/commands/agents
     pub sync_files: Vec<String>, // disposable synced files, e.g. settings.json/statusline.sh
-    pub credentials: Vec<String>, // state_dir-relative bootstrap-only files
+    pub seed_files: Vec<SeedFile>, // state_dir-relative bootstrap-only files
 
     /// How the container guide is derived for this harness.
     pub guide: Guide,
@@ -48,6 +48,26 @@ pub(crate) struct Harness {
     pub sessions_dir: String,
 }
 
+/// A host config file to copy into container-owned state only on its first launch.
+#[derive(Clone, Debug)]
+pub(crate) enum SeedFile {
+    Bytes {
+        file: String,
+    },
+    JsonObject {
+        file: String,
+        remove_keys: Vec<String>,
+    },
+}
+
+impl SeedFile {
+    pub(crate) fn file(&self) -> &str {
+        match self {
+            Self::Bytes { file } | Self::JsonObject { file, .. } => file,
+        }
+    }
+}
+
 /// How vhrn derives one harness's container guide. Agents differ on every axis here —
 /// what the file is called, which host globals fold into it, where it lands, and whether
 /// it leads or trails the host's own text — so all four travel together.
@@ -61,6 +81,7 @@ pub(crate) struct Guide {
 
 /// The built-in registry. Adding an agent is an entry here plus a `FROM vhrn-base`
 /// Dockerfile and a CI matrix row — never a branch in the CLI.
+#[allow(clippy::too_many_lines)] // harness specs keep every persistence choice together
 fn registry() -> Vec<Harness> {
     vec![
         Harness {
@@ -80,7 +101,9 @@ fn registry() -> Vec<Harness> {
             host_config: ".claude".into(),
             sync_dirs: vec!["skills".into(), "commands".into(), "agents".into()],
             sync_files: vec!["settings.json".into(), "statusline.sh".into()],
-            credentials: vec![".credentials.json".into()],
+            seed_files: vec![SeedFile::Bytes {
+                file: ".credentials.json".into(),
+            }],
             guide: Guide {
                 file: "CLAUDE.md".into(),
                 sources: vec!["CLAUDE.md".into()],
@@ -113,7 +136,7 @@ fn registry() -> Vec<Harness> {
             sync_files: vec![],
             // Nothing bootstrapped: device-auth logs in inside the container and mints its own
             // token, rather than sharing one rotating token with the host install.
-            credentials: vec![],
+            seed_files: vec![],
             guide: Guide {
                 // Only the first non-empty global file is read, so a user who already has an
                 // override would shadow a guide written anywhere else. Take that slot and fold
@@ -135,6 +158,54 @@ fn registry() -> Vec<Harness> {
             share_history: false,
             sessions_env: "CODEX_SQLITE_HOME".into(),
             sessions_dir: "sessions".into(),
+        },
+        Harness {
+            name: "pi".into(),
+            image: "vhrn-pi".into(),
+            command: "pi".into(),
+            alias: "pi".into(),
+            // Pi has no universal provider domain. The user grants each provider explicitly.
+            allow_domains: vec![],
+            state_dir: ".pi/agent".into(),
+            config_dir_env: "PI_CODING_AGENT_DIR".into(),
+            host_config: ".pi/agent".into(),
+            sync_dirs: vec![
+                "extensions".into(),
+                "skills".into(),
+                "prompts".into(),
+                "themes".into(),
+            ],
+            sync_files: vec![
+                "models.json".into(),
+                "SYSTEM.md".into(),
+                "APPEND_SYSTEM.md".into(),
+            ],
+            seed_files: vec![
+                SeedFile::JsonObject {
+                    file: "settings.json".into(),
+                    remove_keys: vec!["apiKeys".into(), "defaultProjectTrust".into()],
+                },
+                SeedFile::Bytes {
+                    file: "keybindings.json".into(),
+                },
+            ],
+            guide: Guide {
+                file: "AGENTS.override.md".into(),
+                sources: vec![
+                    "AGENTS.override.md".into(),
+                    "AGENTS.md".into(),
+                    "AGENTS.MD".into(),
+                    "CLAUDE.md".into(),
+                    "CLAUDE.MD".into(),
+                ],
+                in_state: false,
+                first: true,
+            },
+            credential_env: vec![],
+            system_config: false,
+            share_history: false,
+            sessions_env: "PI_CODING_AGENT_SESSION_DIR".into(),
+            sessions_dir: String::new(),
         },
     ]
 }
@@ -164,8 +235,8 @@ mod tests {
         assert_eq!(h.config_dir_env, "CLAUDE_CONFIG_DIR");
         assert_eq!(h.state_dir, ".claude");
         assert!(
-            !h.credentials.is_empty(),
-            "claude should bootstrap at least one credentials file"
+            !h.seed_files.is_empty(),
+            "claude should bootstrap at least one seed file"
         );
         assert!(
             lookup_harness("nope").is_none(),
@@ -193,12 +264,46 @@ mod tests {
             ["CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY"]
         );
         assert!(
-            h.credentials.is_empty(),
+            h.seed_files.is_empty(),
             "codex logs in inside the container; nothing is copied from the host"
         );
         // The agent's own skills dir is container state, and the host library rides in on
         // ~/.agents — syncing either would clobber what the agent installed there.
         assert_eq!(h.sync_dirs, ["prompts"]);
+    }
+
+    #[test]
+    fn lookup_harness_pi() {
+        let h = lookup_harness("pi").expect("pi should be a known harness");
+        assert_eq!(
+            (h.image.as_str(), h.command.as_str(), h.alias.as_str()),
+            ("vhrn-pi", "pi", "pi")
+        );
+        assert_eq!(h.state_dir, ".pi/agent");
+        assert_eq!(h.host_config, ".pi/agent");
+        assert_eq!(h.config_dir_env, "PI_CODING_AGENT_DIR");
+        assert_eq!(h.sessions_env, "PI_CODING_AGENT_SESSION_DIR");
+        assert!(h.sessions_dir.is_empty());
+        assert_eq!(h.sync_dirs, ["extensions", "skills", "prompts", "themes"]);
+        assert_eq!(
+            h.sync_files,
+            ["models.json", "SYSTEM.md", "APPEND_SYSTEM.md"]
+        );
+        assert_eq!(h.guide.file, "AGENTS.override.md");
+        assert!(h.guide.first && !h.guide.in_state);
+        assert_eq!(
+            h.guide.sources,
+            [
+                "AGENTS.override.md",
+                "AGENTS.md",
+                "AGENTS.MD",
+                "CLAUDE.md",
+                "CLAUDE.MD"
+            ]
+        );
+        assert!(!h.system_config && !h.share_history);
+        assert!(h.credential_env.is_empty() && h.allow_domains.is_empty());
+        assert_eq!(h.seed_files.len(), 2);
     }
 
     // Every harness has to answer the persistence questions, or the run path silently
@@ -211,13 +316,25 @@ mod tests {
             assert!(!h.host_config.is_empty(), "{n}: no host config dir");
             assert!(!h.guide.file.is_empty(), "{n}: no container guide");
             assert!(!h.guide.sources.is_empty(), "{n}: guide folds in nothing");
-            assert!(!h.allow_domains.is_empty(), "{n}: no egress domains");
-            // A session partition needs both halves: an env var with no transcript dir
-            // would index files that were never bound in.
+            let expected_domains: &[&str] = match n.as_str() {
+                "claude" => &[
+                    "api.anthropic.com",
+                    "claude.ai",
+                    "platform.claude.com",
+                    "statsig.anthropic.com",
+                    "sentry.io",
+                ],
+                "codex" => &["chatgpt.com", "openai.com"],
+                "pi" => &[],
+                _ => panic!("{n}: no domain coverage expectation"),
+            };
             assert_eq!(
-                h.sessions_env.is_empty(),
-                h.sessions_dir.is_empty(),
-                "{n}: half a session partition"
+                h.allow_domains, expected_domains,
+                "{n}: wrong egress domains"
+            );
+            assert!(
+                h.sessions_dir.is_empty() || !h.sessions_env.is_empty(),
+                "{n}: transcript dir without a session env"
             );
         }
     }
@@ -225,7 +342,7 @@ mod tests {
     #[test]
     fn harness_names_sorted() {
         let names = harness_names();
-        assert_eq!(names, ["claude", "codex"]);
+        assert_eq!(names, ["claude", "codex", "pi"]);
         for w in names.windows(2) {
             assert!(w[0] <= w[1], "harness_names not sorted: {names:?}");
         }

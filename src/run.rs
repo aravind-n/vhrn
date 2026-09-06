@@ -1,11 +1,13 @@
 //! The run path — container preparation, engine selection, the proxy sidecar, and the
 //! small host-side path/exec helpers the run and subcommand handlers share.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{Result, bail};
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -16,6 +18,140 @@ use crate::cli::RunFlags;
 use crate::config::{Config, ResourcesConfig};
 use crate::harness::Harness;
 use crate::net::Mode;
+
+/// A container engine frozen for one run. Docker contexts are resolved once so a
+/// concurrent shell/config change cannot send cleanup to another daemon.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunEngine {
+    name: String,
+    docker_host: Option<String>,
+}
+
+impl RunEngine {
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.name);
+        if self.name == "docker" {
+            command.env_remove("DOCKER_CONTEXT");
+            if let Some(host) = &self.docker_host {
+                command.env("DOCKER_HOST", host);
+            }
+        }
+        command
+    }
+}
+
+fn docker_context_endpoint(context: &str) -> Result<String> {
+    let output = Command::new("docker")
+        .args([
+            "context",
+            "inspect",
+            context,
+            "--format",
+            "{{.Endpoints.docker.Host}}",
+        ])
+        .output()?;
+    if !output.status.success() {
+        bail!("could not inspect Docker context {context:?}");
+    }
+    let endpoint = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if endpoint.is_empty() {
+        bail!("Docker context {context:?} has no docker endpoint");
+    }
+    Ok(endpoint)
+}
+
+fn is_colima_endpoint(endpoint: &str, context: &str) -> bool {
+    endpoint.starts_with("unix://")
+        && (endpoint.contains("/.colima/")
+            || context.eq_ignore_ascii_case("colima")
+            || context.to_ascii_lowercase().contains("colima"))
+}
+
+fn resolve_docker_endpoint(
+    context: Option<&str>,
+    docker_host: Option<&str>,
+    shown_context: impl FnOnce() -> Result<String>,
+    inspect_context: impl FnOnce(&str) -> Result<String>,
+) -> Result<String> {
+    let explicit_context = context.filter(|value| !value.is_empty());
+    let (context, endpoint) = if let Some(context) = explicit_context {
+        (context.to_string(), inspect_context(context)?)
+    } else if let Some(host) = docker_host.filter(|value| !value.is_empty()) {
+        (String::new(), host.to_string())
+    } else {
+        let context = shown_context()?;
+        let endpoint = inspect_context(&context)?;
+        (context, endpoint)
+    };
+    if !is_colima_endpoint(&endpoint, &context) {
+        bail!(
+            "Docker must use a local Colima unix socket; remote, Docker Desktop, and unverified endpoints are unsupported for brokered runs"
+        );
+    }
+    Ok(endpoint)
+}
+
+fn resolve_run_engine(engine: &str) -> Result<RunEngine> {
+    if engine != "docker" {
+        return Ok(RunEngine {
+            name: engine.to_string(),
+            docker_host: None,
+        });
+    }
+    let context = std::env::var("DOCKER_CONTEXT").ok();
+    let host = std::env::var("DOCKER_HOST").ok();
+    let endpoint = resolve_docker_endpoint(
+        context.as_deref(),
+        host.as_deref(),
+        || {
+            let output = Command::new("docker").args(["context", "show"]).output()?;
+            if !output.status.success() {
+                bail!("could not determine Docker context");
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        },
+        docker_context_endpoint,
+    )?;
+    Ok(RunEngine {
+        name: "docker".to_string(),
+        docker_host: Some(endpoint),
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BrokerRoute {
+    network: String,
+    bind: SocketAddr,
+    advertised: String,
+}
+
+fn apple_gateway(inspect: &str) -> Option<Ipv4Addr> {
+    let marker = "ipv4Gateway";
+    let start = inspect.find(marker)?;
+    let value = find_dotted_quad(&inspect[start..])?;
+    value.parse().ok()
+}
+
+fn broker_route(
+    engine: &RunEngine,
+    apple_network_inspect: impl FnOnce() -> Result<String>,
+) -> Result<BrokerRoute> {
+    if engine.name == "container" {
+        let gateway = apple_gateway(&apple_network_inspect()?).ok_or_else(|| {
+            anyhow::anyhow!("could not determine Apple container default network gateway")
+        })?;
+        return Ok(BrokerRoute {
+            network: "default".to_string(),
+            bind: SocketAddr::new(IpAddr::V4(gateway), 0),
+            advertised: gateway.to_string(),
+        });
+    }
+    Ok(BrokerRoute {
+        network: "bridge".to_string(),
+        bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        advertised: "host.docker.internal".to_string(),
+    })
+}
 
 /// Reproduce Claude's `projects/<key>` encoding so in-container history unifies with
 /// native history: every character outside `[A-Za-z0-9]` becomes `-`
@@ -134,7 +270,7 @@ pub(crate) fn env_or(key: &str, def: &str) -> String {
 /// policy files live host-side and are mounted only into this sidecar.
 #[derive(Clone)]
 pub(crate) struct Proxy {
-    engine: String,
+    engine: RunEngine,
     name: String,
 }
 
@@ -193,11 +329,20 @@ struct SignalControl {
     agent_cleanup_failed: Mutex<Option<Arc<AtomicBool>>>,
     agent: Mutex<Option<ProxyCleanup>>,
     proxy: Mutex<Option<ProxyCleanup>>,
+    broker: Mutex<Option<CleanupAction>>,
 }
 
 impl SignalControl {
     fn install_proxy(&self, cleanup: ProxyCleanup) {
         *lock_cleanup(&self.proxy) = Some(cleanup);
+    }
+
+    fn install_broker(&self, cleanup: crate::broker::BrokerCleanup) {
+        *self
+            .broker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Arc::new(move || cleanup.run()));
     }
 
     fn finish_agent(&self) {
@@ -212,11 +357,12 @@ impl SignalControl {
 
     fn terminate(&self) {
         self.terminating.store(true, Ordering::Release);
-        if !run_gated_teardown(
+        let confirmed = run_gated_teardown_with_broker(
             &self.teardown,
             &self.client_cleanup,
             &self.agent,
             &self.proxy,
+            &self.broker,
             || {
                 let _ = self.policy.retire();
             },
@@ -225,7 +371,8 @@ impl SignalControl {
                     .take()
                     .is_some_and(|failed| failed.load(Ordering::Acquire))
             },
-        ) {
+        );
+        if !confirmed {
             eprintln!(
                 "vhrn: agent cleanup could not be confirmed; proxy and policy were retired to revoke egress"
             );
@@ -234,7 +381,7 @@ impl SignalControl {
 
     fn create_agent(
         &self,
-        engine: &str,
+        engine: &RunEngine,
         args: &[String],
         cleanup: ProxyCleanup,
         cleanup_failed: Arc<AtomicBool>,
@@ -247,10 +394,7 @@ impl SignalControl {
             cleanup,
             cleanup_failed,
             || {
-                let status = Command::new(engine)
-                    .args(args)
-                    .stdout(Stdio::null())
-                    .status()?;
+                let status = engine.command().args(args).stdout(Stdio::null()).status()?;
                 if status.success() {
                     Ok(())
                 } else {
@@ -260,9 +404,9 @@ impl SignalControl {
         )
     }
 
-    fn start_agent(&self, engine: &str, args: &[String]) -> Result<()> {
+    fn start_agent(&self, engine: &RunEngine, args: &[String]) -> Result<()> {
         begin_agent_attach(&self.teardown, &self.terminating, &self.agent, || {
-            let child = Command::new(engine).args(args).spawn().map_err(|error| {
+            let child = engine.command().args(args).spawn().map_err(|error| {
                 anyhow::anyhow!("could not start and attach agent container: {error}")
             })?;
             *lock_child(&self.agent_client) = Some(child);
@@ -370,11 +514,12 @@ fn lock_teardown(gate: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn run_gated_teardown<F, C>(
+fn run_gated_teardown_with_broker<F, C>(
     gate: &Mutex<()>,
     client: &Mutex<Option<ProxyCleanup>>,
     agent: &Mutex<Option<ProxyCleanup>>,
     proxy: &Mutex<Option<ProxyCleanup>>,
+    broker: &Mutex<Option<CleanupAction>>,
     policy: F,
     confirmed: C,
 ) -> bool
@@ -390,8 +535,35 @@ where
         agent.run();
     }
     let confirmed = confirmed();
-    run_termination(proxy, policy);
+    if let Some(proxy) = lock_cleanup(proxy).take() {
+        proxy.run();
+    }
+    if let Some(broker) = broker
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        broker();
+    }
+    policy();
     confirmed
+}
+
+#[cfg(test)]
+fn run_gated_teardown<F, C>(
+    gate: &Mutex<()>,
+    client: &Mutex<Option<ProxyCleanup>>,
+    agent: &Mutex<Option<ProxyCleanup>>,
+    proxy: &Mutex<Option<ProxyCleanup>>,
+    policy: F,
+    confirmed: C,
+) -> bool
+where
+    F: FnOnce(),
+    C: FnOnce() -> bool,
+{
+    let broker = Mutex::new(None);
+    run_gated_teardown_with_broker(gate, client, agent, proxy, &broker, policy, confirmed)
 }
 
 fn lock_child(
@@ -435,6 +607,7 @@ fn finish_agent_cleanup_locked(slot: &Mutex<Option<ProxyCleanup>>) {
     }
 }
 
+#[cfg(test)]
 fn run_termination<F>(proxy: &Mutex<Option<ProxyCleanup>>, policy: F)
 where
     F: FnOnce(),
@@ -463,6 +636,7 @@ fn install_signal_control(policy: crate::net::PolicyCleanup) -> Result<Arc<Signa
         agent_cleanup_failed: Mutex::new(None),
         agent: Mutex::new(None),
         proxy: Mutex::new(None),
+        broker: Mutex::new(None),
     });
     let signal_control = Arc::clone(&control);
     std::thread::spawn(move || {
@@ -480,8 +654,8 @@ fn agent_name() -> String {
     format!("vhrn-agent-{}", std::process::id())
 }
 
-fn agent_cleanup(engine: &str, name: &str, failed: Arc<AtomicBool>) -> ProxyCleanup {
-    let engine = engine.to_string();
+fn agent_cleanup(engine: &RunEngine, name: &str, failed: Arc<AtomicBool>) -> ProxyCleanup {
+    let engine = engine.clone();
     let name = name.to_string();
     ProxyCleanup::new(Arc::new(move || {
         if let Err(error) = stop_and_confirm_agent(&engine, &name) {
@@ -537,8 +711,9 @@ fn classify_agent_inspect(success: bool, status: Option<i32>, stderr: &[u8]) -> 
     })
 }
 
-fn inspect_agent(engine: &str, name: &str) -> Result<AgentInspect> {
-    let output = Command::new(engine)
+fn inspect_agent(engine: &RunEngine, name: &str) -> Result<AgentInspect> {
+    let output = engine
+        .command()
         .args(["inspect", name])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -550,8 +725,9 @@ fn inspect_agent(engine: &str, name: &str) -> Result<AgentInspect> {
     ))
 }
 
-fn stop_agent(engine: &str, name: &str, command: &str) -> Result<()> {
-    let _ = Command::new(engine)
+fn stop_agent(engine: &RunEngine, name: &str, command: &str) -> Result<()> {
+    let _ = engine
+        .command()
         .args([command, name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -576,9 +752,10 @@ fn remove_status_error(status: Option<i32>, stderr: &[u8]) -> Result<()> {
     }
 }
 
-fn force_remove_agent(engine: &str, name: &str) -> Result<()> {
-    let output = Command::new(engine)
-        .args(agent_force_remove_args(engine, name))
+fn force_remove_agent(engine: &RunEngine, name: &str) -> Result<()> {
+    let output = engine
+        .command()
+        .args(agent_force_remove_args(&engine.name, name))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()?;
@@ -589,7 +766,7 @@ fn force_remove_agent(engine: &str, name: &str) -> Result<()> {
     }
 }
 
-fn stop_and_confirm_agent(engine: &str, name: &str) -> Result<()> {
+fn stop_and_confirm_agent(engine: &RunEngine, name: &str) -> Result<()> {
     stop_agent(engine, name, "stop")?;
     match inspect_agent(engine, name)? {
         AgentInspect::Absent => Ok(()),
@@ -624,14 +801,14 @@ fn stop_and_confirm_agent(engine: &str, name: &str) -> Result<()> {
 
 impl Proxy {
     fn stop(&self) {
-        let _ = Command::new(&self.engine)
-            .args(["stop", &self.name])
-            .status();
+        let _ = self.engine.command().args(["stop", &self.name]).status();
     }
 
     fn inspect_ip(&self) -> String {
-        if self.engine == "docker" {
-            let out = Command::new("docker")
+        if self.engine.name == "docker" {
+            let out = self
+                .engine
+                .command()
                 .args([
                     "inspect",
                     "-f",
@@ -647,10 +824,7 @@ impl Proxy {
             };
         }
         // Apple `container inspect` prints JSON; scan it for the first dotted quad.
-        match Command::new("container")
-            .args(["inspect", &self.name])
-            .output()
-        {
+        match self.engine.command().args(["inspect", &self.name]).output() {
             Ok(o) if o.status.success() => first_ipv4(&String::from_utf8_lossy(&o.stdout)),
             _ => String::new(),
         }
@@ -660,13 +834,18 @@ impl Proxy {
 /// Launch the detached proxy sidecar and resolve its IP (engines differ; retry until
 /// it has one). `policy_dir` is the host-side net policy dir, mounted into the proxy
 /// only — never the container.
+#[allow(clippy::too_many_arguments)] // broker parameters stay explicit at the process boundary
 fn start_proxy(
-    engine: &str,
+    engine: &RunEngine,
     image: &str,
     policy_dir: &Path,
     run_id: &str,
     project_key: &str,
     port: &str,
+    network: &str,
+    token_file: &Path,
+    broker_port: u16,
+    broker_addr: &str,
     control: &SignalControl,
 ) -> Result<(ProxyGuard, String)> {
     start_proxy_with(
@@ -676,17 +855,35 @@ fn start_proxy(
         run_id,
         project_key,
         port,
+        network,
+        token_file,
+        broker_port,
+        broker_addr,
         |cleanup| control.install_proxy(cleanup),
         Proxy::inspect_ip,
     )
 }
 
-fn proxy_args(policy_dir: &Path, run_id: &str, project_key: &str, port: &str) -> Vec<String> {
+#[allow(clippy::too_many_arguments)] // mirrors the sidecar's explicit boundary
+fn proxy_args(
+    policy_dir: &Path,
+    run_id: &str,
+    project_key: &str,
+    port: &str,
+    network: &str,
+    token_file: &Path,
+    broker_port: u16,
+    broker_addr: &str,
+) -> Vec<String> {
     vec![
         "--volume".into(),
         format!("{}:/etc/vhrn:ro", policy_dir.display()),
         "--volume".into(),
         format!("{}:/var/log/vhrn", policy_dir.join("log").display()),
+        "--volume".into(),
+        format!("{}:/etc/vhrn-broker/token:ro", token_file.display()),
+        "--network".into(),
+        network.into(),
         "--env".into(),
         format!(
             "VHRN_ALLOWLISTS=/etc/vhrn/runs/{run_id}/base.allow,/etc/vhrn/runs/{run_id}/harness.allow,/etc/vhrn/allow.local,/etc/vhrn/projects/{project_key}/allow.local,/etc/vhrn/runs/{run_id}/run.allow"
@@ -697,17 +894,29 @@ fn proxy_args(policy_dir: &Path, run_id: &str, project_key: &str, port: &str) ->
         "VHRN_DENY_LOG=/var/log/vhrn/denied.log".into(),
         "--env".into(),
         format!("VHRN_PROXY_LISTEN=:{port}"),
+        "--env".into(),
+        format!("VHRN_BROKER_ADDR={broker_addr}:{broker_port}"),
+        "--env".into(),
+        "VHRN_BROKER_TOKEN_FILE=/etc/vhrn-broker/token".into(),
+        "--env".into(),
+        format!(
+            "VHRN_LOOPBACK_ALLOWLISTS=/etc/vhrn/loopback.allow,/etc/vhrn/projects/{project_key}/loopback.allow,/etc/vhrn/runs/{run_id}/loopback.allow"
+        ),
     ]
 }
 
 #[allow(clippy::too_many_arguments)] // injected lifecycle seams avoid a real engine in tests
 fn start_proxy_with<F, I>(
-    engine: &str,
+    engine: &RunEngine,
     image: &str,
     policy_dir: &Path,
     run_id: &str,
     project_key: &str,
     port: &str,
+    network: &str,
+    token_file: &Path,
+    broker_port: u16,
+    broker_addr: &str,
     publish: F,
     inspect: I,
 ) -> Result<(ProxyGuard, String)>
@@ -716,9 +925,19 @@ where
     I: Fn(&Proxy) -> String,
 {
     let name = format!("vhrn-proxy-{}", std::process::id());
-    let status = Command::new(engine)
+    let status = engine
+        .command()
         .args(["run", "-d", "--rm", "--name", &name])
-        .args(proxy_args(policy_dir, run_id, project_key, port))
+        .args(proxy_args(
+            policy_dir,
+            run_id,
+            project_key,
+            port,
+            network,
+            token_file,
+            broker_port,
+            broker_addr,
+        ))
         .arg(image)
         .stdout(Stdio::null()) // discard the container id; keep our stdout clean
         .stderr(Stdio::inherit())
@@ -727,7 +946,7 @@ where
         bail!("proxy failed to start (is the {image:?} image built?)");
     }
     let proxy = Proxy {
-        engine: engine.to_string(),
+        engine: engine.clone(),
         name: name.clone(),
     };
 
@@ -1061,11 +1280,14 @@ fn container_run_args(
     mode: Mode,
     ip: &str,
     port: &str,
+    network: &str,
 ) -> Vec<String> {
     let proxy_url = format!("http://{ip}:{port}");
     let mut args = vec!["run".to_string(), "-it".into(), "--rm".into()];
     args.extend(resource_args(&cfg.engine, &cfg.config.resources));
     args.extend([
+        "--network".into(),
+        network.into(),
         "--cap-add".into(),
         "CAP_NET_ADMIN".into(),
         "--env".into(),
@@ -1152,6 +1374,7 @@ fn resource_args(engine: &str, resources: &ResourcesConfig) -> Vec<String> {
 /// Publish the egress policy, start the proxy sidecar, then run the jailed container with all
 /// egress pinned to the proxy. The container run inherits the terminal; its exit status is
 /// returned verbatim as the process exit code.
+#[allow(clippy::too_many_lines)] // lifecycle ordering is clearer in one linear run path
 fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
     let port = env_or("VHRN_PROXY_PORT", "8080");
     let mode = if f.open_net {
@@ -1164,11 +1387,13 @@ fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing canonical project identity"))?;
     let store = crate::net::PolicyStore::new(&cfg.policy_state);
+    let local_allow: Vec<_> = f.extra_local.iter().map(ToString::to_string).collect();
     let policy_run = store.publish_run(
         &cfg.harness.name,
         &project,
         &cfg.harness.allow_domains,
         &f.extra_allow,
+        &local_allow,
         mode,
     )?;
     let signal_control = install_signal_control(policy_run.cleanup_handle())?;
@@ -1215,6 +1440,34 @@ fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
         )?;
     }
 
+    let engine = resolve_run_engine(&cfg.engine)?;
+    let route = broker_route(&engine, || {
+        let output = engine
+            .command()
+            .args(["network", "inspect", "default"])
+            .output()?;
+        if !output.status.success() {
+            bail!("could not inspect Apple container default network");
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    })?;
+    let broker = {
+        let _gate = lock_teardown(&signal_control.teardown);
+        if signal_control.terminating.load(Ordering::Acquire) {
+            bail!("termination requested before broker startup");
+        }
+        let broker = crate::broker::Broker::bind(
+            route.bind,
+            &policy_dir,
+            project.clone(),
+            run_id.clone(),
+            &vhrn_cache(&home_dir()?),
+        )?;
+        signal_control.install_broker(broker.cleanup_handle());
+        broker.start_accepting()?;
+        broker
+    };
+
     let proxy_image = env_or(
         "VHRN_PROXY_IMAGE",
         &crate::image::proxy_image_ref(
@@ -1222,15 +1475,26 @@ fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
             &crate::image::proxy_tag(crate::cli::version(), &cfg.version),
         ),
     );
-    let (_proxy, ip) = start_proxy(
-        &cfg.engine,
-        &proxy_image,
-        &policy_dir,
-        &run_id,
-        project.key(),
-        &port,
-        &signal_control,
-    )?;
+    let (_proxy, ip) = {
+        let _gate = lock_teardown(&signal_control.teardown);
+        if signal_control.terminating.load(Ordering::Acquire) {
+            bail!("termination requested before proxy startup");
+        }
+        start_proxy(
+            &engine,
+            &proxy_image,
+            &policy_dir,
+            &run_id,
+            project.key(),
+            &port,
+            &route.network,
+            &broker.token_file(),
+            broker.address().port(),
+            &route.advertised,
+            &signal_control,
+        )?
+    };
+    broker.wait_ready(Instant::now() + Duration::from_secs(10))?;
 
     // Security banner for --open-net: a direct stderr write, not a tracing event, so
     // no RUST_LOG level can silence the token-exposure caution.
@@ -1250,14 +1514,16 @@ fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
     }
 
     let name = agent_name();
-    let run_args = container_run_args(&cfg, f, mode, &ip, &port);
+    let run_args = container_run_args(&cfg, f, mode, &ip, &port, &route.network);
     let create_args = agent_create_args(&run_args, &name);
     let attach_args = agent_start_args(&name);
     let agent_cleanup_failed = Arc::new(AtomicBool::new(false));
-    let agent = agent_cleanup(&cfg.engine, &name, Arc::clone(&agent_cleanup_failed));
-    signal_control.create_agent(&cfg.engine, &create_args, agent, agent_cleanup_failed)?;
-    signal_control.start_agent(&cfg.engine, &attach_args)?;
-    let status = signal_control.wait_agent();
+    let agent = agent_cleanup(&engine, &name, Arc::clone(&agent_cleanup_failed));
+    let status = (|| -> Result<std::process::ExitStatus> {
+        signal_control.create_agent(&engine, &create_args, agent, agent_cleanup_failed)?;
+        signal_control.start_agent(&engine, &attach_args)?;
+        signal_control.wait_agent()
+    })();
     signal_control.finish_agent();
     let status = status?;
     Ok(status.code().unwrap_or(1))
@@ -1361,20 +1627,88 @@ mod tests {
     }
 
     #[test]
+    fn docker_endpoint_precedence_and_frozen_command_env() {
+        let endpoint = resolve_docker_endpoint(
+            Some("colima"),
+            Some("unix:///ignored.sock"),
+            || panic!("explicit context must win"),
+            |context| {
+                assert_eq!(context, "colima");
+                Ok("unix:///Users/u/.colima/default/docker.sock".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(endpoint, "unix:///Users/u/.colima/default/docker.sock");
+        assert!(
+            resolve_docker_endpoint(
+                None,
+                Some("unix:///var/run/docker.sock"),
+                || panic!("DOCKER_HOST must win over context show"),
+                |_| unreachable!(),
+            )
+            .is_err()
+        );
+
+        let engine = RunEngine {
+            name: "docker".into(),
+            docker_host: Some(endpoint),
+        };
+        let command = engine.command();
+        let envs: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs.get("DOCKER_HOST"),
+            Some(&Some("unix:///Users/u/.colima/default/docker.sock".into()))
+        );
+        assert_eq!(envs.get("DOCKER_CONTEXT"), Some(&None));
+    }
+
+    #[test]
+    fn apple_gateway_route_uses_the_default_network_gateway() {
+        let engine = RunEngine {
+            name: "container".into(),
+            docker_host: None,
+        };
+        let route = broker_route(&engine, || {
+            Ok(r#"[{"status":{"ipv4Gateway":"192.168.64.1"}}]"#.into())
+        })
+        .unwrap();
+        assert_eq!(route.network, "default");
+        assert_eq!(route.bind.to_string(), "192.168.64.1:0");
+        assert_eq!(route.advertised, "192.168.64.1");
+    }
+
+    #[test]
     fn proxy_args_mount_the_policy_layers_without_leaking_host_paths() {
         let args = proxy_args(
             Path::new("/state,with-comma/net"),
             "12-34",
             "project-key",
             "8080",
+            "bridge",
+            Path::new("/secret/token"),
+            9123,
+            "host.docker.internal",
         );
         let want = vec![
                 "--volume", "/state,with-comma/net:/etc/vhrn:ro",
                 "--volume", "/state,with-comma/net/log:/var/log/vhrn",
+                "--volume", "/secret/token:/etc/vhrn-broker/token:ro",
+                "--network", "bridge",
                 "--env", "VHRN_ALLOWLISTS=/etc/vhrn/runs/12-34/base.allow,/etc/vhrn/runs/12-34/harness.allow,/etc/vhrn/allow.local,/etc/vhrn/projects/project-key/allow.local,/etc/vhrn/runs/12-34/run.allow",
                 "--env", "VHRN_MODE_FILE=/etc/vhrn/runs/12-34/mode",
                 "--env", "VHRN_DENY_LOG=/var/log/vhrn/denied.log",
                 "--env", "VHRN_PROXY_LISTEN=:8080",
+                "--env", "VHRN_BROKER_ADDR=host.docker.internal:9123",
+                "--env", "VHRN_BROKER_TOKEN_FILE=/etc/vhrn-broker/token",
+                "--env", "VHRN_LOOPBACK_ALLOWLISTS=/etc/vhrn/loopback.allow,/etc/vhrn/projects/project-key/loopback.allow,/etc/vhrn/runs/12-34/loopback.allow",
             ].into_iter().map(str::to_string).collect::<Vec<_>>();
         assert_eq!(args, want);
         assert!(
@@ -1475,27 +1809,39 @@ mod tests {
     }
 
     #[test]
-    fn sigterm_stops_agent_before_proxy_and_policy() {
+    fn sigterm_stops_client_agent_proxy_broker_then_policy() {
         let order = Arc::new(Mutex::new(Vec::new()));
+        let client_order = Arc::clone(&order);
+        let client = ProxyCleanup::new(Arc::new(move || {
+            client_order.lock().unwrap().push("client");
+        }));
         let agent_order = Arc::clone(&order);
         let agent = ProxyCleanup::new(Arc::new(move || agent_order.lock().unwrap().push("agent")));
         let proxy_order = Arc::clone(&order);
         let proxy = ProxyCleanup::new(Arc::new(move || proxy_order.lock().unwrap().push("proxy")));
         let policy_order = Arc::clone(&order);
         let gate = Mutex::new(());
-        let clients = Mutex::new(None);
+        let clients = Mutex::new(Some(client));
         let agents = Mutex::new(Some(agent));
         let proxies = Mutex::new(Some(proxy));
-        run_gated_teardown(
+        let broker_order = Arc::clone(&order);
+        let broker: Mutex<Option<CleanupAction>> = Mutex::new(Some(Arc::new(move || {
+            broker_order.lock().unwrap().push("broker");
+        })));
+        run_gated_teardown_with_broker(
             &gate,
             &clients,
             &agents,
             &proxies,
+            &broker,
             move || policy_order.lock().unwrap().push("policy"),
             || true,
         );
-        run_gated_teardown(&gate, &clients, &agents, &proxies, || {}, || true);
-        assert_eq!(*order.lock().unwrap(), ["agent", "proxy", "policy"]);
+        run_gated_teardown_with_broker(&gate, &clients, &agents, &proxies, &broker, || {}, || true);
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["client", "agent", "proxy", "broker", "policy"]
+        );
     }
 
     #[test]
@@ -1966,7 +2312,10 @@ mod tests {
         ProxyGuard {
             cleanup,
             proxy: Proxy {
-                engine: "unused".into(),
+                engine: RunEngine {
+                    name: "unused".into(),
+                    docker_host: None,
+                },
                 name: "unused".into(),
             },
         }
@@ -2410,6 +2759,28 @@ mod tests {
     }
 
     #[test]
+    fn env_only_sessions_need_no_nested_remount() {
+        let store = crate::testutil::temp_dir();
+        let (mut cfg, _dir) = fixture_with_sandbox();
+        cfg.harness.share_history = false;
+        cfg.harness.state_dir = ".pi/agent".into();
+        cfg.harness.sessions_env = "PI_CODING_AGENT_SESSION_DIR".into();
+        cfg.harness.sessions_dir = String::new();
+        cfg.sessions = store.path().to_string_lossy().into_owned();
+
+        assert_eq!(
+            cfg.sessions_mount(),
+            vec![
+                "--volume".to_string(),
+                format!("{}:/home/dev/.pi/agent-sessions", store.path().display()),
+                "--env".to_string(),
+                "PI_CODING_AGENT_SESSION_DIR=/home/dev/.pi/agent-sessions".to_string(),
+            ]
+        );
+        assert!(!cfg.nested_mounts().join(" ").contains("agent/sessions"));
+    }
+
+    #[test]
     fn prepare_sessions_is_keyed_and_opt_in() {
         let cache = crate::testutil::temp_dir();
         let h = Harness {
@@ -2469,10 +2840,11 @@ mod tests {
         let f = RunFlags {
             open_net: false,
             extra_allow: vec![],
+            extra_local: vec![],
             rest: vec!["--model".into(), "gpt-5".into()],
         };
 
-        let args = container_run_args(&cfg, &f, Mode::Enforce, "10.0.0.2", "8080");
+        let args = container_run_args(&cfg, &f, Mode::Enforce, "10.0.0.2", "8080", "bridge");
         let pos = |needle: &str| args.iter().position(|a| a == needle).expect(needle);
         assert!(pos("GH_TOKEN=tok") < pos("OPENAI_API_KEY=sk-x"));
         assert!(pos("OPENAI_API_KEY=sk-x") < pos("vhrn-claude:latest"));
@@ -2485,6 +2857,7 @@ mod tests {
         let f = RunFlags {
             open_net: false,
             extra_allow: vec![],
+            extra_local: vec![],
             rest: vec![
                 "--memory".into(),
                 "agent-memory".into(),
@@ -2493,7 +2866,7 @@ mod tests {
             ],
         };
 
-        let args = container_run_args(&cfg, &f, Mode::Enforce, "10.0.0.2", "8080");
+        let args = container_run_args(&cfg, &f, Mode::Enforce, "10.0.0.2", "8080", "bridge");
         let image = args
             .iter()
             .position(|arg| arg == "vhrn-claude:latest")
@@ -2522,6 +2895,7 @@ mod tests {
                 Mode::Enforce,
                 "10.0.0.2",
                 "8080",
+                "bridge",
             );
             let create = agent_create_args(&run, "vhrn-agent-test");
             assert_eq!(create[0], "create", "{engine}");
@@ -2570,6 +2944,7 @@ mod tests {
             Mode::Enforce,
             "10.0.0.2",
             "8080",
+            "bridge",
         );
         let joined = args.join(" ");
 
@@ -2615,15 +2990,108 @@ mod tests {
     }
 
     #[test]
+    fn container_run_args_pi_golden() {
+        let dir = crate::testutil::temp_dir();
+        let sandbox = dir.path().join("sandbox");
+        let sessions = dir.path().join("sessions");
+        for path in ["extensions", "skills", "prompts", "themes", AGENTS_DIR] {
+            std::fs::create_dir_all(sandbox.join(path)).unwrap();
+        }
+        for file in [
+            "models.json",
+            "SYSTEM.md",
+            "APPEND_SYSTEM.md",
+            "AGENTS.override.md",
+        ] {
+            std::fs::write(sandbox.join(file), "host input").unwrap();
+        }
+
+        let h = crate::harness::lookup_harness("pi").unwrap();
+        let cfg = ContainerConfig {
+            engine: "container".into(),
+            image: "vhrn-pi:latest".into(),
+            project: "/proj".into(),
+            key: "-proj".into(),
+            state: "/state".into(),
+            sandbox: sandbox.to_string_lossy().into_owned(),
+            sessions: sessions.to_string_lossy().into_owned(),
+            config_dir: format!("{CONTAINER_HOME}/{}", h.state_dir),
+            harness: h,
+            ..Default::default()
+        };
+        let args = container_run_args(
+            &cfg,
+            &RunFlags {
+                rest: vec!["Fix the parser".into()],
+                ..Default::default()
+            },
+            Mode::Enforce,
+            "10.0.0.2",
+            "8080",
+            "bridge",
+        );
+        let joined = args.join(" ");
+
+        for want in [
+            "PI_CODING_AGENT_DIR=/home/dev/.pi/agent".to_string(),
+            "/state:/home/dev/.pi/agent".to_string(),
+            format!("{}:/home/dev/.pi/agent-sessions", sessions.display()),
+            "PI_CODING_AGENT_SESSION_DIR=/home/dev/.pi/agent-sessions".to_string(),
+            format!("{}:/home/dev/.agents", sandbox.join(AGENTS_DIR).display()),
+            format!(
+                "{}:/home/dev/.pi/agent/AGENTS.override.md",
+                sandbox.join("AGENTS.override.md").display()
+            ),
+        ] {
+            assert!(joined.contains(&want), "missing {want:?} in {args:?}");
+        }
+        for path in ["extensions", "skills", "prompts", "themes"] {
+            let want = format!(
+                "{}:/home/dev/.pi/agent/{path}",
+                sandbox.join(path).display()
+            );
+            assert!(joined.contains(&want), "missing {want:?} in {args:?}");
+        }
+        for file in ["models.json", "SYSTEM.md", "APPEND_SYSTEM.md"] {
+            let want = format!(
+                "{}:/home/dev/.pi/agent/{file}",
+                sandbox.join(file).display()
+            );
+            assert!(joined.contains(&want), "missing {want:?} in {args:?}");
+        }
+        for absent in [
+            "/home/dev/.pi/agent/auth.json",
+            "/home/dev/.pi/agent/trust.json",
+            "/home/dev/.pi/agent/oauth.json",
+            "/home/dev/.pi/agent/models-store.json",
+            "/home/dev/.pi/agent/settings.json",
+            "/home/dev/.pi/agent/keybindings.json",
+            "/home/dev/.pi/agent/projects",
+            "/home/dev/.pi/agent/sessions",
+            "/etc/pi",
+            "VHRN_BROKER",
+            "VHRN_ALLOWLIST",
+            "VHRN_MODE_FILE",
+        ] {
+            assert!(
+                !joined.contains(absent),
+                "unexpected {absent:?} in {args:?}"
+            );
+        }
+        assert_eq!(&args[args.len() - 2..], ["pi", "Fix the parser"]);
+    }
+
+    #[test]
     fn container_run_args_golden() {
         let (cfg, sandbox) = golden_fixture();
         let f = RunFlags {
             open_net: false,
             extra_allow: vec![],
+            extra_local: vec![],
             rest: vec!["--model".into(), "opus".into()],
         };
 
-        let args = container_run_args(&cfg, &f, Mode::Enforce, "10.0.0.2", "8080");
+        let args = container_run_args(&cfg, &f, Mode::Enforce, "10.0.0.2", "8080", "bridge");
 
         let skills = format!(
             "{}:/home/dev/.claude/skills",
@@ -2647,6 +3115,8 @@ mod tests {
             "--rm",
             "--memory",
             "4g",
+            "--network",
+            "bridge",
             "--cap-add",
             "CAP_NET_ADMIN",
             "--env",

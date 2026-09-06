@@ -25,6 +25,11 @@ CODEX_IMAGE ?= vhrn-codex
 CODEX_REF   := $(CODEX_IMAGE):$(TAG)
 CODEX_DIR   ?= codex
 
+# The pi harness image (FROM vhrn-base + Pi coding agent).
+PI_IMAGE ?= vhrn-pi
+PI_REF   := $(PI_IMAGE):$(TAG)
+PI_DIR   ?= pi
+
 # Match the container user to your host UID/GID (native Linux Docker only). Applied
 # to the base build, where the dev user is created.
 BUILD_ARGS :=
@@ -41,10 +46,10 @@ RM_IMAGE := $(ENGINE) image delete
 endif
 
 .DEFAULT_GOAL := build
-.PHONY: build build-base build-claude build-codex clean
+.PHONY: build build-base build-claude build-codex build-pi clean
 
 # Build the base image and its harnesses (the proxy image builds separately).
-build: build-base build-claude build-codex
+build: build-base build-claude build-codex build-pi
 
 build-base:
 	$(ENGINE) build $(BUILD_ARGS) --tag $(BASE_REF) --file $(BASE_DIR)/Dockerfile $(BASE_DIR)
@@ -56,7 +61,11 @@ build-claude: build-base
 build-codex: build-base
 	$(ENGINE) build --build-arg BASE=$(BASE_REF) --tag $(CODEX_REF) --file $(CODEX_DIR)/Dockerfile $(CODEX_DIR)
 
+build-pi: build-base
+	$(ENGINE) build --build-arg BASE=$(BASE_REF) --tag $(PI_REF) --file $(PI_DIR)/Dockerfile $(PI_DIR)
+
 clean:
 	-$(RM_IMAGE) $(CLAUDE_REF)
 	-$(RM_IMAGE) $(CODEX_REF)
+	-$(RM_IMAGE) $(PI_REF)
 	-$(RM_IMAGE) $(BASE_REF)

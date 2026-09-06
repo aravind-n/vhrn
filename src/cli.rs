@@ -20,10 +20,13 @@ Usage:
 Harnesses:
   claude                   Claude Code
   codex                    OpenAI Codex
+  pi                       Pi Coding Agent
 
 Run flags (after the harness name, before the agent's own flags):
-  --open-net               drop the egress guard for this run (all egress)
+  --open-net               drop the public egress guard for this run
   --allow <domain>...      add allowlist domains (comma-separated or repeated)
+  --allow --local <host:port[,host:port...]>
+                           allow host loopback endpoints for this run
   --                       stop reading flags; forward the rest to the agent
 
 After `vhrn install claude` a shell alias lets you run `claude` directly; `command claude`
@@ -33,13 +36,15 @@ or `\claude` still reaches the real binary. Examples:
   vhrn claude -- --help            # the agent's own help, not this one
 
 net subcommands:
-  net status [--domains]   show persistent and active policy
+  net status [--domains] [--local]  show persistent and active policy
   net allow [--project <path>] <domain>... add persistent domains
   net deny [--project <path>] <domain>...  remove persistent domains
+  net allow [--project <path>] --local <host:port>... add local endpoints
+  net deny [--project <path>] --local <host:port>...  remove local endpoints
   net denied               domains blocked this session
-  net open                 drop the guard (allow everything)
+  net open                 allow all public egress for active runs
   net guard                re-enable enforcement
-  net report               allow everything, but log what would be denied
+  net report               allow public egress, but log what would be denied
 
 Environment:
   VHRN_ENGINE        container engine (default: container, then docker)
@@ -518,6 +523,7 @@ fn run_uninstall(args: &[String]) -> i32 {
 pub(crate) struct RunFlags {
     pub open_net: bool,           // --open-net: drop the egress guard this run
     pub extra_allow: Vec<String>, // --allow: session additions to the allowlist
+    pub extra_local: Vec<crate::net::LoopbackAuthority>, // --allow --local: host loopback
     pub rest: Vec<String>,        // everything forwarded to the agent verbatim
 }
 
@@ -537,7 +543,18 @@ fn parse_run_flags(args: &[String]) -> Result<RunFlags> {
             let Some(v) = args.get(i) else {
                 bail!("--allow needs a domain");
             };
-            f.extra_allow.extend(parse_domains(v)?);
+            if v == "--local" {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    bail!("--allow --local needs a host:port");
+                };
+                if v.is_empty() || v.starts_with('-') {
+                    bail!("--allow --local needs a host:port");
+                }
+                f.extra_local.extend(parse_local_authorities(v)?);
+            } else {
+                f.extra_allow.extend(parse_domains(v)?);
+            }
             i += 1;
         } else if let Some(v) = a.strip_prefix("--allow=") {
             f.extra_allow.extend(parse_domains(v)?);
@@ -561,7 +578,31 @@ fn finalize_run_flags(mut flags: RunFlags) -> RunFlags {
         }
     }
     flags.extra_allow = unique;
+    let mut unique_local = Vec::new();
+    for authority in flags.extra_local {
+        if !unique_local.contains(&authority) {
+            unique_local.push(authority);
+        }
+    }
+    flags.extra_local = unique_local;
     flags
+}
+
+fn parse_local_authorities(s: &str) -> Result<Vec<crate::net::LoopbackAuthority>> {
+    if s.is_empty() {
+        bail!("--allow --local needs a host:port");
+    }
+    let mut authorities = Vec::new();
+    for value in s.split(',') {
+        if value.is_empty() {
+            bail!("--allow --local contains an empty host:port");
+        }
+        let authority = crate::net::LoopbackAuthority::parse(value).map_err(anyhow::Error::msg)?;
+        if !authorities.contains(&authority) {
+            authorities.push(authority);
+        }
+    }
+    Ok(authorities)
 }
 
 /// Normalize comma-separated wrapper additions before the run is published.
@@ -595,6 +636,16 @@ mod tests {
     fn run_prints_usage_and_succeeds() {
         assert_eq!(run(&[]), 0);
         assert_eq!(run(&["help".to_string()]), 0);
+    }
+
+    #[test]
+    fn usage_lists_every_builtin_harness() {
+        for name in ["claude", "codex", "pi"] {
+            assert!(
+                USAGE.contains(&format!("  {name}")),
+                "missing {name} from help"
+            );
+        }
     }
 
     #[test]
@@ -749,21 +800,33 @@ mod tests {
             args: &'a [&'a str],
             open_net: bool,
             allow: &'a [&'a str],
+            local: &'a [&'a str],
             rest: &'a [&'a str],
             want_err: bool,
         }
         // Keep the case table aligned one-per-row; rustfmt would explode each into 8 lines.
         #[rustfmt::skip]
         let cases = [
-            Case { name: "empty", args: &[], open_net: false, allow: &[], rest: &[], want_err: false },
-            Case { name: "agent flags pass through", args: &["--model", "opus"], open_net: false, allow: &[], rest: &["--model", "opus"], want_err: false },
-            Case { name: "open-net then dashdash", args: &["--open-net", "--", "--help"], open_net: true, allow: &[], rest: &["--help"], want_err: false },
-            Case { name: "allow comma list", args: &["--allow", "a.com,b.com", "arg"], open_net: false, allow: &["a.com", "b.com"], rest: &["arg"], want_err: false },
-            Case { name: "allow equals form", args: &["--allow=x.com"], open_net: false, allow: &["x.com"], rest: &[], want_err: false },
-            Case { name: "repeated allow", args: &["--allow", "a.com", "--allow", "b.com"], open_net: false, allow: &["a.com", "b.com"], rest: &[], want_err: false },
-            Case { name: "allow missing value", args: &["--allow"], open_net: false, allow: &[], rest: &[], want_err: true },
-            Case { name: "bare dashdash", args: &["--"], open_net: false, allow: &[], rest: &[], want_err: false },
-            Case { name: "first unknown stops parsing", args: &["positional", "--open-net"], open_net: false, allow: &[], rest: &["positional", "--open-net"], want_err: false },
+            Case { name: "empty", args: &[], open_net: false, allow: &[], local: &[], rest: &[], want_err: false },
+            Case { name: "agent flags pass through", args: &["--model", "opus"], open_net: false, allow: &[], local: &[], rest: &["--model", "opus"], want_err: false },
+            Case { name: "open-net then dashdash", args: &["--open-net", "--", "--help"], open_net: true, allow: &[], local: &[], rest: &["--help"], want_err: false },
+            Case { name: "allow comma list", args: &["--allow", "a.com,b.com", "arg"], open_net: false, allow: &["a.com", "b.com"], local: &[], rest: &["arg"], want_err: false },
+            Case { name: "allow equals form", args: &["--allow=x.com"], open_net: false, allow: &["x.com"], local: &[], rest: &[], want_err: false },
+            Case { name: "repeated allow", args: &["--allow", "a.com", "--allow", "b.com"], open_net: false, allow: &["a.com", "b.com"], local: &[], rest: &[], want_err: false },
+            Case { name: "local comma list", args: &["--allow", "--local", "LOCALHOST:00123,[::1]:443", "--allow", "--local", "127.0.0.1:80"], open_net: false, allow: &[], local: &["localhost:123", "[::1]:443", "127.0.0.1:80"], rest: &[], want_err: false },
+            Case { name: "mixed domain and local grants", args: &["--allow", "a.example", "--allow", "--local", "localhost:1234"], open_net: false, allow: &["a.example"], local: &["localhost:1234"], rest: &[], want_err: false },
+            Case { name: "pi local grant then prompt passes through", args: &["--allow", "--local", "localhost:1234", "Fix the parser"], open_net: false, allow: &[], local: &["localhost:1234"], rest: &["Fix the parser"], want_err: false },
+            Case { name: "normalized local grants deduplicate", args: &["--allow", "--local", "LOCALHOST:00123,localhost:123", "--allow", "--local", "localhost:123"], open_net: false, allow: &[], local: &["localhost:123"], rest: &[], want_err: false },
+            Case { name: "localhost positional stops parsing", args: &["localhost:1234", "--allow", "--local", "127.0.0.1:80"], open_net: false, allow: &[], local: &[], rest: &["localhost:1234", "--allow", "--local", "127.0.0.1:80"], want_err: false },
+            Case { name: "dashdash forwards local flag", args: &["--", "--allow", "--local", "localhost:1234"], open_net: false, allow: &[], local: &[], rest: &["--allow", "--local", "localhost:1234"], want_err: false },
+            Case { name: "local empty comma", args: &["--allow", "--local", "localhost:1234,"], open_net: false, allow: &[], local: &[], rest: &[], want_err: true },
+            Case { name: "local empty value", args: &["--allow", "--local", ""], open_net: false, allow: &[], local: &[], rest: &[], want_err: true },
+            Case { name: "bare local forwards", args: &["--local", "localhost:1234"], open_net: false, allow: &[], local: &[], rest: &["--local", "localhost:1234"], want_err: false },
+            Case { name: "allow local missing value", args: &["--allow", "--local"], open_net: false, allow: &[], local: &[], rest: &[], want_err: true },
+            Case { name: "allow local flag value", args: &["--allow", "--local", "--model"], open_net: false, allow: &[], local: &[], rest: &[], want_err: true },
+            Case { name: "allow missing value", args: &["--allow"], open_net: false, allow: &[], local: &[], rest: &[], want_err: true },
+            Case { name: "bare dashdash", args: &["--"], open_net: false, allow: &[], local: &[], rest: &[], want_err: false },
+            Case { name: "first unknown stops parsing", args: &["positional", "--open-net"], open_net: false, allow: &[], local: &[], rest: &["positional", "--open-net"], want_err: false },
         ];
         for c in cases {
             let args = v(c.args);
@@ -773,6 +836,15 @@ mod tests {
                     assert!(!c.want_err, "{}: expected error", c.name);
                     assert_eq!(f.open_net, c.open_net, "{}: open_net", c.name);
                     assert_eq!(f.extra_allow, v(c.allow), "{}: extra_allow", c.name);
+                    assert_eq!(
+                        f.extra_local
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>(),
+                        v(c.local),
+                        "{}: extra_local",
+                        c.name
+                    );
                     assert_eq!(f.rest, v(c.rest), "{}: rest", c.name);
                 }
             }
