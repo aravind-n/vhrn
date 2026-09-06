@@ -21,7 +21,7 @@ A small monorepo with three independently-built parts plus packaging:
   image) enforcing the domain allowlist. Its own stdlib-only module (no third-party deps,
   no `go.sum`), published as `vhrn-proxy`.
 - **`image/`** — the container image recipes: `image/base/` (`Dockerfile` + `entrypoint.sh`)
-  is the shared `vhrn-base`; `image/<harness>/` (`image/claude/`, `image/codex/`) is a thin
+  is the shared `vhrn-base`; `image/<harness>/` (`image/claude/`, `image/codex/`, `image/pi/`) is a thin
   `FROM vhrn-base` plus the agent binary.
 - **`pages/`** — the `curl | sh` installer and landing page, served over GitHub Pages.
   **`.github/workflows/`** — the CI/CD pipeline. **`docs/`** — release docs.
@@ -29,8 +29,9 @@ A small monorepo with three independently-built parts plus packaging:
 Core behavioral invariants — keep these intact:
 
 - **The wrapper is a thin pass-through.** `vhrn <harness> [wrapper-flags] [--] [agent args]`
-  consumes only its own flags (`--open-net`/`--allow`), then forwards the rest to the agent
-  verbatim. Don't bake agent flags in. Bare `vhrn` prints help.
+  consumes only its own flags (`--open-net`, `--allow`, and `--allow --local <authorities>`),
+  then forwards the rest to the agent verbatim. Don't bake agent flags in. Bare `vhrn` prints
+  help.
 - **Harnesses are data, not forks.** `src/harness.rs` holds the registry; a `Harness` spec
   carries the image name, in-container command, alias, default egress domains, and the
   persistence descriptors. Dispatch, install, run, and persistence all read from it. Adding
@@ -50,10 +51,10 @@ Core behavioral invariants — keep these intact:
   ephemeral — do not add cache mounts.
 - **Login/state persists via a container-owned store, not the disposable copy.**
   `~/.cache/vhrn/state/<harness>/` is mounted as the harness's config dir
-  (`CLAUDE_CONFIG_DIR` for claude). Host credentials are copied in **only when the store is
-  empty** (bootstrap-only — an in-container login is never overwritten). Nothing else in the
-  store is ever written by vhrn: onboarding and per-project trust belong to the agent, so the
-  answer given in the container is the one that persists — **do not reintroduce seeding of
+  (`CLAUDE_CONFIG_DIR` for claude). Host credentials are copied in **only when the corresponding
+  destination file is absent** (bootstrap-only — an in-container login is never overwritten).
+  Nothing else in the store is ever written by vhrn: onboarding and per-project trust belong to
+  the agent, so the answer given in the container is the one that persists — **do not reintroduce seeding of
   `hasTrustDialogAccepted`**, which made untrusting a project impossible and handed a repo's
   own `.claude/skills` their `allowed-tools` grants unasked. The disposable synced config, the
   container guide, and the `projects/<key>` history layer on top as **nested** mounts, so the
@@ -74,18 +75,31 @@ Core behavioral invariants — keep these intact:
 - **Persistence descriptors are per-harness, not universal.** `guide` (filename, host sources
   first-non-empty-wins, state-dir vs sandbox, before-or-after the host's text),
   `system_config`, `share_history`, `sessions_env`/`sessions_dir`, and `credential_env` all
-  differ between claude and codex — none of them is a default that happens to suit one agent.
+  differ between claude, codex, and pi — none of them is a default that happens to suit one agent.
   The container guide is the *only* file vhrn derives into a state dir.
+- **Pi's state is selectively seeded and mirrored.** Its state/config dir is `.pi/agent` through
+  `PI_CODING_AGENT_DIR`. `settings.json` is seeded once after filtering `apiKeys` and
+  `defaultProjectTrust`; `keybindings.json` is seeded once so Pi owns its migration. These are
+  generic `SeedFile` descriptors, never credentials. Pi mirrors its user inputs
+  (`models.json`, `SYSTEM.md`, `APPEND_SYSTEM.md`, extensions, skills, prompts, and themes) each
+  run. It never imports host `auth.json` or `trust.json`; Pi-owned package/catalog state persists
+  in its store.
+  Its guide is the first non-empty `AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`,
+  or `CLAUDE.MD` source, composed into `AGENTS.override.md`.
 - **Sessions are partitioned per project where an agent keeps one flat tree.** Codex's
   `CODEX_SQLITE_HOME` points at `state/<harness>-sessions/<key>`, a sibling of the shared
   state dir, and the transcript subdir inside it is bound back under the config dir so the
   index and the files it names cannot land in different partitions. Login and config stay
   shared; the databases that follow that variable carry memories and goals too, so those are
   per-project — a documented delta, not an accident.
+- **Pi sessions are env-directed per project.** `PI_CODING_AGENT_SESSION_DIR` points at the
+  sibling project session store; Pi's own `--session-dir` remains an agent argument and overrides
+  that default.
 - **The disposable config copy (`~/.cache/vhrn/sandbox/<harness>`) is re-synced from the
   harness config dir every run** (`rsync -aL --delete`, `cp -RL` fallback), so edits there are
-  wiped — change `~/.claude` / `~/.codex` instead. Deleting the host source removes the copy too, so config the
-  user deleted is never mounted again. It is physically separate from `state/`, and
+  wiped — change `~/.claude` / `~/.codex` instead. Pi uses selected mirror paths under
+  `~/.pi/agent`. Deleting the host source removes the copy too, so config the user deleted is
+  never mounted again. It is physically separate from `state/`, and
   per-harness so one harness's `--delete` never runs on a tree another's live container has
   mounted.
 - **`~/.agents` is mounted for every harness**, at `/home/dev/.agents`. It is the
@@ -153,7 +167,7 @@ them directly:
 - **CLI:** `cargo build --release` → `target/release/vhrn`; `cargo install --path .` installs
   it to `~/.cargo/bin`.
 - **Images:** `make -C image` builds `vhrn-base` then the harnesses (`build-base`,
-  `build-claude`, `build-codex`; each harness is `FROM vhrn-base`, so base first).
+  `build-claude`, `build-codex`, `build-pi`; each harness is `FROM vhrn-base`, so base first).
   `make -C image build-<name>` builds one; `make -C image clean` removes them.
 - **Proxy image:** `make -C proxy` builds `vhrn-proxy`; `make -C proxy clean` removes it.
 
@@ -205,7 +219,9 @@ The suite runs per changed component on PRs and in full on master:
 - **Workflows:** `actionlint` (with shellcheck on inline `run:` scripts) validates
   `.github/workflows/**`.
 
-Tests cover flag parsing, the history-key encoding, terminal env, allowlist add/dedup,
+Tests cover flag parsing, the history-key encoding, terminal env, allowlist add/dedup and typed
+loopback authorities, broker authentication/lifetime, engine routing, Pi seed/mirror/session
+descriptors,
 engine-inspect IP parsing, the harness registry, the installed registry, shell-alias blocks,
 install/uninstall arg assembly, the guide composition and its source chain, the system
 config layer (host copy, trust-table strip, sandbox-mode injection, env-policy yielding),
@@ -237,6 +253,21 @@ exfiltrating freely. Guard these:
   mode is per active run. `vhrn net` mutates only global/project layers, while `--allow` and
   `--open-net` are run-only. `vhrn net open` changes every active run; future runs are unaffected.
   Keep policy outside config and install: `[net]` and install seeding are removed.
+- **Loopback egress is a separate, explicit capability.** `--allow --local` is run-only and
+  `vhrn net allow|deny [--project <path>] --local <authorities>` mutates global or exact-project
+  policy. Authorities require ports and are only `localhost`, exact `127/8`, or `[::1]`; numeric
+  addresses stay distinct from `localhost`. `open` and `report` never grant loopback access.
+  Every run starts the generic host broker, even with zero grants. The proxy alone mounts its
+  per-run token, and the broker caps a run at 128 connections.
+- **The broker is host-side and capability-gated.** `src/broker.rs` authenticates a proxy-only
+  per-run token and rechecks the three loopback policy layers before an exact loopback dial;
+  `src/run.rs` owns engine routing and cleanup, and `proxy/` routes authorized local requests.
+  SIGTERM tears down agent, proxy, broker, and policy. A SIGKILL closes the broker listener and
+  relays, but its containers and token staging require explicit cleanup; lease reaping retires
+  only run policy.
+- **Brokered routing is verified on Apple `container` and Docker through Colima only.** Native
+  Linux Docker, Docker Desktop, and remote Docker endpoints are unsupported for brokered runs
+  until separately implemented and verified.
 - **The container stays ephemeral (`--rm`).** A fresh, tamper-proof firewall every boot — a
   security feature. Persistence is a property of what's mounted; do **not** move to a
   persistent "container machine."
@@ -245,11 +276,12 @@ exfiltrating freely. Guard these:
   and does **not** terminate TLS, so it can't stop exfiltration to an already-allowed domain
   or domain-fronting behind an allowed CDN.
 - **Only the project and the user's agent configuration are mounted.** The config side is
-  the harness's own dir (`~/.claude`, `~/.codex`), the vendor-neutral `~/.agents`, and
-  `~/.gitconfig` — each as a disposable copy, never the host original. `~/.ssh`, your other projects, and the
-  rest of `$HOME` stay outside; `blocked_dirs` refuses to jail `$HOME` or `/`. Config trees
-  are synced with `rsync -aL`, so a symlink inside one is followed to its target — the user
-  curates those trees, and anything they link in is a deliberate choice.
+  the Claude/Codex config dir, Pi's selected mirrors under `~/.pi/agent`, the vendor-neutral
+  `~/.agents`, and `~/.gitconfig` — each as a disposable copy, never the host original.
+  `~/.ssh`, your other projects, and the rest of `$HOME` stay outside; `blocked_dirs` refuses to
+  jail `$HOME` or `/`. Config trees are synced with `rsync -aL`, so a symlink inside one is
+  followed to its target — the user curates those trees, and anything they link in is a deliberate
+  choice.
 - **Threat model** (full version in `docs/sandbox-design.md`): protects the host filesystem
   and against casual exfiltration. Does **not** cover exfiltration to an allowed domain,
   sessions launched with `--open-net` or changed with `net open`, executable config inside a repo the

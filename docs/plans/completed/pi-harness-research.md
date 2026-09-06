@@ -1,14 +1,13 @@
 # Pi harness support
 
-Status: **design agreed; engine feasibility gates remain.** The prerequisites have landed, and
-this plan is rebased against their implemented interfaces. The completed
-[`egress allowlist layering`](completed/egress-allowlist-layering.md) and
-[`per-project configuration`](completed/per-project-config.md) plans define the current policy
-scopes, canonical project identity, and host-owned configuration. Begin with the engine probes
-below; Pi support and the broker are not yet implemented. The accepted decisions are a broker for
+Status: **completed 2026-09-05.** This is the historical design and research record; the completed
+implementation is summarized below. The completed
+[`egress allowlist layering`](egress-allowlist-layering.md) and
+[`per-project configuration`](per-project-config.md) plans define the policy scopes, canonical
+project identity, and host-owned configuration that Pi uses. The accepted design is a broker for
 every harness run, dual-stack `localhost` with exact numeric grants, and filtered settings bootstrap.
-Required engine coverage is Apple `container` and Docker through Colima on this Mac. Native Linux
-Docker and Docker Desktop coverage are deferred at the maintainer's request and do not block this run.
+Apple `container` and Docker through Colima were the required engine coverage. Native Linux Docker
+and Docker Desktop remain deferred and unverified.
 
 ## Researched behavior
 
@@ -26,7 +25,7 @@ source, but not a complete inventory of every endpoint Pi may use. See Pi's
 [custom-provider](https://pi.dev/docs/latest/custom-provider) documentation.
 
 The official installation path uses Node.js 24 and installs
-`@earendil-works/pi-coding-agent` with npm. The future vhrn image must follow that supported path
+`@earendil-works/pi-coding-agent` with npm. The implemented vhrn image follows that supported path
 instead of assuming that a standalone binary is Pi's primary distribution. See Pi's
 [quickstart](https://pi.dev/docs/latest/quickstart) and
 [containerization guidance](https://pi.dev/docs/latest/containerization).
@@ -379,7 +378,7 @@ The broker is generic runtime infrastructure, available to every harness. No `pi
 boolean, endpoint list, or engine-specific setting belongs in `Harness`. `src/config.rs` continues
 to own host tools/resources configuration; local endpoint permissions never enter `config.toml`.
 
-## Implementation order and gates
+## Historical implementation order and gates
 
 1. Verify the bind/dial recipes with minimal probes on Apple `container` and Docker through Colima. Record
    evidence before implementing the broker; a missing environment leaves this gate outstanding.
@@ -396,7 +395,7 @@ to own host tools/resources configuration; local endpoint permissions never ente
    must pass with the new broker lifecycle, including runs with no local grants.
 6. Complete active docs, help, container guides, changelog, and `AGENTS.md` with the implementation.
    Explain local grant commands and provenance, public-only open/report modes, settings/keybindings
-   bootstrap ownership, and engine requirements. Until implementation, these remain plan-only.
+   bootstrap ownership, and engine requirements. At drafting time, these were plan-only.
 
 Do not ship a reduced remote-only Pi harness. If exact host-loopback inference cannot work safely on
 both Apple `container` and Docker through Colima without privileged host setup, defer the entire Pi harness.
@@ -470,6 +469,25 @@ Run the repository's required CLI checks (`cargo fmt --all -- --check`, then
 `cargo clippy --all-targets -- -D warnings`, then `cargo test`), proxy checks (`gofmt`, `go vet`,
 `go test`, `govulncheck`), and `actionlint` for workflow changes. Unit tests do not substitute for
 the engine probes or live Pi scenarios. Record commands, versions, outcomes, and any unrun gate.
+
+## Completion evidence and limitations
+
+The implementation baked Pi 0.85.1 with Node 24.20.0. Full local Pi coverage passed on Apple
+`container` 1.3.1 and Colima 0.10.3 with Docker 29.5.2: all nine local end-to-end cases passed on
+both engines, including local authorization, streaming/tool reuse, persistence, sessions, and
+signal cleanup. The Rust suite (186 tests), full Go checks, and static checks also passed.
+
+Remote verification is intentionally an unauthenticated endpoint-reachability check rather than a
+model request. On Apple `container`, `api.openai.com/v1/models` reached OpenAI and returned the
+expected missing-bearer-authentication error; `api.anthropic.com/v1/messages` returned HTTP 401
+requesting `x-api-key`. No keys were needed. Colima remote checks were waived and are not verified.
+Credentialed model-request cases were not run and are not a release gate.
+
+There is no guaranteed bound on shared-filesystem policy visibility; current engine tests observed
+about one second. A pooled plain-HTTP request can pass after revocation until the proxy sees the
+updated file; established CONNECT tunnels stay open until closed. Two cold Pi starts can race on
+the nested guide mount, so wait for the first run to become ready before starting the next. The
+brokered route is verified only on Apple `container` and Docker through Colima.
 
 ## Deferred work
 

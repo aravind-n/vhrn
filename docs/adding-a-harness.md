@@ -33,7 +33,7 @@ without the rest of the sync going anywhere near it.
 | --- | --- |
 | `state_dir`, `config_dir_env`, `host_config` | Where the container-owned store mounts, and which host dir seeds it |
 | `sync_dirs`, `sync_files` | Disposable host config layered back on top each run |
-| `credentials` | Bootstrap-only files copied into an *empty* store; never overwritten |
+| `seed_files` | Bootstrap-only state files copied only while their destination file is absent; each is bytes or a filtered JSON object |
 | `credential_env` | Host env vars forwarded when set, and hidden from spawned commands |
 | `guide` | The derived guide: filename, host sources (first non-empty wins), whether it lands in the state dir, and whether it leads or trails the host's text |
 | `system_config` | Mount the host's config plus vhrn's own defaults read-only at `/etc/<name>` |
@@ -50,6 +50,20 @@ one tree. Mounting that tree hands a jailed agent every transcript on the machin
 vhrn-owned store is smaller but still lets project A read project B. The store is keyed by
 project, and the index and the transcripts it names are bound from the same tree so they
 cannot end up in different partitions.
+
+## Pi as a descriptor example
+
+Pi demonstrates why bootstrap files are generic `SeedFile` descriptors rather than credentials.
+It uses `.pi/agent` through `PI_CODING_AGENT_DIR`. vhrn seeds `settings.json` only when absent,
+removing its top-level `apiKeys` and `defaultProjectTrust` keys, and seeds `keybindings.json` once
+so Pi's migration and later choices persist. It never imports host `auth.json` or `trust.json`.
+
+Pi mirrors `models.json`, `SYSTEM.md`, `APPEND_SYSTEM.md`, and user-managed `extensions/`,
+`skills/`, `prompts/`, and `themes/` from the host on each run. Its package and catalog state stay
+in the container-owned store. Its guide source is the first non-empty file among
+`AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, and `CLAUDE.MD`, composed into
+`AGENTS.override.md`. Its `PI_CODING_AGENT_SESSION_DIR` points to a project-specific store; an
+agent-provided `--session-dir` continues to override that default.
 
 ## What is not a spec field
 

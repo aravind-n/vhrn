@@ -8,11 +8,11 @@ container, and what the sandbox does and does not protect against.
 ## Network egress guard
 
 Every run starts a small proxy sidecar. The container's firewall routes every outbound
-connection through that proxy, and the proxy only allows allowlisted domains. Everything
-else, including direct DNS, is refused. A blocked request fails with the domain named,
-like `blocked by vhrn egress policy: example.com`.
+connection through that proxy, and the proxy allows permitted public domains or explicitly
+granted host-loopback endpoints. Everything else, including direct DNS, is refused. A blocked
+request fails with the domain named, like `blocked by vhrn egress policy: example.com`.
 
-The policy lives on the host at `${XDG_STATE_HOME:-~/.local/state}/vhrn/net`, with a store lock,
+The public-domain policy lives on the host at `${XDG_STATE_HOME:-~/.local/state}/vhrn/net`, with a store lock,
 atomic same-directory writes, and active-run leases. It is mounted
 into the proxy but **never** into the container. Five additive layers are evaluated in order:
 immutable base, selected harness, persistent global, exact canonical project, and run-only wrapper
@@ -29,33 +29,49 @@ vhrn net open                   # set every active run open
 vhrn net guard                  # set every active run enforce
 ```
 
-`--allow` and `--open-net` are run-only. `open`, `guard`, and `report` change active runs only;
-future runs default to enforce. `allow`/`deny` normalize ASCII domain input (use IDNA/punycode for
+`--allow` and `--open-net` are run-only. `open`, `guard`, and `report` change active runs' public
+egress only; future runs default to enforce. `allow`/`deny` normalize ASCII domain input (use IDNA/punycode for
 internationalized names), and parent domains match subdomains. `deny` removes no other layer and
 reports remaining provenance. `[net]` configuration and install-time policy seeding are removed.
 Stale `[net]` yields a targeted migration error, while `vhrn net` remains usable.
 
+Host-loopback inference endpoints use a separate local policy. A run-only grant is
+`vhrn pi --allow --local localhost:1234`; persistent grants use `vhrn net allow [--project .]
+--local <authority>...`. Authorities require a port and are restricted to `localhost`, an exact
+`127.0.0.0/8` address, or `[::1]`. `localhost` and numeric forms are separate authorities;
+`localhost` tries IPv4 then IPv6 without DNS. `net status --local` shows each scope's provenance.
+`net open` and `net report` change public-domain behavior only and never permit a local endpoint.
+
+Each run has a generic host-side broker. The proxy validates local policy on each decision and
+uses a proxy-only, per-run token to ask the broker for an exact loopback relay; the agent never
+receives that token. The broker rechecks policy before it dials and accepts at most 128 connections
+for a run. This is runtime infrastructure for every harness, including a run with no local grants,
+not a Pi setting.
+
 vhrn synchronously creates the named agent container before start/attach. On SIGTERM, cleanup
-removes the agent, then the proxy, then the run policy; a SIGKILL cannot run cleanup, so lease
-reaping removes stale active-run state later. This does not close existing proxy tunnels.
+removes the agent, proxy, broker, and run policy. A SIGKILL closes the host broker listener and
+relays, but the agent/proxy containers and token staging require explicit cleanup; lease reaping
+retires only stale run policy. Established CONNECT tunnels survive policy revocation until they
+close. Policy changes are visible through shared filesystem mounts after roughly a second in
+current engine tests; there is no guaranteed immediate visibility or bound. A pooled plain-HTTP
+request can therefore pass after revocation until the proxy sees the replacement policy.
 
 ## Login and state persistence
 
 Each harness has a persistent store at `~/.cache/vhrn/state/<harness>/`, mounted as the
 harness's config dir inside the container. A login, refreshed credentials, and trust
 state live there and survive across runs — one login serves every project. The store is
-authoritative once populated: your host login is copied in **only** to bootstrap an
-empty store, so an in-container login is never overwritten.
+authoritative once populated: a host seed file is copied only while that destination file is
+absent, so an in-container login is never overwritten.
 
 The container stays ephemeral (`--rm`) — a fresh, tamper-proof firewall is installed on
 every boot. Persistence is a property of what's mounted, not of container lifetime.
 (Caveat: an in-container token refresh doesn't flow back to the host.)
 
-A disposable copy of your host harness config (skills, commands, agents, harness
-settings) is synced into `~/.cache/vhrn/sandbox/<harness>/` on each run and layered on top
-of the persistent store, so edits to that copy don't survive — change your real host config
-instead (e.g. `~/.claude` for Claude, `~/.codex` for Codex). The persistent store is
-separate and is never touched by the sync.
+A disposable copy of the Claude/Codex host configuration is synced into
+`~/.cache/vhrn/sandbox/<harness>/` on each run and layered on top of the persistent store, so
+edits to that copy don't survive — change your real host config instead. Pi uses only its selected
+mirror paths under `~/.pi/agent`. The persistent store is separate and is never touched by a sync.
 
 What else persists is per-harness, because the agents differ:
 
@@ -77,6 +93,12 @@ What else persists is per-harness, because the agents differ:
   on top costs its shell commands all network access. This is a *default*, so `vhrn codex
   --sandbox workspace-write` still turns it back on for a run. bubblewrap is installed in the
   image either way: Codex aborts rather than degrades when it looks for it and finds nothing.
+- **Pi** uses `~/.pi/agent` through `PI_CODING_AGENT_DIR`. `settings.json` is seeded once after
+  removing `apiKeys` and `defaultProjectTrust`; `keybindings.json` is seeded once for Pi's
+  migration. User inputs such as models, prompts, extensions, skills, and themes mirror from the
+  host, while Pi-owned authentication, trust, package, and catalog state stay in the persistent
+  store. Host Pi auth is never imported. The default `PI_CODING_AGENT_SESSION_DIR` is per project,
+  and Pi's `--session-dir` overrides it.
 
 `~/.agents` — the vendor-neutral config dir several agent tools read, so portable
 configuration like a skill library is installed once instead of once per vendor — is copied
@@ -120,9 +142,9 @@ present and unused.
 
 - Your host filesystem. Only the project and your agent configuration are mounted —
   `~/.ssh`, your other projects, and the rest of `$HOME` are not, so nothing inside the
-  container can read or damage them. The configuration that does come in (the harness's
-  own dir, `~/.agents`, `~/.gitconfig`) is a disposable copy, so the container cannot
-  write back to your real config either.
+  container can read or damage them. The configuration that does come in (the Claude/Codex
+  config dir, Pi's selected mirrors, `~/.agents`, and `~/.gitconfig`) is a disposable copy,
+  so the container cannot write back to your real config either.
 - Against casual exfiltration. Default-deny egress stops a prompt injection from POSTing
   your source to an outside server; it can only reach the domains you have allowed.
 
@@ -140,7 +162,15 @@ present and unused.
   rather than preventing execution — which is why vhrn does not answer the trust prompt for
   you, on the host's behalf or otherwise. Treat trusting an unfamiliar repo as running its
   code, because it is.
-- Sessions launched with `--open-net`, or active runs changed to `net open`, which turn their
-  guard off.
+- Public egress in sessions launched with `--open-net`, or active runs changed to `net open`.
+- A host-loopback endpoint you explicitly grant. Local policy narrows the address and port, but it
+  intentionally permits the agent to exchange data with that service. Revocation applies to later
+  proxy/broker decisions after policy visibility; it does not interrupt established CONNECT tunnels.
+- Simultaneous cold Pi launches can race while creating the nested guide mount. Wait for the first
+  Pi run to become ready before starting another one.
 - A container escape under Docker, where the container shares the host's kernel. Apple
   `container` puts each container in its own lightweight VM, a stronger boundary.
+
+Brokered loopback routing is verified on Apple `container` and Docker through Colima. Native Linux
+Docker, Docker Desktop, and remote Docker daemons are unsupported for this route until they are
+implemented and verified.
