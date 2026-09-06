@@ -4,7 +4,8 @@ Run coding agents inside a container jailed to the current project directory, wi
 
 ## Requirements
 
-- [Apple Container](https://github.com/apple/container) or Docker (auto-detected, `container` first)
+- [Apple Container](https://github.com/apple/container) or Docker through Colima (auto-detected,
+  `container` first; every run starts the host broker)
 - `gh` on the host for forwarded GitHub auth (optional)
 - [Rust](https://rust-lang.org/tools/install/) if building from code
 
@@ -24,19 +25,22 @@ and `vhrn update` re-pulls installed harnesses only when the registry has a newe
 
 | Harness | Agent | Logging in |
 | --- | --- | --- |
-| `claude` | Claude Code | Your host login bootstraps an empty store, once |
+| `claude` | Claude Code | Your host login bootstraps missing seed files, once |
 | `codex` | OpenAI Codex | `codex login --device-auth` inside the container, once |
+| `pi` | Pi Coding Agent | `/login` inside the container, once |
 
 Codex uses device-auth because the browser callback port isn't reachable from inside the
 container, and because it mints the container its own token instead of sharing your host
-one. Either login persists across runs and serves every project. For non-interactive use,
+one. Pi likewise keeps its login in its container-owned store; vhrn never imports host Pi
+credentials. Either login persists across runs and serves every project. Pi login can require
+explicit grants for its provider's API and authentication domains. For non-interactive Codex use,
 `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, and `OPENAI_API_KEY` are forwarded from the host
 when set. vhrn defaults to hiding them from commands the agent spawns; set
 `[shell_environment_policy]` in your host config and yours wins.
 
 Each run composes immutable base and selected-harness domains with optional persistent global and
-exact-project domains, then run-only wrapper domains. Installing a harness never changes egress
-policy.
+exact-project domains, then run-only wrapper domains. Pi has no default provider domains; grant
+each provider explicitly. Installing a harness never changes egress policy.
 
 ## Usage
 
@@ -46,12 +50,15 @@ A shell alias runs the harness directly (e.g. `claude` → `vhrn claude`); `comm
 ```sh
 vhrn <harness>                   # guarded: egress limited to the allowlist
 vhrn <harness> --allow docs.rs   # add domains to the allowlist for this session
-vhrn <harness> --open-net        # drop the guard for this session (all egress)
+vhrn pi --allow --local localhost:1234 # allow one host-loopback endpoint for this session
+vhrn <harness> --open-net        # allow public egress for this session
 vhrn <harness> -- --help         # harness's own help (-- stops wrapper flag parsing)
 
 vhrn net status [--domains]      # persistent scopes and active runs (with provenance)
 vhrn net allow docs.rs            # persist a global domain
 vhrn net allow --project . api.x.io # persist a domain for this canonical project
+vhrn net allow --local localhost:1234 # persist a global host-loopback endpoint
+vhrn net allow --project . --local '[::1]:1234' # persist it for this exact project
 vhrn net deny api.x.io             # remove from the global mutable scope
 vhrn net deny --project . api.x.io # remove from this project's mutable scope
 vhrn net denied                  # denials since the last idle period
@@ -62,15 +69,24 @@ vhrn update [<harness>]          # re-pull installed harnesses when a newer agen
 vhrn uninstall <harness>         # drop the alias/registry entry (--image also deletes the image)
 ```
 
-Wrapper flags (`--open-net`, `--allow`) go after the harness name, before the agent's own flags.
-They never persist. `open`, `guard`, and `report` affect active runs only; when idle they report
+Wrapper flags (`--open-net`, `--allow`, and the exact pair
+`--allow --local <host:port[,host:port...]>`) go after the harness name, before the agent's own
+flags. They never persist. `open`, `guard`, and `report` affect active runs only; when idle they report
 `no active runs; future runs default to enforce`.
 
-`allow` and `deny` accept ASCII domain names only. vhrn trims and lowercases input, accepts a
-leading `*.` and leading/trailing dots as the same domain, and matches a parent domain's subdomains.
-Use an IDNA/punycode spelling for an internationalized domain rather than storing Unicode. A denied
-batch is atomic: every requested domain must be present in the selected scope. Status and deny
-output identify remaining sources rather than treating deny as a negative override.
+Without `--local`, `allow` and `deny` accept ASCII domain names only. vhrn trims and lowercases
+input, accepts a leading `*.` and leading/trailing dots as the same domain, and matches a parent
+domain's subdomains. Use an IDNA/punycode spelling for an internationalized domain rather than
+storing Unicode. A denied batch is atomic: every requested domain must be present in the selected
+scope. Status and deny output identify remaining sources rather than treating deny as a negative
+override.
+
+Local grants are a separate capability for host-loopback model servers. They accept only an
+explicit port on `localhost`, an exact `127.0.0.0/8` address, or `[::1]`; `localhost` tries IPv4
+then IPv6 without DNS. `localhost:1234` and `127.0.0.1:1234` are distinct grants. Use
+`vhrn net status --local` to view persistent and active-run provenance, and `vhrn net deny
+--local ...` to revoke a persistent grant. `--open-net` and `net open`/`report` affect public
+egress only; they never authorize a local endpoint.
 
 ## Configuration
 
@@ -132,17 +148,24 @@ The host project mount preserves project-local installed dependencies and output
 `node_modules`, `.venv`, `target`, and generated files. Package-manager caches under the
 container home last only for that invocation and are intentionally not mounted between runs.
 
-Your harness config dir (`~/.claude`, `~/.codex`) and the vendor-neutral `~/.agents` are
-copied into the container on each run, the latter at `/home/dev/.agents` for every harness.
-Both copies are disposable — edit the host directories, not the copies. Whether an agent
-reads `~/.agents` is up to that agent: Codex resolves `~/.agents/skills` as its user skill
-root, while Claude Code reads `~/.claude/skills` only, so for Claude the mount is inert.
+Your Claude/Codex config dir and the vendor-neutral `~/.agents` are copied into the container on
+each run, the latter at `/home/dev/.agents` for every harness. Pi instead mirrors only selected
+host paths described below. Those copies and mirrors are disposable — edit the host directories,
+not their container counterparts. Whether an agent reads `~/.agents` is up to that agent: Codex
+resolves `~/.agents/skills` as its user skill root, while Claude Code reads `~/.claude/skills`
+only, so for Claude the mount is inert.
 
 Codex's own `~/.codex/config.toml` is applied as *defaults* rather than as your config
 layer, so that the copy the agent writes inside the container — trust answers, dismissed
 notices — is the one that persists. Edit the host file to change a setting; its
 `[projects.*]` trust entries are deliberately left behind, so trusting a folder on the host
 does not trust it in the jail.
+
+Pi mirrors `models.json`, global prompt files, and its user-managed extensions, skills, prompts,
+and themes from `~/.pi/agent` on every run. It seeds `settings.json` once after removing
+`apiKeys` and `defaultProjectTrust`, and seeds `keybindings.json` once so Pi's migration can
+persist. Pi-owned auth, trust, package, and model-catalog state stay in the container-owned store.
+Its default session store is per project; Pi's own `--session-dir` still overrides that default.
 
 ## Building from source
 

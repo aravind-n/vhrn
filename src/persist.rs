@@ -5,13 +5,17 @@
 //! in the container is the one that survives. The sandbox sync + container guide are
 //! re-derived each run and layered on top as nested mounts.
 
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use tracing::warn;
 
-use crate::harness::Harness;
+use crate::harness::{Harness, SeedFile};
 use crate::run::{look_path, set_mode};
 
 /// The persistent, container-owned store for one harness (`<cache>/state/<harness>`),
@@ -21,12 +25,12 @@ fn host_state_dir(cache: &Path, harness: &str) -> PathBuf {
 }
 
 /// Ready the persistent store before launch and return its path: ensure the dir and
-/// bootstrap credentials from the host once.
+/// create bootstrap-only seed files from the host once.
 pub(crate) fn prepare_state(home: &Path, cache: &Path, h: &Harness) -> Result<PathBuf> {
     let state = host_state_dir(cache, &h.name);
     std::fs::create_dir_all(&state)?;
     set_mode(&state, 0o700)?;
-    bootstrap_credentials(home, &state, h);
+    bootstrap_seed_files(home, &state, h)?;
     Ok(state)
 }
 
@@ -50,25 +54,105 @@ pub(crate) fn prepare_sessions(cache: &Path, h: &Harness, key: &str) -> Result<O
     Ok(Some(store))
 }
 
-/// Copy each host credentials file into the store, but only when the store's copy is
-/// absent. Bootstrap-only: once the container has its own (refreshed) credentials they are
-/// authoritative and never clobbered, so an in-container login is never overwritten.
-fn bootstrap_credentials(home: &Path, state: &Path, h: &Harness) {
-    for rel in &h.credentials {
-        let dst = state.join(rel);
-        if dst.is_file() {
-            continue; // container store already populated
-        }
-        let src = home.join(&h.host_config).join(rel);
-        if !src.is_file() {
-            continue; // nothing on the host to inherit; the container will prompt to log in
-        }
-        if let Err(e) = copy_file(&src, &dst) {
-            warn!("could not seed {rel}: {e}");
+/// Copy each declared host seed into the store, but only when the store's copy is absent.
+/// Existing container state is authoritative, including a file the agent wrote itself.
+fn bootstrap_seed_files(home: &Path, state: &Path, h: &Harness) -> Result<()> {
+    for seed in &h.seed_files {
+        let file = seed.file();
+        let dst = state.join(file);
+        if destination_is_regular_file(&dst, file)? {
             continue;
         }
-        let _ = set_mode(&dst, 0o600); // credentials stay private
+        let src = home.join(&h.host_config).join(file);
+        let source = match std::fs::metadata(&src) {
+            Ok(metadata) if metadata.is_file() => src,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Ok(_) | Err(_) => return seed_error(file),
+        };
+        let input = std::fs::read(source).map_err(|_| anyhow::anyhow!("seed file '{file}'"))?;
+        let contents = seed_contents(seed, input)?;
+        publish_seed(&dst, file, &contents)?;
     }
+    Ok(())
+}
+
+fn seed_contents(seed: &SeedFile, input: Vec<u8>) -> Result<Vec<u8>> {
+    match seed {
+        SeedFile::Bytes { .. } => Ok(input),
+        SeedFile::JsonObject { file, remove_keys } => {
+            let mut json: serde_json::Value = serde_json::from_slice(&input)
+                .map_err(|_| anyhow::anyhow!("seed file '{file}'"))?;
+            let Some(object) = json.as_object_mut() else {
+                return seed_error(file);
+            };
+            for key in remove_keys {
+                object.remove(key);
+            }
+            serde_json::to_vec(&json).map_err(|_| anyhow::anyhow!("seed file '{file}'"))
+        }
+    }
+}
+
+fn destination_is_regular_file(dst: &Path, file: &str) -> Result<bool> {
+    match std::fs::symlink_metadata(dst) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Ok(_) | Err(_) => seed_error(file),
+    }
+}
+
+static SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct SeedTemp(PathBuf);
+
+impl Drop for SeedTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Publish through a hard link so a competing first launch can never replace a seed.
+fn publish_seed(dst: &Path, file: &str, contents: &[u8]) -> Result<()> {
+    let parent = dst
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("seed file '{file}'"))?;
+    std::fs::create_dir_all(parent).map_err(|_| anyhow::anyhow!("seed file '{file}'"))?;
+    for _ in 0..16 {
+        let temp = parent.join(format!(
+            ".vhrn-seed-{}-{}",
+            std::process::id(),
+            SEED_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut output = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return seed_error(file),
+        };
+        let temp = SeedTemp(temp);
+        output
+            .write_all(contents)
+            .and_then(|()| output.sync_all())
+            .map_err(|_| anyhow::anyhow!("seed file '{file}'"))?;
+        match std::fs::hard_link(&temp.0, dst) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if destination_is_regular_file(dst, file)? {
+                    return Ok(());
+                }
+            }
+            Err(_) => return seed_error(file),
+        }
+    }
+    seed_error(file)
+}
+
+fn seed_error<T>(file: &str) -> Result<T> {
+    bail!("seed file '{file}'")
 }
 
 /// Copy src to dst, following symlinks in src (like cp -L), creating parents.
@@ -341,7 +425,9 @@ fn compose_guide(host: &[u8], guide_first: bool, open_net: bool, project_shell: 
     if !open_net {
         b.extend_from_slice(b"  Ask the user to run `vhrn net allow --project ");
         b.extend_from_slice(project_shell);
-        b.extend_from_slice(b" <domain>` for this project. They may instead run `vhrn net allow <domain>` globally. Prefer project access; never open the whole network.\n");
+        b.extend_from_slice(b" <domain>` for this project. They may instead run `vhrn net allow <domain>` globally. Local host services need an explicit `vhrn net allow --project ");
+        b.extend_from_slice(project_shell);
+        b.extend_from_slice(b" --local localhost:<port>` grant; they may instead run `vhrn net allow --local localhost:<port>` globally. `--open-net` affects public egress only. Prefer project access; never open the whole network.\n");
     }
     if guide_first {
         b.extend_from_slice(host);
@@ -362,8 +448,7 @@ network egress guard. Adapt as follows:
   reinstalled; you cannot install it from inside the container.
 ";
 
-const CONTAINER_GUIDE_OPEN: &str =
-    "- **Network egress is unrestricted this session** (the guard is off via `--open-net`).\n";
+const CONTAINER_GUIDE_OPEN: &str = "- **Public network egress is unrestricted this session** (the guard is off via `--open-net`). Host-loopback services still need an explicit `vhrn net allow --local localhost:<port>` grant.\n";
 
 // A denial surfaces as whatever the agent's HTTP client makes of a refused CONNECT — often
 // after its own retries, and often indistinguishable from a flaky network.
@@ -379,7 +464,9 @@ mod tests {
         Harness {
             name: "claude".into(),
             host_config: ".claude".into(),
-            credentials: vec![".credentials.json".into()],
+            seed_files: vec![SeedFile::Bytes {
+                file: ".credentials.json".into(),
+            }],
             guide: Guide {
                 file: "CLAUDE.md".into(),
                 sources: vec!["CLAUDE.md".into()],
@@ -446,13 +533,13 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_credentials_is_seed_only() {
+    fn bootstrap_bytes_seed_is_seed_only() {
         let home = temp_dir();
         let state = temp_dir();
         let h = claude();
 
         // No host creds: nothing seeded.
-        bootstrap_credentials(home.path(), state.path(), &h);
+        bootstrap_seed_files(home.path(), state.path(), &h).unwrap();
         assert!(
             !state.path().join(".credentials.json").is_file(),
             "seeded creds without a host source"
@@ -465,7 +552,7 @@ mod tests {
             "HOST",
         )
         .unwrap();
-        bootstrap_credentials(home.path(), state.path(), &h);
+        bootstrap_seed_files(home.path(), state.path(), &h).unwrap();
         assert_eq!(
             std::fs::read_to_string(state.path().join(".credentials.json")).unwrap(),
             "HOST"
@@ -473,11 +560,169 @@ mod tests {
 
         // Container has since logged in: the host seed must not clobber it.
         std::fs::write(state.path().join(".credentials.json"), "existing").unwrap();
-        bootstrap_credentials(home.path(), state.path(), &h);
+        bootstrap_seed_files(home.path(), state.path(), &h).unwrap();
         assert_eq!(
             std::fs::read_to_string(state.path().join(".credentials.json")).unwrap(),
             "existing"
         );
+    }
+
+    fn filtered_seed() -> Harness {
+        Harness {
+            host_config: ".agent".into(),
+            seed_files: vec![SeedFile::JsonObject {
+                file: "settings.json".into(),
+                remove_keys: vec!["apiKeys".into(), "defaultProjectTrust".into()],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn filtered_json_seed_keeps_preferences_and_host_unchanged() {
+        let home = temp_dir();
+        let state = temp_dir();
+        let h = filtered_seed();
+        let source = home.path().join(".agent").join("settings.json");
+        let host = r#"{"theme":"dark","apiKeys":{"key":"secret"},"defaultProjectTrust":true}"#;
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, host).unwrap();
+
+        bootstrap_seed_files(home.path(), state.path(), &h).unwrap();
+
+        let seeded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(state.path().join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(seeded["theme"], "dark");
+        assert!(seeded.get("apiKeys").is_none());
+        assert!(seeded.get("defaultProjectTrust").is_none());
+        assert_eq!(std::fs::read_to_string(source).unwrap(), host);
+    }
+
+    #[test]
+    fn existing_seed_destination_wins_before_source_is_read() {
+        let home = temp_dir();
+        let state = temp_dir();
+        let h = filtered_seed();
+        let source = home.path().join(".agent").join("settings.json");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(source, "not json").unwrap();
+        std::fs::write(state.path().join("settings.json"), "container choice").unwrap();
+
+        bootstrap_seed_files(home.path(), state.path(), &h).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(state.path().join("settings.json")).unwrap(),
+            "container choice"
+        );
+    }
+
+    #[test]
+    fn invalid_json_seed_reports_only_its_filename() {
+        let home = temp_dir();
+        let state = temp_dir();
+        let h = filtered_seed();
+        let source = home.path().join(".agent").join("settings.json");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "{ secret value").unwrap();
+
+        let error = bootstrap_seed_files(home.path(), state.path(), &h)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "seed file 'settings.json'");
+        assert!(!error.contains("secret"));
+
+        std::fs::write(&source, "[]").unwrap();
+        assert_eq!(
+            bootstrap_seed_files(home.path(), state.path(), &h)
+                .unwrap_err()
+                .to_string(),
+            "seed file 'settings.json'"
+        );
+    }
+
+    #[test]
+    fn nonfile_source_and_source_symlink_follow_the_seed_contract() {
+        use std::os::unix::fs::symlink;
+
+        let home = temp_dir();
+        let state = temp_dir();
+        let h = filtered_seed();
+        let source = home.path().join(".agent").join("settings.json");
+        std::fs::create_dir_all(&source).unwrap();
+        assert_eq!(
+            prepare_state(home.path(), state.path(), &h)
+                .unwrap_err()
+                .to_string(),
+            "seed file 'settings.json'"
+        );
+
+        std::fs::remove_dir(&source).unwrap();
+        let linked = home.path().join("host-settings.json");
+        std::fs::write(&linked, r#"{"preference":"kept"}"#).unwrap();
+        symlink(&linked, &source).unwrap();
+        prepare_state(home.path(), state.path(), &h).unwrap();
+        let seeded: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(state.path().join("state").join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(seeded["preference"], "kept");
+    }
+
+    #[test]
+    fn seed_rejects_symlink_or_nonfile_destination() {
+        use std::os::unix::fs::symlink;
+
+        let home = temp_dir();
+        let h = filtered_seed();
+        let source = home.path().join(".agent").join("settings.json");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(source, "{}").unwrap();
+
+        let symlink_state = temp_dir();
+        symlink("elsewhere", symlink_state.path().join("settings.json")).unwrap();
+        assert_eq!(
+            bootstrap_seed_files(home.path(), symlink_state.path(), &h)
+                .unwrap_err()
+                .to_string(),
+            "seed file 'settings.json'"
+        );
+
+        let dir_state = temp_dir();
+        std::fs::create_dir(dir_state.path().join("settings.json")).unwrap();
+        assert_eq!(
+            bootstrap_seed_files(home.path(), dir_state.path(), &h)
+                .unwrap_err()
+                .to_string(),
+            "seed file 'settings.json'"
+        );
+    }
+
+    #[test]
+    fn concurrent_seed_keeps_one_complete_file_and_no_temp_files() {
+        let home = temp_dir();
+        let state = temp_dir();
+        let h = claude();
+        let source = home.path().join(".claude").join(".credentials.json");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "complete credential seed").unwrap();
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| bootstrap_seed_files(home.path(), state.path(), &h).unwrap());
+            }
+        });
+
+        assert_eq!(
+            std::fs::read_to_string(state.path().join(".credentials.json")).unwrap(),
+            "complete credential seed"
+        );
+        assert!(std::fs::read_dir(state.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".vhrn-seed-")
+        }));
     }
 
     // A harness that injects configuration through a read-only system layer.
@@ -777,8 +1022,8 @@ mod tests {
         let open = std::fs::read_to_string(dst.path().join("CLAUDE.md")).unwrap();
         assert!(open.contains("unrestricted"), "open-net text missing");
         assert!(
-            !open.contains("vhrn net allow"),
-            "stale guard text carried over"
+            open.contains("vhrn net allow --local"),
+            "open-net guide must still name local grants"
         );
 
         // A harness with no guide file writes nothing at all.
@@ -844,9 +1089,8 @@ mod tests {
                     .any(|part| part == b"guard is off")
             );
             assert!(
-                !open
-                    .windows(b"vhrn net allow".len())
-                    .any(|part| part == b"vhrn net allow")
+                open.windows(b"vhrn net allow --local".len())
+                    .any(|part| part == b"vhrn net allow --local")
             );
         }
     }

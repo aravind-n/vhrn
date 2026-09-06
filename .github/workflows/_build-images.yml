@@ -119,6 +119,8 @@ jobs:
             version_cmd: claude --version
           - harness: codex
             version_cmd: codex --version
+          - harness: pi
+            version_cmd: pi --version
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-qemu-action@v4

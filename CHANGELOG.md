@@ -15,11 +15,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Scoped global and exact-project `vhrn net allow`/`deny`, plus active-run/domain provenance in
   `net status --domains` and remaining-source reports from `deny`.
 
+- Pi is now a harness, with container-owned filtered settings and keybindings, separate auth and
+  trust state, mirrored user inputs, and per-project sessions.
+
+- Typed loopback grants are available at global, exact-project, and run scope through an
+  authenticated host broker, with up to 128 brokered connections per run.
+
 ### Changed
 
 - Effective egress now derives from immutable base and selected-harness domains, persistent global
   and exact-project domains, and run-only wrapper layers. Policy state moved to
   `${XDG_STATE_HOME:-~/.local/state}/vhrn/net`.
+
+- Brokered local routing is supported through Apple `container` and Docker via Colima; native Linux
+  Docker and Docker Desktop remain deferred. Public `open` and `report` modes still require an
+  explicit loopback grant.
 
 - `net open`, `guard`, and `report` affect active runs only; future runs default to enforcement.
   Documentation now describes scoped policy and a clean reset path. Policy state is host-owned,

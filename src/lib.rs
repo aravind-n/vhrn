@@ -3,6 +3,7 @@
 //! `src/main.rs` is a thin shim. Comments explain why, not what, and stay terse.
 #![forbid(unsafe_code)]
 
+mod broker;
 mod cli;
 mod config;
 mod env;
