@@ -3,45 +3,16 @@
 //! remains the only widening path. Modes are per-published-run files.
 
 use std::collections::HashSet;
-use std::fmt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 
+pub(crate) use vhrn_policy::{LoopbackAuthority, Mode};
+
 use crate::run::set_mode;
-
-/// The egress guard mode for a run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Mode {
-    Enforce,
-    Report,
-    Open,
-}
-
-impl Mode {
-    /// The wire string written to the mode file and `VHRN_NET`.
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Mode::Enforce => "enforce",
-            Mode::Report => "report",
-            Mode::Open => "open",
-        }
-    }
-
-    /// Parse a mode string; unknown values yield None (callers fall back to enforce).
-    fn from_str(s: &str) -> Option<Mode> {
-        match s {
-            "enforce" => Some(Mode::Enforce),
-            "report" => Some(Mode::Report),
-            "open" => Some(Mode::Open),
-            _ => None,
-        }
-    }
-}
 
 // Per-process unique suffix for atomic temp files (os.CreateTemp's role).
 fn next_tmp_id() -> u64 {
@@ -81,103 +52,12 @@ pub(crate) struct ResolvedDomain {
     pub(crate) sources: Vec<LayerSource>,
 }
 
-/// An explicit host-loopback endpoint.  Local inference policy deliberately names an
-/// authority rather than a hostname: numeric loopback addresses remain distinct.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct LoopbackAuthority {
-    host: LoopbackHost,
-    port: u16,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum LoopbackHost {
-    Localhost,
-    Ipv4([u8; 4]),
-    Ipv6Loopback,
-}
-
-impl fmt::Display for LoopbackAuthority {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.host {
-            LoopbackHost::Localhost => write!(formatter, "localhost:{}", self.port),
-            LoopbackHost::Ipv4(octets) => write!(
-                formatter,
-                "{}.{}.{}.{}:{}",
-                octets[0], octets[1], octets[2], octets[3], self.port
-            ),
-            LoopbackHost::Ipv6Loopback => write!(formatter, "[::1]:{}", self.port),
-        }
-    }
-}
-
-impl LoopbackAuthority {
-    pub(crate) fn parse(input: &str) -> std::result::Result<Self, String> {
-        if input.is_empty() || input.trim() != input || !input.is_ascii() {
-            return Err(format!("invalid loopback authority {input:?}"));
-        }
-        let (host, port) = input
-            .rsplit_once(':')
-            .ok_or_else(|| format!("invalid loopback authority {input:?}"))?;
-        let port = parse_loopback_port(port, input)?;
-        let host = if host.eq_ignore_ascii_case("localhost") {
-            LoopbackHost::Localhost
-        } else if let Some(ipv6) = host
-            .strip_prefix('[')
-            .and_then(|host| host.strip_suffix(']'))
-        {
-            let ipv6 = std::net::Ipv6Addr::from_str(ipv6)
-                .map_err(|_| format!("invalid loopback authority {input:?}"))?;
-            if !ipv6.is_loopback() {
-                return Err(format!("invalid loopback authority {input:?}"));
-            }
-            LoopbackHost::Ipv6Loopback
-        } else {
-            LoopbackHost::Ipv4(parse_loopback_ipv4(host, input)?)
-        };
-        Ok(Self { host, port })
-    }
-}
-
 /// Normalize an explicit loopback host and port for durable policy storage.
 #[allow(dead_code)] // Parsed by the CLI layer in the following ship step.
 pub(crate) fn normalize_loopback_authority(input: &str) -> std::result::Result<String, String> {
-    LoopbackAuthority::parse(input).map(|authority| authority.to_string())
-}
-
-fn parse_loopback_port(port: &str, input: &str) -> std::result::Result<u16, String> {
-    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(format!("invalid loopback authority {input:?}"));
-    }
-    let port = port
-        .parse::<u16>()
-        .map_err(|_| format!("invalid loopback authority {input:?}"))?;
-    if port == 0 {
-        return Err(format!("invalid loopback authority {input:?}"));
-    }
-    Ok(port)
-}
-
-fn parse_loopback_ipv4(host: &str, input: &str) -> std::result::Result<[u8; 4], String> {
-    let parts: Vec<_> = host.split('.').collect();
-    if parts.len() != 4 {
-        return Err(format!("invalid loopback authority {input:?}"));
-    }
-    let mut octets = [0; 4];
-    for (index, part) in parts.into_iter().enumerate() {
-        if part.is_empty()
-            || !part.bytes().all(|byte| byte.is_ascii_digit())
-            || (part.len() > 1 && part.starts_with('0'))
-        {
-            return Err(format!("invalid loopback authority {input:?}"));
-        }
-        octets[index] = part
-            .parse::<u8>()
-            .map_err(|_| format!("invalid loopback authority {input:?}"))?;
-    }
-    if octets[0] != 127 {
-        return Err(format!("invalid loopback authority {input:?}"));
-    }
-    Ok(octets)
+    LoopbackAuthority::parse(input)
+        .map(|authority| authority.to_string())
+        .map_err(|_| format!("invalid loopback authority {input:?}"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,27 +77,13 @@ pub(crate) fn normalize_domain(input: &str) -> std::result::Result<String, Strin
     if !value.is_ascii() {
         let suggestion = idna::domain_to_ascii(value)
             .ok()
-            .filter(|value| valid_domain(value));
+            .filter(|value| vhrn_policy::normalize_domain_entry(value).is_ok());
         return Err(match suggestion {
             Some(value) => format!("domain must be ASCII; use {value:?}"),
             None => "domain must be a valid ASCII IDNA hostname".to_string(),
         });
     }
-    let value = value.to_ascii_lowercase();
-    if valid_domain(&value) {
-        Ok(value)
-    } else {
-        Err(format!("invalid domain {input:?}"))
-    }
-}
-
-fn valid_domain(value: &str) -> bool {
-    !value.is_empty()
-        && !value.split('.').any(str::is_empty)
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        && value.bytes().any(|b| b.is_ascii_alphanumeric())
+    vhrn_policy::normalize_domain_entry(input).map_err(|_| format!("invalid domain {input:?}"))
 }
 
 /// A byte-stable project identity. Unix paths need not be UTF-8, so neither the key
@@ -904,7 +770,7 @@ impl PolicyStore {
     ) -> std::io::Result<ActiveRun> {
         let harness = read_trimmed(&path.join("harness"), "run harness")?;
         let mode = read_trimmed(&path.join("mode"), "run mode")?;
-        if Mode::from_str(&mode).is_none() {
+        if Mode::parse(&mode).is_none() {
             return Err(invalid_data("invalid run mode"));
         }
         let project_key = read_trimmed(&path.join("project-key"), "run project key")?;
@@ -1448,7 +1314,10 @@ fn normalize_loopback_batch(
         normalize_loopback_authorities(add)?,
         remove
             .iter()
-            .map(|authority| LoopbackAuthority::parse(authority).map_err(invalid_input))
+            .map(|authority| {
+                LoopbackAuthority::parse(authority)
+                    .map_err(|_| invalid_input(format!("invalid loopback authority {authority:?}")))
+            })
             .collect::<std::io::Result<HashSet<_>>>()?,
     ))
 }
@@ -1457,7 +1326,8 @@ fn normalize_loopback_authorities(
 ) -> std::io::Result<Vec<LoopbackAuthority>> {
     let mut result = Vec::new();
     for authority in authorities {
-        let authority = LoopbackAuthority::parse(authority).map_err(invalid_input)?;
+        let authority = LoopbackAuthority::parse(authority)
+            .map_err(|_| invalid_input(format!("invalid loopback authority {authority:?}")))?;
         if !result.contains(&authority) {
             result.push(authority);
         }
@@ -1990,9 +1860,9 @@ mod tests {
     #[test]
     fn mode_roundtrips() {
         for m in [Mode::Enforce, Mode::Report, Mode::Open] {
-            assert_eq!(Mode::from_str(m.as_str()), Some(m));
+            assert_eq!(Mode::parse(m.as_str()), Some(m));
         }
-        assert_eq!(Mode::from_str("nope"), None);
+        assert_eq!(Mode::parse("nope"), None);
     }
 
     #[test]
@@ -2029,6 +1899,22 @@ mod tests {
                 _ => panic!("invalid loopback fixture row: {line}"),
             }
         }
+    }
+
+    #[test]
+    fn loopback_batch_errors_quote_the_invalid_input() {
+        let invalid = "localhost:0".to_string();
+        let error = normalize_loopback_authorities(std::slice::from_ref(&invalid)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid loopback authority \"localhost:0\""
+        );
+
+        let error = normalize_loopback_batch(&[], std::slice::from_ref(&invalid)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid loopback authority \"localhost:0\""
+        );
     }
 
     #[test]

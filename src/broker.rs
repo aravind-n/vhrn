@@ -17,10 +17,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use subtle::ConstantTimeEq;
+use vhrn_policy::{BrokerRequest, BrokerToken, MAX_BROKER_FRAME_SIZE, parse_broker_request};
 
 use crate::net::{LoopbackAuthority, PolicyStore, ProjectIdentity};
 
-const MAX_HANDSHAKE: usize = 256;
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(3);
 const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 // The broker runs on the host, outside the container resource limits. Bound each run's
@@ -46,7 +46,7 @@ struct AcceptArgs {
     root: PathBuf,
     project: ProjectIdentity,
     run_id: String,
-    token: String,
+    token: BrokerToken,
 }
 struct Lifecycle {
     listener: Option<TcpListener>,
@@ -285,7 +285,7 @@ impl Drop for Broker {
     }
 }
 
-fn create_secret(dir: &Path) -> io::Result<String> {
+fn create_secret(dir: &Path) -> io::Result<BrokerToken> {
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
     builder.create(dir)?; // create_new semantics: never remove a competing run's directory.
@@ -358,7 +358,7 @@ fn serve(
     store: PolicyStore,
     project: ProjectIdentity,
     run_id: String,
-    token: String,
+    token: BrokerToken,
 ) {
     let mut client = connection.stream;
     let result = handshake(&mut client, &token).and_then(|request| match request {
@@ -403,33 +403,25 @@ enum Request {
     Ready,
     Connect(LoopbackAuthority),
 }
-fn handshake(stream: &mut TcpStream, token: &str) -> Result<Request> {
+fn handshake(stream: &mut TcpStream, token: &BrokerToken) -> Result<Request> {
     let line = read_line(stream, Instant::now() + HANDSHAKE_DEADLINE)?;
-    let line = std::str::from_utf8(&line[..line.len() - 1]).context("invalid handshake")?;
-    let fields: Vec<_> = line.split(' ').collect();
-    if fields.len() < 3
-        || fields[0] != "VHRN-BROKER/1"
-        || token.as_bytes().ct_eq(fields[2].as_bytes()).unwrap_u8() != 1
-    {
+    let request = parse_broker_request(&line).map_err(anyhow::Error::from)?;
+    let request_token = match &request {
+        BrokerRequest::Ready(token) | BrokerRequest::Connect { token, .. } => token,
+    };
+    if token.as_bytes().ct_eq(request_token.as_bytes()).unwrap_u8() != 1 {
         bail!("denied");
     }
-    match fields.as_slice() {
-        [_, "READY", _] => Ok(Request::Ready),
-        [_, "CONNECT", _, authority] => {
-            let parsed = LoopbackAuthority::parse(authority).map_err(anyhow::Error::msg)?;
-            if parsed.to_string() != *authority {
-                bail!("denied");
-            }
-            Ok(Request::Connect(parsed))
-        }
-        _ => bail!("denied"),
+    match request {
+        BrokerRequest::Ready(_) => Ok(Request::Ready),
+        BrokerRequest::Connect { authority, .. } => Ok(Request::Connect(authority)),
     }
 }
 fn read_line(stream: &mut TcpStream, deadline: Instant) -> Result<Vec<u8>> {
     let mut line = Vec::new();
     loop {
         let remain = deadline.saturating_duration_since(Instant::now());
-        if remain.is_zero() || line.len() == MAX_HANDSHAKE {
+        if remain.is_zero() || line.len() == MAX_BROKER_FRAME_SIZE {
             bail!("invalid handshake");
         }
         stream.set_read_timeout(Some(remain))?;
@@ -499,10 +491,10 @@ fn relay(mut client: TcpStream, mut upstream: TcpStream) {
     let _ = client.shutdown(Shutdown::Both);
     let _ = forward.join();
 }
-fn random_token() -> io::Result<String> {
+fn random_token() -> io::Result<BrokerToken> {
     let mut bytes = [0; 32];
     fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(hex::encode(bytes))
+    BrokerToken::parse(hex::encode(bytes)).map_err(io::Error::other)
 }
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -752,7 +744,10 @@ mod tests {
     fn malformed_oversized_and_cross_run_tokens_are_denied() {
         let (temp, broker, identity) = broker();
         assert_eq!(exchange(&broker, "bad\n"), "ERR\n");
-        assert_eq!(exchange(&broker, &"x".repeat(MAX_HANDSHAKE)), "ERR\n");
+        assert_eq!(
+            exchange(&broker, &"x".repeat(MAX_BROKER_FRAME_SIZE)),
+            "ERR\n"
+        );
         let second = Broker::bind(
             SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             &temp.path().join("net"),

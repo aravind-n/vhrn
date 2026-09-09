@@ -1032,6 +1032,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "vhrn-policy",
 ]
 
 [[package]]
