@@ -1,5 +1,6 @@
 //! Validated numeric public connection setup.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
@@ -7,15 +8,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::client::conn::http1;
+use hyper::{Request, Uri};
+use hyper_util::rt::TokioIo;
+use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
 
-use crate::service::{BoxFuture, PublicConnector, sealed};
+use crate::service::{BoxFuture, PublicConnector, PublicHttpFuture, PublicResponse, sealed};
 use crate::target::PublicTarget;
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) trait PublicStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T> PublicStream for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -154,6 +167,34 @@ fn is_shared(address: Ipv4Addr) -> bool {
 pub(crate) struct PublicConnectorAdapter {
     resolver: Arc<dyn Resolver>,
     dialer: Arc<dyn NumericDialer>,
+    pool: Mutex<HashMap<OriginKey, OriginConnection>>,
+    response_timeout: Duration,
+    response_limit: usize,
+    #[cfg(test)]
+    public_calls: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    active_drivers: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct OriginConnection {
+    sender: http1::SendRequest<Full<Bytes>>,
+    driver: JoinHandle<()>,
+}
+
+#[cfg(test)]
+struct DriverGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl Drop for DriverGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for OriginConnection {
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
 }
 
 impl PublicConnectorAdapter {
@@ -162,7 +203,35 @@ impl PublicConnectorAdapter {
     }
 
     pub(crate) fn new(resolver: Arc<dyn Resolver>, dialer: Arc<dyn NumericDialer>) -> Self {
-        Self { resolver, dialer }
+        Self {
+            resolver,
+            dialer,
+            pool: Mutex::new(HashMap::new()),
+            response_timeout: HTTP_TIMEOUT,
+            response_limit: MAX_RESPONSE_BYTES,
+            #[cfg(test)]
+            public_calls: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            active_drivers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_response_limits(
+        resolver: Arc<dyn Resolver>,
+        dialer: Arc<dyn NumericDialer>,
+        response_timeout: Duration,
+        response_limit: usize,
+    ) -> Self {
+        Self {
+            resolver,
+            dialer,
+            pool: Mutex::new(HashMap::new()),
+            response_timeout,
+            response_limit,
+            public_calls: std::sync::atomic::AtomicUsize::new(0),
+            active_drivers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
     }
 
     async fn open_with(
@@ -200,16 +269,129 @@ impl PublicConnectorAdapter {
         })
     }
 
+    async fn open_sender(&self, target: &PublicTarget) -> Result<OriginConnection> {
+        let stream =
+            Self::open_with(self.resolver.clone(), self.dialer.clone(), target.clone()).await?;
+        let io: BoxStream = if target.secure() {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let roots =
+                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let server_name = ServerName::try_from(target.host().to_owned())
+                .map_err(|_| anyhow!("invalid TLS server name"))?;
+            let tls = timeout(
+                HTTP_TIMEOUT,
+                TlsConnector::from(Arc::new(config)).connect(server_name, stream),
+            )
+            .await
+            .map_err(|_| anyhow!("TLS handshake timed out"))??;
+            Box::new(tls)
+        } else {
+            stream
+        };
+        let (sender, connection) = timeout(HTTP_TIMEOUT, http1::handshake(TokioIo::new(io)))
+            .await
+            .map_err(|_| anyhow!("origin handshake timed out"))??;
+        #[cfg(test)]
+        let driver_guard = {
+            self.active_drivers
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            DriverGuard(self.active_drivers.clone())
+        };
+        let driver = tokio::spawn(async move {
+            #[cfg(test)]
+            let _driver_guard = driver_guard;
+            let _ = connection.await;
+        });
+        Ok(OriginConnection { sender, driver })
+    }
+
+    async fn send(
+        &self,
+        target: PublicTarget,
+        request: Request<Full<Bytes>>,
+    ) -> Result<PublicResponse> {
+        #[cfg(test)]
+        self.public_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let key = OriginKey::from_target(&target);
+        let request = outbound_request(request)?;
+        let connection = self.pool.lock().await.remove(&key);
+        let mut connection = match connection {
+            Some(connection) => connection,
+            None => self.open_sender(&target).await?,
+        };
+        let response = timeout(
+            self.response_timeout,
+            connection.sender.send_request(request),
+        )
+        .await
+        .map_err(|_| anyhow!("origin response timed out"));
+        let Ok(response) = response else {
+            return Err(response.unwrap_err());
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => return Err(anyhow!(error)),
+        };
+        let (parts, body) = response.into_parts();
+        let body = timeout(
+            self.response_timeout,
+            collect_limited(body, self.response_limit),
+        )
+        .await
+        .map_err(|_| anyhow!("origin body timed out"))??;
+        self.pool.lock().await.insert(key, connection);
+        Ok(PublicResponse {
+            status: parts.status,
+            headers: parts.headers,
+            body,
+        })
+    }
+
     #[cfg(test)]
     async fn open(&self, target: PublicTarget) -> Result<BoxStream> {
         Self::open_with(self.resolver.clone(), self.dialer.clone(), target).await
     }
+
+    #[cfg(test)]
+    pub(crate) async fn pool_len(&self) -> usize {
+        self.pool.lock().await.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn public_calls(&self) -> usize {
+        self.public_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_drivers(&self) -> usize {
+        self.active_drivers
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+async fn collect_limited(mut body: Incoming, limit: usize) -> Result<Bytes> {
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| anyhow!("origin body failed"))?;
+        if let Ok(data) = frame.into_data() {
+            let remaining = limit.saturating_sub(bytes.len());
+            if data.len() > remaining {
+                return Err(anyhow!("origin body too large"));
+            }
+            bytes.extend_from_slice(&data);
+        }
+    }
+    Ok(Bytes::from(bytes))
 }
 
 impl sealed::Public for PublicConnectorAdapter {}
 impl PublicConnector for PublicConnectorAdapter {
-    fn http(&self, target: PublicTarget) -> BoxFuture {
-        self.connect_target(target)
+    fn http(&self, target: PublicTarget, request: Request<Full<Bytes>>) -> PublicHttpFuture<'_> {
+        Box::pin(async move { self.send(target, request).await })
     }
 
     fn connect(&self, target: PublicTarget) -> BoxFuture {
@@ -217,12 +399,27 @@ impl PublicConnector for PublicConnectorAdapter {
     }
 }
 
+fn outbound_request(request: Request<Full<Bytes>>) -> Result<Request<Full<Bytes>>> {
+    let (mut parts, body) = request.into_parts();
+    parts.headers.remove("proxy-connection");
+    parts.headers.remove("proxy-authorization");
+    let path = parts
+        .uri
+        .path_and_query()
+        .map_or("/", |value| value.as_str());
+    parts.uri = path
+        .parse::<Uri>()
+        .map_err(|_| anyhow!("invalid origin path"))?;
+    Ok(Request::from_parts(parts, body))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use tokio::io::DuplexStream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio::sync::oneshot;
 
     use super::*;
     use crate::target::{Target, classify};
@@ -276,6 +473,25 @@ mod tests {
     impl NumericDialer for PendingDialer {
         fn dial(&self, _: SocketAddr) -> DialFuture {
             Box::pin(std::future::pending())
+        }
+    }
+    struct QueueDialer {
+        calls: Mutex<Vec<SocketAddr>>,
+        streams: Mutex<VecDeque<BoxStream>>,
+    }
+    impl QueueDialer {
+        fn new(streams: Vec<BoxStream>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                streams: Mutex::new(streams.into()),
+            }
+        }
+    }
+    impl NumericDialer for QueueDialer {
+        fn dial(&self, address: SocketAddr) -> DialFuture {
+            self.calls.lock().unwrap().push(address);
+            let stream = self.streams.lock().unwrap().pop_front();
+            Box::pin(async move { stream.ok_or_else(|| anyhow!("missing test stream")) })
         }
     }
     fn public_target(value: &str) -> PublicTarget {
@@ -438,6 +654,136 @@ mod tests {
         assert_eq!(first, same);
         assert_ne!(first, secure);
         assert_ne!(first, port);
+    }
+
+    #[test]
+    fn outbound_request_keeps_ordinary_connection_fields() {
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://api.example.com:8080/path?q=one")
+            .header("host", "api.example.com:8080")
+            .header("connection", "X-Remove")
+            .header("x-remove", "kept")
+            .header("proxy-connection", "close")
+            .header("proxy-authorization", "Basic ignored")
+            .body(Full::new(Bytes::from_static(b"body")))
+            .unwrap();
+        let request = outbound_request(request).unwrap();
+        assert_eq!(request.uri(), "/path?q=one");
+        assert_eq!(request.headers()["connection"], "X-Remove");
+        assert_eq!(request.headers()["x-remove"], "kept");
+        assert_eq!(request.headers()["host"], "api.example.com:8080");
+        assert!(!request.headers().contains_key("proxy-connection"));
+        assert!(!request.headers().contains_key("proxy-authorization"));
+    }
+
+    #[tokio::test]
+    async fn secure_origin_never_receives_an_http_request_before_tls() {
+        struct ProbeDialer(Mutex<Option<BoxStream>>);
+        impl NumericDialer for ProbeDialer {
+            fn dial(&self, _: SocketAddr) -> DialFuture {
+                let stream = self.0.lock().unwrap().take().unwrap();
+                Box::pin(async move { Ok(stream) })
+            }
+        }
+
+        let (client, mut peer) = tokio::io::duplex(1024);
+        let (observed, receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let mut bytes = vec![0; 1024];
+            let read = timeout(Duration::from_millis(500), peer.read(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+            bytes.truncate(read);
+            let _ = observed.send(bytes);
+        });
+        let resolver = Arc::new(FakeResolver::new(vec![Ok(parse_addresses("8.8.8.8"))]));
+        let dialer = Arc::new(ProbeDialer(Mutex::new(Some(Box::new(client)))));
+        let connector = PublicConnectorAdapter::new(resolver, dialer);
+        let target = public_target("https://allowed.example/");
+        let request = Request::builder()
+            .uri("https://allowed.example/")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert!(connector.http(target, request).await.is_err());
+        let bytes = timeout(Duration::from_millis(500), receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!bytes.starts_with(b"GET "));
+        assert_eq!(&bytes[..3], &[22, 3, 1]);
+    }
+
+    #[tokio::test]
+    async fn bounded_origin_response_errors_do_not_retain_pool_entries() {
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let resolver = Arc::new(FakeResolver::new(vec![Ok(parse_addresses("8.8.8.8"))]));
+        let dialer = Arc::new(QueueDialer::new(vec![Box::new(client)]));
+        let connector = PublicConnectorAdapter::with_response_limits(
+            resolver,
+            dialer,
+            Duration::from_millis(80),
+            3,
+        );
+        let peer_task = tokio::spawn(async move {
+            let mut request = [0; 1024];
+            let _ = timeout(Duration::from_millis(300), peer.read(&mut request))
+                .await
+                .unwrap()
+                .unwrap();
+            peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ntool")
+                .await
+                .unwrap();
+        });
+        let request = Request::builder()
+            .uri("http://allowed.example/")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert!(
+            connector
+                .http(public_target("http://allowed.example/"), request)
+                .await
+                .is_err()
+        );
+        timeout(Duration::from_millis(300), peer_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(connector.pool_len().await, 0);
+
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let resolver = Arc::new(FakeResolver::new(vec![Ok(parse_addresses("8.8.8.8"))]));
+        let dialer = Arc::new(QueueDialer::new(vec![Box::new(client)]));
+        let connector = PublicConnectorAdapter::with_response_limits(
+            resolver,
+            dialer,
+            Duration::from_millis(50),
+            16,
+        );
+        let peer_task = tokio::spawn(async move {
+            let mut request = [0; 1024];
+            let _ = timeout(Duration::from_millis(300), peer.read(&mut request))
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        });
+        let request = Request::builder()
+            .uri("http://allowed.example/")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert!(
+            connector
+                .http(public_target("http://allowed.example/"), request)
+                .await
+                .is_err()
+        );
+        timeout(Duration::from_millis(300), peer_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(connector.pool_len().await, 0);
     }
 
     #[allow(dead_code)]

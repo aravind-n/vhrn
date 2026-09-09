@@ -8,11 +8,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use http_body_util::Full;
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Body, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
+use hyper::{HeaderMap, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
@@ -31,8 +31,18 @@ const MAX_HEADERS: usize = 64;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(700);
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_millis(800);
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+pub(crate) type PublicHttpFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<PublicResponse>> + Send + 'a>>;
+
+pub struct PublicResponse {
+    pub(crate) status: StatusCode,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Bytes,
+}
 
 pub(crate) mod sealed {
     pub trait Public {}
@@ -41,7 +51,7 @@ pub(crate) mod sealed {
 
 /// Typed inert seam for a public destination.
 pub trait PublicConnector: sealed::Public + Send + Sync + 'static {
-    fn http(&self, target: PublicTarget) -> BoxFuture;
+    fn http(&self, target: PublicTarget, request: Request<Full<Bytes>>) -> PublicHttpFuture<'_>;
     fn connect(&self, target: PublicTarget) -> BoxFuture;
 }
 /// Typed inert seam for a local destination.
@@ -55,8 +65,8 @@ struct InertConnector;
 impl sealed::Public for InertConnector {}
 impl sealed::Local for InertConnector {}
 impl PublicConnector for InertConnector {
-    fn http(&self, _: PublicTarget) -> BoxFuture {
-        Box::pin(async {})
+    fn http(&self, _: PublicTarget, _: Request<Full<Bytes>>) -> PublicHttpFuture<'_> {
+        Box::pin(async { anyhow::bail!("public connector unavailable") })
     }
     fn connect(&self, _: PublicTarget) -> BoxFuture {
         Box::pin(async {})
@@ -238,22 +248,71 @@ async fn handle(
     config: Config,
     connectors: Connectors,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    Ok(route(
-        request.method(),
-        &request.uri().to_string(),
-        config,
-        connectors,
-    )
-    .await)
+    Ok(handle_with_body_limits(request, config, connectors, BODY_TIMEOUT, MAX_BODY_BYTES).await)
 }
 
+async fn handle_with_body_limits<B>(
+    request: Request<B>,
+    config: Config,
+    connectors: Connectors,
+    body_timeout: Duration,
+    body_limit: usize,
+) -> Response<Full<Bytes>>
+where
+    B: Body<Data = Bytes> + Unpin,
+{
+    let (parts, body) = request.into_parts();
+    let Ok(collected) = timeout(body_timeout, collect_request_body(body, body_limit)).await else {
+        return response(StatusCode::BAD_REQUEST, None, "bad request\n");
+    };
+    let Ok(body) = collected else {
+        return response(StatusCode::BAD_REQUEST, None, "bad request\n");
+    };
+    let request = Request::from_parts(parts, Full::new(body));
+    route_request(request, config, connectors).await
+}
+
+async fn collect_request_body<B>(mut body: B, limit: usize) -> std::result::Result<Bytes, ()>
+where
+    B: Body<Data = Bytes> + Unpin,
+{
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| ())?;
+        if let Ok(data) = frame.into_data() {
+            let remaining = limit.saturating_sub(bytes.len());
+            if data.len() > remaining {
+                return Err(());
+            }
+            bytes.extend_from_slice(&data);
+        }
+    }
+    Ok(Bytes::from(bytes))
+}
+
+#[cfg(test)]
 async fn route(
     method: &hyper::Method,
     uri: &str,
     config: Config,
     connectors: Connectors,
 ) -> Response<Full<Bytes>> {
-    let target = classify(method.as_str(), uri);
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Full::new(Bytes::new()))
+        .expect("test request is valid");
+    route_request(request, config, connectors).await
+}
+
+async fn route_request(
+    request: Request<Full<Bytes>>,
+    config: Config,
+    connectors: Connectors,
+) -> Response<Full<Bytes>> {
+    let method = request.method().clone();
+    let uri = request.uri().to_string();
+    let target = classify(method.as_str(), &uri);
     match target {
         Target::Direct(path) if method == hyper::Method::GET => {
             descriptor(&direct_response(&path, effective_mode(&config)))
@@ -266,8 +325,10 @@ async fn route(
                 if decision.record_denial {
                     record(&config, target.authority());
                 }
-                connectors.public.http(target).await;
-                response(StatusCode::BAD_GATEWAY, None, "bad gateway\n")
+                match connectors.public.http(target, request).await {
+                    Ok(origin) => origin_response(origin),
+                    Err(_) => response(StatusCode::BAD_GATEWAY, None, "bad gateway\n"),
+                }
             } else {
                 record(&config, target.authority());
                 response(StatusCode::FORBIDDEN, None, "forbidden\n")
@@ -309,6 +370,16 @@ async fn route(
             }
         }
     }
+}
+
+fn origin_response(origin: PublicResponse) -> Response<Full<Bytes>> {
+    let mut builder = Response::builder().status(origin.status);
+    for (name, value) in &origin.headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Full::new(origin.body))
+        .expect("origin response headers are valid")
 }
 
 fn effective_mode(config: &Config) -> Mode {
@@ -373,14 +444,19 @@ fn normalize_listen(value: &str) -> Result<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::convert::Infallible;
+    use std::pin::Pin;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context as TaskContext, Poll};
 
     use http_body_util::BodyExt;
+    use hyper::body::Frame;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
-    use tokio::sync::{Notify, watch};
+    use tokio::sync::{Notify, oneshot, watch};
     use tokio::time::{Duration, timeout};
 
     use super::*;
@@ -410,9 +486,9 @@ mod tests {
     impl sealed::Public for Counts {}
     impl sealed::Local for Counts {}
     impl PublicConnector for Counts {
-        fn http(&self, _: PublicTarget) -> BoxFuture {
+        fn http(&self, _: PublicTarget, _: Request<Full<Bytes>>) -> PublicHttpFuture<'_> {
             self.public_http.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {})
+            Box::pin(async { anyhow::bail!("test connector") })
         }
         fn connect(&self, _: PublicTarget) -> BoxFuture {
             self.public_connect.fetch_add(1, Ordering::SeqCst);
@@ -433,6 +509,45 @@ mod tests {
         entered: Notify,
         calls: AtomicUsize,
     }
+    struct TestBody {
+        frames: VecDeque<Bytes>,
+        pending: bool,
+    }
+    impl TestBody {
+        fn frames(frames: &[&[u8]]) -> Self {
+            Self {
+                frames: frames
+                    .iter()
+                    .map(|frame| Bytes::copy_from_slice(frame))
+                    .collect(),
+                pending: false,
+            }
+        }
+        fn pending() -> Self {
+            Self {
+                frames: VecDeque::new(),
+                pending: true,
+            }
+        }
+    }
+    impl Body for TestBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if let Some(frame) = self.frames.pop_front() {
+                return Poll::Ready(Some(Ok(Frame::data(frame))));
+            }
+            if self.pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(None)
+            }
+        }
+    }
     struct AdapterResolver(Mutex<Vec<(String, u16)>>);
     impl Resolver for AdapterResolver {
         fn resolve(&self, host: String, port: u16) -> ResolveFuture {
@@ -448,9 +563,37 @@ mod tests {
             Box::pin(async move { Ok(Box::new(stream) as BoxStream) })
         }
     }
+    struct ScenarioResolver {
+        calls: AtomicUsize,
+    }
+    impl Resolver for ScenarioResolver {
+        fn resolve(&self, _: String, _: u16) -> ResolveFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(vec!["8.8.8.8".parse().unwrap()]) })
+        }
+    }
+    struct ScenarioDialer {
+        calls: AtomicUsize,
+        streams: Mutex<VecDeque<BoxStream>>,
+    }
+    impl ScenarioDialer {
+        fn new(streams: Vec<BoxStream>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                streams: Mutex::new(streams.into()),
+            }
+        }
+    }
+    impl NumericDialer for ScenarioDialer {
+        fn dial(&self, _: SocketAddr) -> DialFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let stream = self.streams.lock().unwrap().pop_front();
+            Box::pin(async move { stream.ok_or_else(|| anyhow::anyhow!("missing test stream")) })
+        }
+    }
     impl sealed::Public for PendingPublic {}
     impl PublicConnector for PendingPublic {
-        fn http(&self, _: PublicTarget) -> BoxFuture {
+        fn http(&self, _: PublicTarget, _: Request<Full<Bytes>>) -> PublicHttpFuture<'_> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.entered.notify_one();
             Box::pin(std::future::pending())
@@ -536,6 +679,66 @@ mod tests {
         assert_denial(&format!("{}\n", records[0]), "miss.example");
         assert_denial(&format!("{}\n", records[1]), "miss.example");
         assert!(!records.iter().any(|record| record.contains("token")));
+    }
+
+    fn proxy_request(method: &str, uri: &str, body: &[u8]) -> Request<Full<Bytes>> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "allowed.example")
+            .body(Full::new(Bytes::copy_from_slice(body)))
+            .unwrap()
+    }
+    #[tokio::test]
+    async fn inbound_body_limits_reject_before_routing_and_timeout_boundedly() {
+        assert!(
+            collect_request_body(TestBody::frames(&[b"abc", b"de"]), 4)
+                .await
+                .is_err()
+        );
+        assert!(
+            timeout(
+                Duration::from_millis(40),
+                collect_request_body(TestBody::pending(), 4),
+            )
+            .await
+            .is_err()
+        );
+
+        let directory = tempdir().unwrap();
+        let counts = Arc::new(Counts {
+            public_http: AtomicUsize::new(0),
+            public_connect: AtomicUsize::new(0),
+            local_http: AtomicUsize::new(0),
+            local_connect: AtomicUsize::new(0),
+        });
+        let connectors = Connectors::new(counts.clone(), counts.clone());
+        for body in [TestBody::frames(&[b"abc", b"de"]), TestBody::pending()] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("http://allowed.example/upload")
+                .body(body)
+                .unwrap();
+            let response = timeout(
+                Duration::from_millis(100),
+                handle_with_body_limits(
+                    request,
+                    config(directory.path(), "enforce"),
+                    connectors.clone(),
+                    Duration::from_millis(20),
+                    4,
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(response.headers().get("content-type").is_none());
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                "bad request\n"
+            );
+        }
+        assert_eq!(counts.values(), (0, 0, 0, 0));
     }
     #[tokio::test]
     async fn listen_and_startup_validation() {
@@ -928,5 +1131,307 @@ mod tests {
             .unwrap();
         assert_eq!(report.aborted_tasks, 1);
         drop(first);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn public_service_forwards_exact_request_reuses_pool_then_observes_revocation() {
+        let directory = tempdir().unwrap();
+        let (client, mut origin) = tokio::io::duplex(8192);
+        let resolver = Arc::new(ScenarioResolver {
+            calls: AtomicUsize::new(0),
+        });
+        let dialer = Arc::new(ScenarioDialer::new(vec![Box::new(client)]));
+        let adapter = Arc::new(PublicConnectorAdapter::new(
+            resolver.clone(),
+            dialer.clone(),
+        ));
+        let connectors = Connectors::new(adapter.clone(), Arc::new(InertConnector));
+        let policy_config = config(directory.path(), "enforce");
+        let (seen, received) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let mut first = [0; 2048];
+            let length = timeout(Duration::from_millis(500), origin.read(&mut first))
+                .await
+                .unwrap()
+                .unwrap();
+            let first = String::from_utf8_lossy(&first[..length]);
+            assert!(first.starts_with("POST /path?q=one HTTP/1.1\r\n"));
+            assert!(first.contains("host: allowed.example"));
+            assert!(first.contains("connection: X-Remove"));
+            assert!(first.contains("x-remove: kept"));
+            assert!(first.contains("\r\n\r\nexact body"));
+            assert!(!first.contains("proxy-connection"));
+            assert!(!first.contains("proxy-authorization"));
+            origin
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nX-Origin: one\r\nContent-Length: 5\r\n\r\nfirst",
+                )
+                .await
+                .unwrap();
+            let mut second = [0; 2048];
+            let length = timeout(Duration::from_millis(500), origin.read(&mut second))
+                .await
+                .unwrap()
+                .unwrap();
+            let second = String::from_utf8_lossy(&second[..length]);
+            assert!(second.starts_with("GET /again HTTP/1.1\r\n"));
+            origin
+                .write_all(
+                    b"HTTP/1.1 202 Accepted\r\nX-Origin: two\r\nContent-Length: 6\r\n\r\nsecond",
+                )
+                .await
+                .unwrap();
+            let _ = seen.send(());
+        });
+        let mut first = proxy_request("POST", "http://allowed.example/path?q=one", b"exact body");
+        first
+            .headers_mut()
+            .insert("connection", "X-Remove".parse().unwrap());
+        first
+            .headers_mut()
+            .insert("x-remove", "kept".parse().unwrap());
+        first
+            .headers_mut()
+            .insert("proxy-connection", "close".parse().unwrap());
+        first
+            .headers_mut()
+            .insert("proxy-authorization", "Basic ignored".parse().unwrap());
+        let response = route_request(first, policy_config.clone(), connectors.clone()).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()["x-origin"], "one");
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "first"
+        );
+        let response = route_request(
+            proxy_request("GET", "http://ALLOWED.example./again", b""),
+            policy_config.clone(),
+            connectors.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "second"
+        );
+        timeout(Duration::from_millis(500), received)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_millis(500), origin_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dialer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.public_calls(), 2);
+        std::fs::write(directory.path().join("public"), "").unwrap();
+        let response = route_request(
+            proxy_request("GET", "http://allowed.example/blocked", b""),
+            policy_config,
+            connectors,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "forbidden\n"
+        );
+        assert_eq!(adapter.public_calls(), 2);
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dialer.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn public_service_buffers_origin_response_until_completion() {
+        let directory = tempdir().unwrap();
+        let (client, mut origin) = tokio::io::duplex(4096);
+        let resolver = Arc::new(ScenarioResolver {
+            calls: AtomicUsize::new(0),
+        });
+        let dialer = Arc::new(ScenarioDialer::new(vec![Box::new(client)]));
+        let adapter = Arc::new(PublicConnectorAdapter::new(resolver, dialer));
+        let connectors = Connectors::new(adapter.clone(), Arc::new(InertConnector));
+        let (release, wait) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let mut request = [0; 1024];
+            timeout(Duration::from_millis(500), origin.read(&mut request))
+                .await
+                .unwrap()
+                .unwrap();
+            origin
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nfirst")
+                .await
+                .unwrap();
+            wait.await.unwrap();
+            origin.write_all(b" second").await.unwrap();
+        });
+        let mut response = Box::pin(route_request(
+            proxy_request("GET", "http://allowed.example/stream", b""),
+            config(directory.path(), "enforce"),
+            connectors,
+        ));
+        assert!(
+            timeout(Duration::from_millis(100), &mut response)
+                .await
+                .is_err()
+        );
+        let _ = release.send(());
+        let response = timeout(Duration::from_millis(500), response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "first second"
+        );
+        timeout(Duration::from_millis(500), origin_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(adapter.pool_len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn public_service_disconnect_cancels_origin_and_drops_pool_entry() {
+        let directory = tempdir().unwrap();
+        let (client, mut origin) = tokio::io::duplex(4096);
+        let resolver = Arc::new(ScenarioResolver {
+            calls: AtomicUsize::new(0),
+        });
+        let dialer = Arc::new(ScenarioDialer::new(vec![Box::new(client)]));
+        let adapter = Arc::new(PublicConnectorAdapter::new(resolver, dialer));
+        let connectors = Connectors::new(adapter.clone(), Arc::new(InertConnector));
+        let (started, ready) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let mut request = [0; 1024];
+            timeout(Duration::from_millis(500), origin.read(&mut request))
+                .await
+                .unwrap()
+                .unwrap();
+            let _ = started.send(());
+            let mut byte = [0; 1];
+            assert_eq!(
+                timeout(Duration::from_millis(500), origin.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+        });
+        let request = proxy_request("GET", "http://allowed.example/pending", b"");
+        let task = tokio::spawn(route_request(
+            request,
+            config(directory.path(), "enforce"),
+            connectors,
+        ));
+        timeout(Duration::from_millis(500), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        timeout(Duration::from_millis(500), origin_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(adapter.pool_len().await, 0);
+        timeout(Duration::from_millis(500), async {
+            while adapter.active_drivers() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(adapter.active_drivers(), 0);
+    }
+
+    #[tokio::test]
+    async fn public_service_keys_scheme_normalized_host_and_port_and_verifies_tls() {
+        let directory = tempdir().unwrap();
+        let policy_config = config(directory.path(), "enforce");
+        std::fs::write(
+            directory.path().join("public"),
+            "allowed.example\nother.example\n",
+        )
+        .unwrap();
+        let (first_client, mut first_origin) = tokio::io::duplex(4096);
+        let (second_client, mut second_origin) = tokio::io::duplex(4096);
+        let (tls_client, mut tls_peer) = tokio::io::duplex(4096);
+        let resolver = Arc::new(ScenarioResolver {
+            calls: AtomicUsize::new(0),
+        });
+        let dialer = Arc::new(ScenarioDialer::new(vec![
+            Box::new(first_client),
+            Box::new(second_client),
+            Box::new(tls_client),
+        ]));
+        let adapter = Arc::new(PublicConnectorAdapter::new(
+            resolver.clone(),
+            dialer.clone(),
+        ));
+        let connectors = Connectors::new(adapter, Arc::new(InertConnector));
+        let first = tokio::spawn(async move {
+            let mut request = [0; 1024];
+            timeout(Duration::from_millis(500), first_origin.read(&mut request))
+                .await
+                .unwrap()
+                .unwrap();
+            first_origin
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na")
+                .await
+                .unwrap();
+        });
+        let second = tokio::spawn(async move {
+            let mut request = [0; 1024];
+            timeout(Duration::from_millis(500), second_origin.read(&mut request))
+                .await
+                .unwrap()
+                .unwrap();
+            second_origin
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb")
+                .await
+                .unwrap();
+        });
+        let tls = tokio::spawn(async move {
+            let mut bytes = [0; 1024];
+            let size = timeout(Duration::from_millis(500), tls_peer.read(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(size >= 3);
+            assert_eq!(&bytes[..3], &[22, 3, 1]);
+            assert!(!bytes[..size].starts_with(b"GET "));
+        });
+        for uri in [
+            "http://ALLOWED.example.:80/one",
+            "http://other.example:81/two",
+            "https://allowed.example/three",
+        ] {
+            let response = route_request(
+                proxy_request("GET", uri, b""),
+                policy_config.clone(),
+                connectors.clone(),
+            )
+            .await;
+            if uri.starts_with("https") {
+                assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            } else {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
+        timeout(Duration::from_millis(500), first)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_millis(500), second)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_millis(500), tls)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(dialer.calls.load(Ordering::SeqCst), 3);
     }
 }
