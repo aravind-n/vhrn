@@ -1,0 +1,11 @@
+# TSV: class<TAB>input<TAB>expected status<TAB>observable result
+direct	/healthz	200	ok line
+direct	/__status	200	JSON mode and line-feed
+direct	/not-found	404	not found
+diagnostic	denied.example	403	one RFC3339 tab destination line without broker token
+startup	no public path variables	start	one default public path
+startup	partial local variables	fail	no listener
+startup	invalid local token	fail	no listener
+startup	listener address already bound	fail	no listener
+startup	broker readiness refused	fail	no accepting listener
+lifecycle	SIGTERM	terminate	non-clean termination within one second

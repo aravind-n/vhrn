@@ -1,0 +1,13 @@
+# TSV: class<TAB>target<TAB>policy<TAB>expected status<TAB>observations
+public-http	http://allowed.example/path	enforce matched	origin response	method authority body forwarded; Proxy-Connection and Proxy-Authorization removed; Connection and X-Remove retained
+public-http	http://blocked.example/path	enforce unmatched	403	denial record
+public-http	http://blocked.example/path	report unmatched	origin response	exactly one denial record
+public-http	http://blocked.example/path	open unmatched	origin response	zero denial records
+public-http	https://allowed.example/path	enforce matched	502	connector failure
+public-connect	allowed.example	enforce matched	200	default port 443; parser-buffered request bytes are not relayed
+public-connect	allowed.example:8443	enforce matched	200	explicit port
+public-connect	blocked.example:443	enforce unmatched	403	denial record
+public-connect	allowed.example:443	dial failure	502	no tunnel
+local-http	http://localhost/path	local grant	origin response	broker only; response chunks flush and downstream cancellation closes origin work
+local-connect	localhost:80	local grant	200	broker only; parser-buffered request bytes are relayed
+local-connect	localhost:80	local revoked	200	new tunnel denied; established tunnel remains usable

@@ -1,0 +1,8 @@
+# TSV: exchange<TAB>wire bytes using \n escapes<TAB>response<TAB>post-response bytes<TAB>outcome
+ready	VHRN-BROKER/1 READY <token>\n	OK\n		ready
+connect	VHRN-BROKER/1 CONNECT <token> localhost:80\n	OK\n	payload	connected
+connect	VHRN-BROKER/1 CONNECT <token> localhost:80\n	ERR\n		denied
+connect	VHRN-BROKER/1 CONNECT <token> localhost:80\n	NO\n		denied
+connect	VHRN-BROKER/1 CONNECT <token> localhost:80\n	TOOLONG		denied
+connect	VHRN-BROKER/1 CONNECT <token> localhost:80\n	O		cancelled
+ready	VHRN-BROKER/1 READY <token>\n	timeout		cancelled

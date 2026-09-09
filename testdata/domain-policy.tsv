@@ -1,0 +1,13 @@
+# TSV: kind<TAB>input<TAB>normalized-or-host<TAB>allow entry<TAB>outcome
+# Empty fields are represented by an empty cell. Whitespace in input is literal.
+entry	  GitHub.COM 	github.com		accept
+entry	*.api.example.com	api.example.com		accept
+entry	example.com.	example.com		accept
+entry	https://bad.example			deny
+entry	example..com			deny
+entry				deny
+host	API.EXAMPLE.COM.	api.example.com	api.example.com	allow
+host	x.api.example.com	x.api.example.com	api.example.com	allow
+host	evilapi.example.com	evilapi.example.com	api.example.com	deny
+host	api.example.com.attacker.test	api.example.com.attacker.test	api.example.com	deny
+host			api.example.com	deny
