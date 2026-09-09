@@ -1,21 +1,35 @@
 # Rust proxy migration
 
-Status: proposed; implementation has not started.
+Status: in progress; the clean-room protocol is approved and characterization has not started.
 
-Replace the Go egress proxy with an idiomatic Rust service built from the proxy's security and
-protocol contract. Keep Go as the shipping implementation until the Rust image passes the cutover
-gate, then remove Go and ship one proxy implementation.
+Replace the Go egress proxy with an idiomatic Rust service built clean-room from the proxy's
+consumer contract and the vhrn security requirements. Keep Go as the shipping implementation until
+the Rust image passes the cutover gate, then remove Go and ship one proxy implementation.
 
-The source of truth for current behavior is the combination of:
+This migration uses two strictly separated rooms. The existing user-created
+`proxy/rust-migration` branch is reused; Ship performs no branch operation in this documentation
+step.
 
-- `proxy/` for request handling, policy enforcement, safe dialing, diagnostics, and image shape;
-- `src/net.rs` for policy values and live policy storage;
-- `src/broker.rs` for `VHRN-BROKER/1` and local connection enforcement;
-- `src/run.rs` for the process environment, mounts, image invocation, and lifecycle;
-- `proxy/Makefile`, `proxy/Dockerfile`, and `.github/workflows/` for build and release behavior.
+**Characterization room.** A characterization-only role may inspect or run the Go proxy. It may
+write only a standalone normative consumer contract, language-neutral outcome fixtures, and Go
+characterization tests. It must not change Go production code or write Rust source or tests. The
+contract records only consumer-observable inputs, outcomes, and observations; it contains no Go
+implementation rationale, structure, control flow, or identifiers.
 
-Characterize observable behavior from those boundaries. Use the Go code as evidence, not as the
-Rust module design.
+**Rust room.** Freeze and commit the consumer contract and fixtures before any Rust production
+code or Rust test begins. Every Rust production, Rust test, and Rust remediation worker is fresh
+and has no prior Go-room history. Rust workers may read only the frozen contract and fixtures,
+consumer-facing host Rust interfaces and security requirements, and existing Rust work. They may
+not open current or historical Go source, Go tests, Go module files, or receive Go-derived
+explanations. Rust source and tests stand alone: they contain no Go or migration comments,
+rationales, copied structure, control flow, identifiers, or history-shaped abstractions.
+
+Only the orchestrator or a read-only reviewer may run reference-versus-candidate differentials.
+When a differential finds a discrepancy, it first becomes a consumer-observable contract row. A
+fresh Rust worker receives only that normative outcome, never a Go-derived explanation. Preserve
+all consumer-visible behavior: this plan authorizes neither behavior changes nor treating a
+difference as an outcome exemption. A conflict with an `AGENTS.md` security invariant
+stops for user direction; it is neither silently preserved nor corrected.
 
 ## Target design
 
@@ -208,9 +222,12 @@ changing host parsing. Keep tokens out of logs, errors, panic messages, and stat
 
 ## Feature parity
 
-Create language-neutral corpora under `testdata/` and make Go and Rust consume the same rows during
-the migration. Each row states the required outcome rather than a function name or implementation
-detail. Add a regression row before fixing any discrepancy.
+The characterization room creates a standalone normative consumer contract and language-neutral
+outcome corpora under `testdata/`; the contract and fixtures are frozen and committed before Rust
+work begins. Each row states the required consumer outcome and observations rather than a function
+name or implementation detail. Go characterization tests may consume those rows. Rust workers use
+only the frozen contract and fixtures, never Go materials. The orchestrator or read-only reviewer
+adds a consumer-observable contract row before assigning a Rust remediation for any differential.
 
 | Area | Required cases |
 | --- | --- |
@@ -242,10 +259,12 @@ standard gate.
 
 ## Implementation sequence
 
-### Phase 1: characterize the contract
+### Phase 1: characterize and freeze the consumer contract
 
-Inventory the observable boundary from the source-of-truth files. Add shared corpora and missing Go
-characterization tests. Resolve these known ambiguities before choosing Rust helpers:
+The characterization room inventories the consumer-observable boundary and writes the standalone
+normative contract, outcome corpora, and any needed Go characterization tests. It may inspect or
+run Go only within that room; it does not write Go production code or Rust. Resolve these known
+consumer-outcome ambiguities before the contract is frozen:
 
 - public CONNECT currently handles HTTP-parser buffering differently from local CONNECT;
 - public and local HTTP currently differ in flush and cancellation behavior;
@@ -253,12 +272,13 @@ characterization tests. Resolve these known ambiguities before choosing Rust hel
 - standard hop-by-hop headers need an explicit forwarding rule;
 - process shutdown needs an explicit drain bound.
 
-Choose one target behavior for each ambiguity based on the security contract and client-visible
-result. Record intentional corrections as contract rows rather than preserving accidental behavior.
+Record the established consumer-visible outcome for each ambiguity. If it conflicts with an
+`AGENTS.md` security invariant, stop for user direction; do not preserve or correct it by default.
+Freeze and commit the contract and fixtures before beginning Phase 2 Rust production or tests.
 
-Completion criterion: every row in the parity table has an expected outcome, both implementations
-can read the applicable corpus, all Go characterization checks pass, and each ambiguity above has a
-recorded decision.
+Completion criterion: every row in the parity table has a normative expected outcome, the frozen
+contract and fixtures are committed, all Go characterization checks pass, and each ambiguity above
+has a recorded consumer outcome. No Rust production code or Rust test has begun.
 
 ### Phase 2: create the workspace and shared types
 
@@ -304,9 +324,12 @@ for pooled requests and established tunnels.
 
 ### Phase 6: close parity and resource bounds
 
-Run the complete corpus against Go and Rust. Classify each difference as a Rust defect, a fixture
-defect, or an intentional contract correction. Stress slow bodies, partial frames, half-closes,
-disconnects, policy replacement, concurrent tunnels, and shutdown races.
+The orchestrator or a read-only reviewer runs the complete frozen corpus against Go and Rust. Each
+difference first becomes a consumer-observable contract row; the orchestrator then gives a fresh
+Rust worker only the normative row for remediation. Do not exempt a difference from the frozen
+normative outcome. A security-invariant conflict stops for user direction.
+Stress slow bodies, partial frames, half-closes, disconnects, policy replacement, concurrent
+tunnels, and shutdown races.
 
 Measure the Go and Rust proxy with the same local workload:
 
@@ -318,9 +341,9 @@ Measure the Go and Rust proxy with the same local workload:
 
 Set accepted bounds from the measurements and record the rationale for every accepted regression.
 
-Completion criterion: every parity row passes or names an approved contract correction; stress runs
-remain within explicit task, socket, memory, and time bounds; dependency, license, advisory, binary,
-image, and resource reviews are complete.
+Completion criterion: every frozen parity row passes; stress runs remain within explicit task,
+socket, memory, and time bounds; dependency, license, advisory, binary, image, and resource reviews
+are complete.
 
 ### Phase 7: qualify the Rust image
 
@@ -341,9 +364,9 @@ Makefile interface remain unchanged; release tags still point to Go.
 ### Phase 8: cut over
 
 Replace `proxy/Dockerfile` with the qualified Rust build and remove `Dockerfile.rust`. Remove the Go
-sources, module, tests, toolchain setup, vulnerability job, and Go build stage. Retain all corpora and
-Rust parity checks. Update `AGENTS.md`, workflow path filters, release documentation, and component
-descriptions in the same change.
+sources, module, tests, toolchain setup, vulnerability job, and Go build stage. Retain the frozen
+consumer contract, outcome corpora, and standalone Rust parity checks. Update `AGENTS.md`, workflow
+path filters, release documentation, and component descriptions in the same change.
 
 Build a new matched CLI/proxy release. Preserve existing immutable image tags. Rollback uses the
 previous matched release or a reverted change published under a new version.
@@ -354,7 +377,9 @@ passes the full parity, resource, architecture, engine, and release-contract gat
 
 ## CI changes
 
-During phases 2–7, run Go checks and Rust workspace checks in parallel while packaging Go:
+During phases 2–7, run Go checks in the characterization room and Rust workspace checks in the Rust
+room while packaging Go. The checks may run in parallel, but no Go source, test, module, output, or
+explanation crosses into a Rust worker's context:
 
 ```text
 cargo fmt --all -- --check
@@ -379,7 +404,9 @@ Append evidence as phases complete:
 | Date | Phase | Revision/image | Command or corpus | Platform | Result |
 | --- | --- | --- | --- | --- | --- |
 
-Record failures and open gaps alongside passes. A phase is complete only when its completion
-criterion is supported by entries here and by checked-in tests or review artifacts.
+Record failures and open gaps alongside passes. Differential evidence is recorded only by the
+orchestrator or read-only reviewer and states consumer-observable outcomes, never Go implementation
+detail. A phase is complete only when its completion criterion is supported by entries here and by
+checked-in tests or review artifacts.
 
 No implementation evidence exists yet.
