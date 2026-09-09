@@ -62,8 +62,11 @@ authority, ordinary headers, and body. It removes `Proxy-Connection` and
 `X-Remove` field remain visible to the origin. A denied
 public or local request returns 403. An origin or connector failure returns 502.
 
-Public HTTP streaming and cancellation outcomes are not fixed by this contract.
-Local HTTP flushes each response chunk when flushing is available. A downstream
+For public HTTP, an origin-flushed first chunk remains buffered until origin
+completion; a downstream disconnect cancels origin work. Two allowed public
+requests reuse one origin connection; after live policy revocation, the next
+request returns 403 without another origin request or connector call. Local HTTP
+flushes each response chunk when flushing is available. A downstream
 disconnect cancels the request context used for the local route. Local HTTP uses
 the broker connector only and closes origin response work on downstream
 cancellation. Local decisions always use the three local layers and are
@@ -73,8 +76,12 @@ CONNECT uses the supplied port or 443 when none is supplied. It connects before
 writing 200. The public path discards HTTP-parser-buffered bytes after upgrade;
 the local path relays those buffered bytes. A revoked grant blocks later
 requests and tunnels but does not end an established local tunnel.
-Absolute-form HTTPS that encounters a connector failure returns 502. Package
-certificate-root qualification is outside this contract.
+For a public CONNECT tunnel, when the upstream sends bytes then closes its write
+side, the client receives those bytes followed by EOF and the upstream read side
+receives EOF.
+An absolute-form HTTPS request to a loopback origin with an untrusted certificate
+returns 502 after verified TLS handshake failure; the origin receives zero HTTP
+requests. Package certificate-root qualification is outside this contract.
 `proxy-http-cases.tsv` fixes these outcomes.
 
 ## Local authority and broker exchange

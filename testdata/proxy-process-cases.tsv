@@ -1,7 +1,7 @@
 # TSV: class<TAB>input<TAB>expected status<TAB>observable result
-direct	/healthz	200	ok line
-direct	/__status	200	JSON mode and line-feed
-direct	/not-found	404	not found
+direct	/healthz	200	ok line-feed
+direct	/__status	200	application/json mode JSON line-feed
+direct	/not-found	404	404 page not found line-feed
 diagnostic	denied.example	403	one RFC3339 tab destination line without broker token
 startup	no public path variables	start	one default public path
 startup	partial local variables	fail	no listener
