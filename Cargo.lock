@@ -1043,10 +1043,13 @@ version = "0.1.0"
 name = "vhrn-proxy"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "tempfile",
  "tokio",
+ "vhrn-policy",
 ]
 
 [[package]]

@@ -20,7 +20,12 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+anyhow = "1.0.104"
 http-body-util = "0.1.3"
 hyper = { version = "1.8.1", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "signal"] }
+vhrn-policy = { path = "../crates/vhrn-policy" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

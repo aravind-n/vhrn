@@ -1,5 +1,10 @@
-//! Runtime wiring will live here.
+//! Values and decisions for the network boundary.
 #![forbid(unsafe_code)]
+
+pub mod config;
+pub mod diagnostics;
+pub mod policy;
+pub mod target;
 
 /// Returns this package's Cargo name.
 #[must_use]
