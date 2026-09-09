@@ -2,7 +2,7 @@
 
 use std::io;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
 
 /// Relays both stream directions until EOF, cancellation, or an I/O error.
@@ -12,11 +12,7 @@ use tokio::sync::watch;
 /// # Errors
 ///
 /// Returns the first I/O error reported by either direction.
-pub async fn relay<A, B>(
-    mut first: A,
-    mut second: B,
-    mut shutdown: watch::Receiver<bool>,
-) -> io::Result<()>
+pub async fn relay<A, B>(first: A, second: B, mut shutdown: watch::Receiver<bool>) -> io::Result<()>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
@@ -24,11 +20,24 @@ where
     if *shutdown.borrow() {
         return Ok(());
     }
+    let (mut first_read, mut first_write) = tokio::io::split(first);
+    let (mut second_read, mut second_write) = tokio::io::split(second);
+
     tokio::select! {
-        result = tokio::io::copy_bidirectional(&mut first, &mut second) => result.map(|_| ()),
-        () = cancelled(&mut shutdown) => {
+        result = tokio::io::copy(&mut first_read, &mut second_write) => {
+            result?;
+            second_write.shutdown().await?;
+            tokio::select! {
+                result = tokio::io::copy(&mut second_read, &mut first_write) => result.map(|_| ()),
+                () = cancelled(&mut shutdown) => Ok(()),
+            }
+        }
+        result = tokio::io::copy(&mut second_read, &mut first_write) => {
+            result?;
+            first_write.shutdown().await?;
             Ok(())
         }
+        () = cancelled(&mut shutdown) => Ok(()),
     }
 }
 
@@ -130,6 +139,39 @@ mod tests {
         let mut response = Vec::new();
         client_peer.read_to_end(&mut response).await.unwrap();
         assert_eq!(response, b"response");
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upstream_eof_closes_both_sides_without_waiting_for_client_eof() {
+        let (client, mut client_peer) = tokio::io::duplex(64);
+        let (server, mut server_peer) = tokio::io::duplex(64);
+        let (shutdown, _) = watch::channel(false);
+        let task = tokio::spawn(relay(client, server, shutdown.subscribe()));
+
+        server_peer.write_all(b"sentinel").await.unwrap();
+        server_peer.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        timeout(
+            Duration::from_secs(1),
+            client_peer.read_to_end(&mut received),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(received, b"sentinel");
+        let mut byte = [0];
+        assert_eq!(
+            timeout(Duration::from_secs(1), server_peer.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
         timeout(Duration::from_secs(1), task)
             .await
             .unwrap()

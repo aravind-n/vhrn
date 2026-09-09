@@ -22,7 +22,9 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
-use crate::service::{BoxFuture, PublicConnector, PublicHttpFuture, PublicResponse, sealed};
+use crate::service::{
+    PublicConnectFuture, PublicConnector, PublicHttpFuture, PublicResponse, sealed,
+};
 use crate::target::PublicTarget;
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -261,12 +263,10 @@ impl PublicConnectorAdapter {
             .map_err(|_| anyhow!("public connection timed out"))?
     }
 
-    fn connect_target(&self, target: PublicTarget) -> BoxFuture {
+    fn connect_target(&self, target: PublicTarget) -> PublicConnectFuture<'_> {
         let resolver = self.resolver.clone();
         let dialer = self.dialer.clone();
-        Box::pin(async move {
-            let _ = Self::open_with(resolver, dialer, target).await;
-        })
+        Box::pin(async move { Self::open_with(resolver, dialer, target).await })
     }
 
     async fn open_sender(&self, target: &PublicTarget) -> Result<OriginConnection> {
@@ -394,7 +394,7 @@ impl PublicConnector for PublicConnectorAdapter {
         Box::pin(async move { self.send(target, request).await })
     }
 
-    fn connect(&self, target: PublicTarget) -> BoxFuture {
+    fn connect(&self, target: PublicTarget) -> PublicConnectFuture<'_> {
         self.connect_target(target)
     }
 }
@@ -547,6 +547,34 @@ mod tests {
         assert_eq!(
             *dialer.calls.lock().unwrap(),
             vec!["8.8.8.8:80".parse().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_uses_default_or_explicit_authority_number() {
+        let resolver = Arc::new(FakeResolver::new(vec![
+            Ok(parse_addresses("8.8.8.8")),
+            Ok(parse_addresses("8.8.8.8")),
+        ]));
+        let (first, _) = tokio::io::duplex(1);
+        let (second, _) = tokio::io::duplex(1);
+        let dialer = Arc::new(QueueDialer::new(vec![Box::new(first), Box::new(second)]));
+        let connector = PublicConnectorAdapter::new(resolver, dialer.clone());
+        let Target::PublicConnect(default_target) = classify("CONNECT", "allowed.example") else {
+            panic!("expected public CONNECT target");
+        };
+        let Target::PublicConnect(explicit_target) = classify("CONNECT", "allowed.example:8443")
+        else {
+            panic!("expected public CONNECT target");
+        };
+        let _ = connector.open(default_target).await.unwrap();
+        let _ = connector.open(explicit_target).await.unwrap();
+        assert_eq!(
+            *dialer.calls.lock().unwrap(),
+            vec![
+                "8.8.8.8:443".parse().unwrap(),
+                "8.8.8.8:8443".parse().unwrap(),
+            ]
         );
     }
 

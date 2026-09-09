@@ -37,6 +37,8 @@ const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub(crate) type PublicHttpFuture<'a> =
     Pin<Box<dyn Future<Output = anyhow::Result<PublicResponse>> + Send + 'a>>;
+pub(crate) type PublicConnectFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<crate::public::BoxStream>> + Send + 'a>>;
 
 pub struct PublicResponse {
     pub(crate) status: StatusCode,
@@ -50,9 +52,9 @@ pub(crate) mod sealed {
 }
 
 /// Typed inert seam for a public destination.
-pub trait PublicConnector: sealed::Public + Send + Sync + 'static {
+pub(crate) trait PublicConnector: sealed::Public + Send + Sync + 'static {
     fn http(&self, target: PublicTarget, request: Request<Full<Bytes>>) -> PublicHttpFuture<'_>;
-    fn connect(&self, target: PublicTarget) -> BoxFuture;
+    fn connect(&self, target: PublicTarget) -> PublicConnectFuture<'_>;
 }
 /// Typed inert seam for a local destination.
 pub trait LocalConnector: sealed::Local + Send + Sync + 'static {
@@ -68,8 +70,8 @@ impl PublicConnector for InertConnector {
     fn http(&self, _: PublicTarget, _: Request<Full<Bytes>>) -> PublicHttpFuture<'_> {
         Box::pin(async { anyhow::bail!("public connector unavailable") })
     }
-    fn connect(&self, _: PublicTarget) -> BoxFuture {
-        Box::pin(async {})
+    fn connect(&self, _: PublicTarget) -> PublicConnectFuture<'_> {
+        Box::pin(async { anyhow::bail!("public connector unavailable") })
     }
 }
 impl LocalConnector for InertConnector {
@@ -222,17 +224,67 @@ async fn serve_connection(
     if *shutdown.borrow() {
         return;
     }
-    let service = service_fn(move |request| handle(request, config.clone(), connectors.clone()));
+    let tunnels = Arc::new(tokio::sync::Mutex::new(JoinSet::new()));
+    let service_tunnels = tunnels.clone();
+    let service_shutdown = shutdown.clone();
+    let service = service_fn(move |request| {
+        handle(
+            request,
+            config.clone(),
+            connectors.clone(),
+            service_tunnels.clone(),
+            service_shutdown.clone(),
+        )
+    });
     let mut connection = Box::pin(
         http1::Builder::new()
             .max_headers(MAX_HEADERS)
             .max_buf_size(MAX_HEADER_BYTES)
-            .serve_connection(TokioIo::new(stream), service),
+            .serve_connection(TokioIo::new(stream), service)
+            .with_upgrades(),
     );
-    tokio::select! {
-        _ = &mut connection => {}
-        () = cancelled(&mut shutdown) => { connection.as_mut().graceful_shutdown(); let _ = timeout(CONNECTION_DRAIN_TIMEOUT, &mut connection).await; }
+    let shutting_down = tokio::select! {
+        _ = &mut connection => false,
+        () = cancelled(&mut shutdown) => {
+            connection.as_mut().graceful_shutdown();
+            let _ = timeout(CONNECTION_DRAIN_TIMEOUT, &mut connection).await;
+            true
+        }
+    };
+    wait_for_tunnels(&tunnels, shutdown, shutting_down).await;
+}
+
+async fn wait_for_tunnels(
+    tunnels: &tokio::sync::Mutex<JoinSet<()>>,
+    mut shutdown: watch::Receiver<bool>,
+    shutting_down: bool,
+) {
+    let mut tunnels = tunnels.lock().await;
+    if !shutting_down && !*shutdown.borrow() {
+        while !tunnels.is_empty() {
+            tokio::select! {
+                _ = tunnels.join_next() => {}
+                () = cancelled(&mut shutdown) => break,
+            }
+        }
     }
+    if tunnels.is_empty() {
+        return;
+    }
+    let deadline = Instant::now() + CONNECTION_DRAIN_TIMEOUT;
+    while !tunnels.is_empty() {
+        match timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            tunnels.join_next(),
+        )
+        .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    tunnels.abort_all();
+    while tunnels.join_next().await.is_some() {}
 }
 
 async fn cancelled(shutdown: &mut watch::Receiver<bool>) {
@@ -247,8 +299,70 @@ async fn handle(
     request: Request<Incoming>,
     config: Config,
     connectors: Connectors,
+    tunnels: Arc<tokio::sync::Mutex<JoinSet<()>>>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if request.method() == hyper::Method::CONNECT {
+        return Ok(handle_connect(request, config, connectors, tunnels, shutdown).await);
+    }
     Ok(handle_with_body_limits(request, config, connectors, BODY_TIMEOUT, MAX_BODY_BYTES).await)
+}
+
+async fn handle_connect(
+    mut request: Request<Incoming>,
+    config: Config,
+    connectors: Connectors,
+    tunnels: Arc<tokio::sync::Mutex<JoinSet<()>>>,
+    shutdown: watch::Receiver<bool>,
+) -> Response<Full<Bytes>> {
+    let uri = request.uri().to_string();
+    let Target::PublicConnect(target) = classify("CONNECT", &uri) else {
+        return route_connect_fallback(&config, &connectors, &uri).await;
+    };
+    let decision = decide_public(&config.allowlists, &config.mode_file, target.host());
+    if !decision.allowed {
+        record(&config, target.authority());
+        return response(StatusCode::FORBIDDEN, None, "forbidden\n");
+    }
+    if decision.record_denial {
+        record(&config, target.authority());
+    }
+    let Ok(upstream) = connectors.public.connect(target).await else {
+        return response(StatusCode::BAD_GATEWAY, None, "bad gateway\n");
+    };
+    let upgrade = hyper::upgrade::on(&mut request);
+    tunnels.lock().await.spawn(async move {
+        let Ok(upgraded) = upgrade.await else {
+            return;
+        };
+        let Ok(parts) = upgraded.downcast::<TokioIo<TcpStream>>() else {
+            return;
+        };
+        let _ = crate::relay::relay(TokioIo::new(parts.io), upstream, shutdown).await;
+    });
+    response(StatusCode::OK, None, "")
+}
+
+async fn route_connect_fallback(
+    config: &Config,
+    connectors: &Connectors,
+    uri: &str,
+) -> Response<Full<Bytes>> {
+    let target = classify("CONNECT", uri);
+    match target {
+        Target::LocalConnect(target) => {
+            if config.local.as_ref().is_some_and(|local| {
+                decide_local(&local.policy_paths, target.canonical_authority())
+            }) {
+                connectors.local.connect(target).await;
+                response(StatusCode::BAD_GATEWAY, None, "bad gateway\n")
+            } else {
+                record(config, target.authority());
+                response(StatusCode::FORBIDDEN, None, "forbidden\n")
+            }
+        }
+        _ => response(StatusCode::BAD_REQUEST, None, "bad request\n"),
+    }
 }
 
 async fn handle_with_body_limits<B>(
@@ -340,7 +454,7 @@ async fn route_request(
                 if decision.record_denial {
                     record(&config, target.authority());
                 }
-                connectors.public.connect(target).await;
+                let _ = connectors.public.connect(target).await;
                 response(StatusCode::BAD_GATEWAY, None, "bad gateway\n")
             } else {
                 record(&config, target.authority());
@@ -490,9 +604,9 @@ mod tests {
             self.public_http.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { anyhow::bail!("test connector") })
         }
-        fn connect(&self, _: PublicTarget) -> BoxFuture {
+        fn connect(&self, _: PublicTarget) -> PublicConnectFuture<'_> {
             self.public_connect.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {})
+            Box::pin(async { anyhow::bail!("test connector") })
         }
     }
     impl LocalConnector for Counts {
@@ -508,6 +622,20 @@ mod tests {
     struct PendingPublic {
         entered: Notify,
         calls: AtomicUsize,
+    }
+    struct ControlledPublic {
+        entered: Notify,
+        calls: AtomicUsize,
+        result: Mutex<Option<oneshot::Receiver<anyhow::Result<BoxStream>>>>,
+    }
+    impl ControlledPublic {
+        fn new(result: oneshot::Receiver<anyhow::Result<BoxStream>>) -> Self {
+            Self {
+                entered: Notify::new(),
+                calls: AtomicUsize::new(0),
+                result: Mutex::new(Some(result)),
+            }
+        }
     }
     struct TestBody {
         frames: VecDeque<Bytes>,
@@ -574,19 +702,22 @@ mod tests {
     }
     struct ScenarioDialer {
         calls: AtomicUsize,
+        addresses: Mutex<Vec<SocketAddr>>,
         streams: Mutex<VecDeque<BoxStream>>,
     }
     impl ScenarioDialer {
         fn new(streams: Vec<BoxStream>) -> Self {
             Self {
                 calls: AtomicUsize::new(0),
+                addresses: Mutex::new(Vec::new()),
                 streams: Mutex::new(streams.into()),
             }
         }
     }
     impl NumericDialer for ScenarioDialer {
-        fn dial(&self, _: SocketAddr) -> DialFuture {
+        fn dial(&self, address: SocketAddr) -> DialFuture {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.addresses.lock().unwrap().push(address);
             let stream = self.streams.lock().unwrap().pop_front();
             Box::pin(async move { stream.ok_or_else(|| anyhow::anyhow!("missing test stream")) })
         }
@@ -598,8 +729,25 @@ mod tests {
             self.entered.notify_one();
             Box::pin(std::future::pending())
         }
-        fn connect(&self, _: PublicTarget) -> BoxFuture {
-            Box::pin(async {})
+        fn connect(&self, _: PublicTarget) -> PublicConnectFuture<'_> {
+            Box::pin(async { anyhow::bail!("test connector") })
+        }
+    }
+    impl sealed::Public for ControlledPublic {}
+    impl PublicConnector for ControlledPublic {
+        fn http(&self, _: PublicTarget, _: Request<Full<Bytes>>) -> PublicHttpFuture<'_> {
+            Box::pin(async { anyhow::bail!("test connector") })
+        }
+
+        fn connect(&self, _: PublicTarget) -> PublicConnectFuture<'_> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            let result = self.result.lock().unwrap().take().unwrap();
+            Box::pin(async move {
+                result
+                    .await
+                    .map_err(|_| anyhow::anyhow!("test connector released without result"))?
+            })
         }
     }
     fn config(directory: &std::path::Path, mode: &str) -> Config {
@@ -663,6 +811,20 @@ mod tests {
         .unwrap()
         .unwrap();
         response
+    }
+    async fn response_head(stream: &mut TcpStream) -> Vec<u8> {
+        let mut head = Vec::new();
+        loop {
+            let mut byte = [0];
+            timeout(Duration::from_millis(500), stream.read_exact(&mut byte))
+                .await
+                .unwrap()
+                .unwrap();
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                return head;
+            }
+        }
     }
     async fn route_status(
         method: &hyper::Method,
@@ -824,6 +986,400 @@ mod tests {
             .status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn denied_public_connect_never_resolves_or_dials() {
+        let directory = tempdir().unwrap();
+        let listener = bind_listener("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let resolver = Arc::new(AdapterResolver(Mutex::new(Vec::new())));
+        let dialer = Arc::new(AdapterDialer(Mutex::new(Vec::new())));
+        let (shutdown, receiver) = watch::channel(false);
+        let task = tokio::spawn(serve(
+            listener,
+            config(directory.path(), "enforce"),
+            Connectors::new(
+                Arc::new(PublicConnectorAdapter::new(
+                    resolver.clone(),
+                    dialer.clone(),
+                )),
+                Arc::new(InertConnector),
+            ),
+            receiver,
+        ));
+        let response = raw_request(
+            address,
+            b"CONNECT denied.example:443 HTTP/1.1\r\nHost: denied.example:443\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
+        assert!(response.ends_with(b"\r\n\r\nforbidden\n"));
+        assert!(
+            std::fs::read_to_string(directory.path().join("deny"))
+                .unwrap()
+                .ends_with("\tdenied.example:443\n")
+        );
+        assert!(resolver.0.lock().unwrap().is_empty());
+        assert!(dialer.0.lock().unwrap().is_empty());
+        shutdown.send(true).unwrap();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_connect_discards_header_buffer_and_relays_after_success() {
+        let directory = tempdir().unwrap();
+        let listener = bind_listener("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (upstream, mut peer) = tokio::io::duplex(1024);
+        let resolver = Arc::new(ScenarioResolver {
+            calls: AtomicUsize::new(0),
+        });
+        let dialer = Arc::new(ScenarioDialer::new(vec![Box::new(upstream)]));
+        let adapter = Arc::new(PublicConnectorAdapter::new(resolver, dialer.clone()));
+        let (shutdown, receiver) = watch::channel(false);
+        let task = tokio::spawn(serve(
+            listener,
+            config(directory.path(), "enforce"),
+            Connectors::new(adapter, Arc::new(InertConnector)),
+            receiver,
+        ));
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"CONNECT allowed.example HTTP/1.1\r\nHost: allowed.example\r\n\r\nsentinel")
+            .await
+            .unwrap();
+        let head = response_head(&mut client).await;
+        assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(head.ends_with(b"\r\n\r\n"));
+        assert_eq!(
+            dialer.addresses.lock().unwrap().as_slice(),
+            &["8.8.8.8:443".parse().unwrap()]
+        );
+        let mut unexpected = [0; 8];
+        assert!(
+            timeout(Duration::from_millis(80), peer.read(&mut unexpected))
+                .await
+                .is_err()
+        );
+        client.write_all(b"later bytes").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut forwarded = Vec::new();
+        peer.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(forwarded, b"later bytes");
+        peer.write_all(b"upstream bytes").await.unwrap();
+        peer.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"upstream bytes");
+        shutdown.send(true).unwrap();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_connect_upstream_eof_forwards_bytes_then_closes_both_sides() {
+        for _ in 0..5 {
+            let directory = tempdir().unwrap();
+            let listener = bind_listener("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (upstream, mut peer) = tokio::io::duplex(1024);
+            let dialer = Arc::new(ScenarioDialer::new(vec![Box::new(upstream)]));
+            let adapter = Arc::new(PublicConnectorAdapter::new(
+                Arc::new(ScenarioResolver {
+                    calls: AtomicUsize::new(0),
+                }),
+                dialer,
+            ));
+            let (shutdown, receiver) = watch::channel(false);
+            let service = tokio::spawn(serve(
+                listener,
+                config(directory.path(), "enforce"),
+                Connectors::new(adapter, Arc::new(InertConnector)),
+                receiver,
+            ));
+            let mut client = TcpStream::connect(address).await.unwrap();
+            client
+                .write_all(
+                    b"CONNECT allowed.example HTTP/1.1\r\nHost: allowed.example\r\n\r\nignored",
+                )
+                .await
+                .unwrap();
+            let head = response_head(&mut client).await;
+            assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            let mut discarded = [0; 1];
+            assert!(
+                timeout(Duration::from_millis(80), peer.read(&mut discarded))
+                    .await
+                    .is_err()
+            );
+            peer.write_all(b"sentinel").await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut forwarded = Vec::new();
+            timeout(Duration::from_secs(1), client.read_to_end(&mut forwarded))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(forwarded, b"sentinel");
+            let mut byte = [0];
+            assert_eq!(
+                timeout(Duration::from_secs(1), peer.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            shutdown.send(true).unwrap();
+            let report = timeout(Duration::from_secs(1), service)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(report.aborted_tasks, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn healthy_public_tunnel_outlives_connection_drain_timeout() {
+        for _ in 0..5 {
+            let directory = tempdir().unwrap();
+            let listener = bind_listener("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (upstream, mut peer) = tokio::io::duplex(1024);
+            let dialer = Arc::new(ScenarioDialer::new(vec![Box::new(upstream)]));
+            let adapter = Arc::new(PublicConnectorAdapter::new(
+                Arc::new(ScenarioResolver {
+                    calls: AtomicUsize::new(0),
+                }),
+                dialer,
+            ));
+            let (shutdown, receiver) = watch::channel(false);
+            let service = tokio::spawn(serve(
+                listener,
+                config(directory.path(), "enforce"),
+                Connectors::new(adapter, Arc::new(InertConnector)),
+                receiver,
+            ));
+            let mut client = TcpStream::connect(address).await.unwrap();
+            client
+                .write_all(b"CONNECT allowed.example HTTP/1.1\r\nHost: allowed.example\r\n\r\n")
+                .await
+                .unwrap();
+            let head = response_head(&mut client).await;
+            assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            tokio::time::sleep(Duration::from_millis(1_050)).await;
+            client.write_all(b"still open").await.unwrap();
+            let mut forwarded = [0; 10];
+            timeout(Duration::from_secs(1), peer.read_exact(&mut forwarded))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&forwarded, b"still open");
+            peer.write_all(b"reply").await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut reply = Vec::new();
+            timeout(Duration::from_secs(1), client.read_to_end(&mut reply))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply, b"reply");
+            shutdown.send(true).unwrap();
+            let report = timeout(Duration::from_secs(1), service)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(report.aborted_tasks, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn public_connect_waits_for_upstream_before_writing_success() {
+        let directory = tempdir().unwrap();
+        let listener = bind_listener("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (released, result) = oneshot::channel();
+        let connector = Arc::new(ControlledPublic::new(result));
+        let (shutdown, receiver) = watch::channel(false);
+        let task = tokio::spawn(serve(
+            listener,
+            config(directory.path(), "enforce"),
+            Connectors::new(connector.clone(), Arc::new(InertConnector)),
+            receiver,
+        ));
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let entered = connector.entered.notified();
+        client
+            .write_all(b"CONNECT allowed.example:443 HTTP/1.1\r\nHost: allowed.example:443\r\n\r\n")
+            .await
+            .unwrap();
+        timeout(Duration::from_millis(500), entered).await.unwrap();
+        let mut byte = [0];
+        assert!(
+            timeout(Duration::from_millis(80), client.read(&mut byte))
+                .await
+                .is_err()
+        );
+        let (upstream, mut peer) = tokio::io::duplex(1024);
+        assert!(released.send(Ok(Box::new(upstream))).is_ok());
+        let head = response_head(&mut client).await;
+        assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(head.ends_with(b"\r\n\r\n"));
+        client.write_all(b"later bytes").await.unwrap();
+        let mut forwarded = [0; 11];
+        timeout(Duration::from_millis(500), peer.read_exact(&mut forwarded))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&forwarded, b"later bytes");
+        client.shutdown().await.unwrap();
+        peer.shutdown().await.unwrap();
+        let mut rest = Vec::new();
+        timeout(Duration::from_millis(500), client.read_to_end(&mut rest))
+            .await
+            .unwrap()
+            .unwrap();
+        shutdown.send(true).unwrap();
+        let report = timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.aborted_tasks, 0);
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_public_connect_never_upgrades_or_retains_a_tunnel() {
+        let directory = tempdir().unwrap();
+        let listener = bind_listener("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (released, result) = oneshot::channel();
+        let connector = Arc::new(ControlledPublic::new(result));
+        let (shutdown, receiver) = watch::channel(false);
+        let task = tokio::spawn(serve(
+            listener,
+            config(directory.path(), "enforce"),
+            Connectors::new(connector.clone(), Arc::new(InertConnector)),
+            receiver,
+        ));
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let entered = connector.entered.notified();
+        client
+            .write_all(b"CONNECT allowed.example:443 HTTP/1.1\r\nHost: allowed.example:443\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        timeout(Duration::from_millis(500), entered).await.unwrap();
+        assert!(released.send(Err(anyhow::anyhow!("test failure"))).is_ok());
+        let mut response = Vec::new();
+        timeout(
+            Duration::from_millis(500),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+        assert!(response.ends_with(b"\r\n\r\nbad gateway\n"));
+        assert!(!response.windows(3).any(|window| window == b"200"));
+        shutdown.send(true).unwrap();
+        let report = timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.aborted_tasks, 0);
+        assert_eq!(report.drained_tasks, 0);
+        assert_eq!(report.reaped_tasks, 1);
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn active_public_tunnels_close_and_reap_on_disconnect_or_shutdown() {
+        for close_client in [true, false].into_iter().cycle().take(10) {
+            let directory = tempdir().unwrap();
+            let listener = bind_listener("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (released, result) = oneshot::channel();
+            let connector = Arc::new(ControlledPublic::new(result));
+            let (shutdown, receiver) = watch::channel(false);
+            let task = tokio::spawn(serve(
+                listener,
+                config(directory.path(), "enforce"),
+                Connectors::new(connector.clone(), Arc::new(InertConnector)),
+                receiver,
+            ));
+            let (upstream, mut peer) = tokio::io::duplex(1024);
+            assert!(released.send(Ok(Box::new(upstream))).is_ok());
+            let mut client = Some(TcpStream::connect(address).await.unwrap());
+            let entered = connector.entered.notified();
+            client
+                .as_mut()
+                .unwrap()
+                .write_all(
+                    b"CONNECT allowed.example:443 HTTP/1.1\r\nHost: allowed.example:443\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            timeout(Duration::from_millis(500), entered).await.unwrap();
+            let head = response_head(client.as_mut().unwrap()).await;
+            assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            assert!(head.ends_with(b"\r\n\r\n"));
+            if close_client {
+                drop(client.take());
+                let mut byte = [0];
+                assert_eq!(
+                    timeout(Duration::from_millis(500), peer.read(&mut byte))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+                peer.shutdown().await.unwrap();
+                let health = raw_request(
+                    address,
+                    b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+                assert!(health.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            }
+            shutdown.send(true).unwrap();
+            let mut byte = [0];
+            if let Some(client) = client.as_mut() {
+                assert_eq!(
+                    timeout(Duration::from_millis(900), client.read(&mut byte))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+            }
+            assert_eq!(
+                timeout(Duration::from_millis(900), peer.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            let report = timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(report.aborted_tasks, 0);
+            assert!(report.drained_tasks + report.reaped_tasks <= 2);
+            if close_client {
+                assert!(report.reaped_tasks >= 1);
+            }
+            assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
+        }
     }
     #[tokio::test]
     async fn typed_routes_and_policy_diagnostics() {
