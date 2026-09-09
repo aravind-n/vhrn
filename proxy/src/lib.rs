@@ -4,6 +4,8 @@
 pub mod config;
 pub mod diagnostics;
 pub mod policy;
+pub mod relay;
+pub mod service;
 pub mod target;
 
 /// Returns this package's Cargo name.
