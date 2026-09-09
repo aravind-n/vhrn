@@ -23,6 +23,7 @@ use vhrn_policy::Mode;
 use crate::config::{Config, config_from_env, load_broker_token};
 use crate::diagnostics::{ResponseDescriptor, direct_response, write_denial};
 use crate::policy::{decide_local, decide_public};
+use crate::public::PublicConnectorAdapter;
 use crate::target::{LocalTarget, PublicTarget, Target, classify};
 
 const MAX_CONNECTIONS: usize = 64;
@@ -85,6 +86,13 @@ impl Connectors {
     pub(crate) fn new(public: Arc<dyn PublicConnector>, local: Arc<dyn LocalConnector>) -> Self {
         Self { public, local }
     }
+
+    fn production() -> Self {
+        Self::new(
+            Arc::new(PublicConnectorAdapter::system()),
+            Arc::new(InertConnector),
+        )
+    }
 }
 
 /// Outcome of a completed listener lifecycle.
@@ -110,7 +118,7 @@ async fn run_with_config(config: Config, shutdown: watch::Receiver<bool>) -> Res
         let _ = load_broker_token(local)?; /* Sidecar readiness is inserted here before binding. */
     }
     let listener = bind_listener(&config.listen).await?;
-    serve(listener, config, Connectors::default(), shutdown).await
+    serve(listener, config, Connectors::production(), shutdown).await
 }
 
 /// Binds a configured numeric listener address without name resolution.
@@ -365,6 +373,7 @@ fn normalize_listen(value: &str) -> Result<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use http_body_util::BodyExt;
@@ -375,6 +384,9 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     use super::*;
+    use crate::public::{
+        BoxStream, DialFuture, NumericDialer, PublicConnectorAdapter, ResolveFuture, Resolver,
+    };
 
     struct Counts {
         public_http: AtomicUsize,
@@ -420,6 +432,21 @@ mod tests {
     struct PendingPublic {
         entered: Notify,
         calls: AtomicUsize,
+    }
+    struct AdapterResolver(Mutex<Vec<(String, u16)>>);
+    impl Resolver for AdapterResolver {
+        fn resolve(&self, host: String, port: u16) -> ResolveFuture {
+            self.0.lock().unwrap().push((host, port));
+            Box::pin(async { Ok(vec!["8.8.8.8".parse().unwrap()]) })
+        }
+    }
+    struct AdapterDialer(Mutex<Vec<SocketAddr>>);
+    impl NumericDialer for AdapterDialer {
+        fn dial(&self, address: SocketAddr) -> DialFuture {
+            self.0.lock().unwrap().push(address);
+            let (stream, _) = tokio::io::duplex(1);
+            Box::pin(async move { Ok(Box::new(stream) as BoxStream) })
+        }
     }
     impl sealed::Public for PendingPublic {}
     impl PublicConnector for PendingPublic {
@@ -692,6 +719,55 @@ mod tests {
         );
         assert_eq!(counts.values(), (2, 1, 1, 1));
         assert_miss_records(directory.path());
+    }
+
+    #[tokio::test]
+    async fn public_adapter_runs_only_after_public_policy_and_never_for_local_targets() {
+        let directory = tempdir().unwrap();
+        let resolver = Arc::new(AdapterResolver(Mutex::new(Vec::new())));
+        let dialer = Arc::new(AdapterDialer(Mutex::new(Vec::new())));
+        let connectors = Connectors::new(
+            Arc::new(PublicConnectorAdapter::new(
+                resolver.clone(),
+                dialer.clone(),
+            )),
+            Arc::new(InertConnector),
+        );
+        let enforce = config(directory.path(), "enforce");
+        assert_eq!(
+            route_status(
+                &hyper::Method::GET,
+                "http://miss.example/",
+                enforce.clone(),
+                connectors.clone(),
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert!(resolver.0.lock().unwrap().is_empty());
+        assert!(dialer.0.lock().unwrap().is_empty());
+        for (method, uri) in [
+            (&hyper::Method::GET, "http://allowed.example/"),
+            (&hyper::Method::CONNECT, "allowed.example:443"),
+        ] {
+            assert_eq!(
+                route_status(method, uri, enforce.clone(), connectors.clone()).await,
+                StatusCode::BAD_GATEWAY
+            );
+        }
+        let local = local_config(enforce, directory.path());
+        assert_eq!(
+            route_status(
+                &hyper::Method::GET,
+                "http://localhost:8000/",
+                local,
+                connectors,
+            )
+            .await,
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(resolver.0.lock().unwrap().len(), 2);
+        assert_eq!(dialer.0.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

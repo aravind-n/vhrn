@@ -4,6 +4,7 @@
 pub mod config;
 pub mod diagnostics;
 pub mod policy;
+pub mod public;
 pub mod relay;
 pub mod service;
 pub mod target;
