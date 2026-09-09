@@ -1,6 +1,7 @@
 //! Values and decisions for the network boundary.
 #![forbid(unsafe_code)]
 
+mod broker;
 pub mod config;
 pub mod diagnostics;
 pub mod policy;

@@ -20,6 +20,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout};
 use vhrn_policy::Mode;
 
+use crate::broker::BrokerConnector;
 use crate::config::{Config, config_from_env, load_broker_token};
 use crate::diagnostics::{ResponseDescriptor, direct_response, write_denial};
 use crate::policy::{decide_local, decide_public};
@@ -83,6 +84,23 @@ impl LocalConnector for InertConnector {
     }
 }
 
+struct BrokerLocalConnector(BrokerConnector);
+impl sealed::Local for BrokerLocalConnector {}
+impl LocalConnector for BrokerLocalConnector {
+    fn http(&self, target: LocalTarget) -> BoxFuture {
+        let connector = self.0.clone();
+        Box::pin(async move {
+            let _ = connector.connect(target.canonical_authority()).await;
+        })
+    }
+    fn connect(&self, target: LocalTarget) -> BoxFuture {
+        let connector = self.0.clone();
+        Box::pin(async move {
+            let _ = connector.connect(target.canonical_authority()).await;
+        })
+    }
+}
+
 /// Connector pair used by the HTTP shell.
 #[derive(Clone)]
 pub struct Connectors {
@@ -99,10 +117,13 @@ impl Connectors {
         Self { public, local }
     }
 
-    fn production() -> Self {
+    fn production(local: Option<BrokerConnector>) -> Self {
         Self::new(
             Arc::new(PublicConnectorAdapter::system()),
-            Arc::new(InertConnector),
+            local.map_or_else(
+                || Arc::new(InertConnector) as Arc<dyn LocalConnector>,
+                |connector| Arc::new(BrokerLocalConnector(connector)),
+            ),
         )
     }
 }
@@ -126,11 +147,43 @@ pub async fn run_from_env(shutdown: watch::Receiver<bool>) -> Result<ServiceRepo
 }
 
 async fn run_with_config(config: Config, shutdown: watch::Receiver<bool>) -> Result<ServiceReport> {
-    if let Some(local) = &config.local {
-        let _ = load_broker_token(local)?; /* Sidecar readiness is inserted here before binding. */
-    }
+    let broker = if let Some(local) = &config.local {
+        let connector = BrokerConnector::new(local.broker_addr, load_broker_token(local)?);
+        connector.ready().await?;
+        Some(connector)
+    } else {
+        None
+    };
+    run_after_readiness(config, shutdown, broker).await
+}
+
+async fn run_after_readiness(
+    config: Config,
+    shutdown: watch::Receiver<bool>,
+    broker: Option<BrokerConnector>,
+) -> Result<ServiceReport> {
     let listener = bind_listener(&config.listen).await?;
-    serve(listener, config, Connectors::production(), shutdown).await
+    serve(listener, config, Connectors::production(broker), shutdown).await
+}
+
+#[cfg(test)]
+async fn run_with_config_with_ready_timeout(
+    config: Config,
+    shutdown: watch::Receiver<bool>,
+    ready_timeout: Duration,
+) -> Result<ServiceReport> {
+    let broker = if let Some(local) = &config.local {
+        let connector = BrokerConnector::with_ready_timeout(
+            local.broker_addr,
+            load_broker_token(local)?,
+            ready_timeout,
+        );
+        connector.ready().await?;
+        Some(connector)
+    } else {
+        None
+    };
+    run_after_readiness(config, shutdown, broker).await
 }
 
 /// Binds a configured numeric listener address without name resolution.
@@ -812,6 +865,168 @@ mod tests {
         .unwrap();
         response
     }
+    async fn wait_for_client(address: SocketAddr) -> TcpStream {
+        timeout(Duration::from_millis(500), async {
+            loop {
+                if let Ok(stream) = TcpStream::connect(address).await {
+                    return stream;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn broker_readiness_precedes_listener_binding() {
+        let directory = tempdir().unwrap();
+        let broker = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let broker_address = broker.local_addr().unwrap();
+        let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let (accepted_tx, accepted) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = broker.accept().await.unwrap();
+            let mut frame = [0; 85];
+            stream.read_exact(&mut frame).await.unwrap();
+            accepted_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            stream.write_all(b"OK\n").await.unwrap();
+        });
+        let mut config = config(directory.path(), "enforce");
+        config.listen = proxy_address.to_string();
+        config = local_config(config, directory.path());
+        let local = config.local.as_mut().unwrap();
+        local.broker_addr = broker_address;
+        std::fs::write(&local.token_file, "a".repeat(64)).unwrap();
+        let (shutdown, _) = watch::channel(false);
+        let task = tokio::spawn(run_with_config(config, shutdown.subscribe()));
+        timeout(Duration::from_millis(500), accepted)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(TcpStream::connect(proxy_address).await.is_err());
+        release.send(()).unwrap();
+        let mut connected = false;
+        for _ in 0..20 {
+            if TcpStream::connect(proxy_address).await.is_ok() {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(connected);
+        let _ = shutdown.send(true);
+        assert!(
+            timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_readiness_failures_are_redacted_and_leave_listener_unbound() {
+        for response in [
+            Some(b"ERR\n".as_slice()),
+            Some(b"O"),
+            Some(b"TOOLONG"),
+            None,
+        ] {
+            let directory = tempdir().unwrap();
+            let broker = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let broker_address = broker.local_addr().unwrap();
+            let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = reserved.local_addr().unwrap();
+            drop(reserved);
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = broker.accept().await.unwrap();
+                let mut frame = [0; 85];
+                stream.read_exact(&mut frame).await.unwrap();
+                if let Some(response) = response {
+                    stream.write_all(response).await.unwrap();
+                } else {
+                    let mut byte = [0];
+                    assert_eq!(
+                        timeout(Duration::from_millis(500), stream.read(&mut byte))
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                        0
+                    );
+                }
+            });
+            let mut value = local_config(config(directory.path(), "enforce"), directory.path());
+            value.listen = proxy_address.to_string();
+            let local = value.local.as_mut().unwrap();
+            local.broker_addr = broker_address;
+            std::fs::write(&local.token_file, "a".repeat(64)).unwrap();
+            let (_, shutdown) = watch::channel(false);
+            let error = timeout(
+                Duration::from_millis(500),
+                run_with_config_with_ready_timeout(value, shutdown, Duration::from_millis(50)),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            let rendered = format!("{error:#?}");
+            assert!(!error.to_string().contains(&"a".repeat(64)));
+            assert!(!rendered.contains(&"a".repeat(64)));
+            if let Some(response) = response {
+                let unsafe_bytes = String::from_utf8_lossy(response);
+                assert!(!error.to_string().contains(unsafe_bytes.as_ref()));
+                assert!(!rendered.contains(unsafe_bytes.as_ref()));
+            }
+            drop(bind_listener(&proxy_address.to_string()).await.unwrap());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_without_local_configuration_never_contacts_broker() {
+        let directory = tempdir().unwrap();
+        let broker = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let mut value = config(directory.path(), "enforce");
+        value.listen = proxy_address.to_string();
+        assert!(value.local.is_none());
+        let (shutdown, receiver) = watch::channel(false);
+        let task = tokio::spawn(run_with_config(value, receiver));
+        let mut client = wait_for_client(proxy_address).await;
+        client
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        timeout(
+            Duration::from_millis(500),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(
+            timeout(Duration::from_millis(80), broker.accept())
+                .await
+                .is_err()
+        );
+        shutdown.send(true).unwrap();
+        let report = timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.aborted_tasks, 0);
+    }
+
     async fn response_head(stream: &mut TcpStream) -> Vec<u8> {
         let mut head = Vec::new();
         loop {
