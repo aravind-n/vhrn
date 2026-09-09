@@ -4,10 +4,10 @@ Run coding agents inside a container jailed to the current project directory, wi
 
 ## Requirements
 
-- [Apple Container](https://github.com/apple/container) or Docker through Colima (auto-detected,
-  `container` first; every run starts the host broker)
-- `gh` on the host for forwarded GitHub auth (optional)
-- [Rust](https://rust-lang.org/tools/install/) if building from code
+- [Apple Container](https://github.com/apple/container)
+  - Docker as an alternative container engine
+- \[Optional\] `gh` on the host for forwarded GitHub auth
+- \[Optional\] [Rust](https://rust-lang.org/tools/install/) if building from code (See [Building from source](#building-from-source))
 
 ## Getting Started
 
