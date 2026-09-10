@@ -1067,6 +1067,8 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-rustls",
