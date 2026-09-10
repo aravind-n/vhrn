@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::body::{Body, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -20,7 +20,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout};
 use vhrn_policy::Mode;
 
-use crate::broker::BrokerConnector;
+use crate::broker::{BrokerConnector, BrokerResponse, BrokerStream};
 use crate::config::{Config, config_from_env, load_broker_token};
 use crate::diagnostics::{ResponseDescriptor, direct_response, write_denial};
 use crate::policy::{decide_local, decide_public};
@@ -35,11 +35,22 @@ const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_millis(800);
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(crate) type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type ProxyBody = UnsyncBoxBody<Bytes, anyhow::Error>;
+
+fn fixed_body(bytes: Bytes) -> ProxyBody {
+    Full::new(bytes)
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
 pub(crate) type PublicHttpFuture<'a> =
     Pin<Box<dyn Future<Output = anyhow::Result<PublicResponse>> + Send + 'a>>;
 pub(crate) type PublicConnectFuture<'a> =
     Pin<Box<dyn Future<Output = anyhow::Result<crate::public::BoxStream>> + Send + 'a>>;
+pub(crate) type LocalHttpFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<BrokerResponse>> + Send + 'a>>;
+pub(crate) type LocalConnectFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<BrokerStream>> + Send + 'a>>;
 
 pub struct PublicResponse {
     pub(crate) status: StatusCode,
@@ -58,9 +69,9 @@ pub(crate) trait PublicConnector: sealed::Public + Send + Sync + 'static {
     fn connect(&self, target: PublicTarget) -> PublicConnectFuture<'_>;
 }
 /// Typed inert seam for a local destination.
-pub trait LocalConnector: sealed::Local + Send + Sync + 'static {
-    fn http(&self, target: LocalTarget) -> BoxFuture;
-    fn connect(&self, target: LocalTarget) -> BoxFuture;
+pub(crate) trait LocalConnector: sealed::Local + Send + Sync + 'static {
+    fn http(&self, target: LocalTarget, request: Request<Full<Bytes>>) -> LocalHttpFuture<'_>;
+    fn connect(&self, target: LocalTarget) -> LocalConnectFuture<'_>;
 }
 
 #[derive(Default)]
@@ -76,28 +87,28 @@ impl PublicConnector for InertConnector {
     }
 }
 impl LocalConnector for InertConnector {
-    fn http(&self, _: LocalTarget) -> BoxFuture {
-        Box::pin(async {})
+    fn http(&self, _: LocalTarget, _: Request<Full<Bytes>>) -> LocalHttpFuture<'_> {
+        Box::pin(async { anyhow::bail!("local connector unavailable") })
     }
-    fn connect(&self, _: LocalTarget) -> BoxFuture {
-        Box::pin(async {})
+    fn connect(&self, _: LocalTarget) -> LocalConnectFuture<'_> {
+        Box::pin(async { anyhow::bail!("local connector unavailable") })
     }
 }
 
 struct BrokerLocalConnector(BrokerConnector);
 impl sealed::Local for BrokerLocalConnector {}
 impl LocalConnector for BrokerLocalConnector {
-    fn http(&self, target: LocalTarget) -> BoxFuture {
+    fn http(&self, target: LocalTarget, request: Request<Full<Bytes>>) -> LocalHttpFuture<'_> {
         let connector = self.0.clone();
         Box::pin(async move {
-            let _ = connector.connect(target.canonical_authority()).await;
+            connector
+                .http(target.canonical_authority(), target.secure(), request)
+                .await
         })
     }
-    fn connect(&self, target: LocalTarget) -> BoxFuture {
+    fn connect(&self, target: LocalTarget) -> LocalConnectFuture<'_> {
         let connector = self.0.clone();
-        Box::pin(async move {
-            let _ = connector.connect(target.canonical_authority()).await;
-        })
+        Box::pin(async move { connector.connect(target.canonical_authority()).await })
     }
 }
 
@@ -354,7 +365,7 @@ async fn handle(
     connectors: Connectors,
     tunnels: Arc<tokio::sync::Mutex<JoinSet<()>>>,
     shutdown: watch::Receiver<bool>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<ProxyBody>, hyper::Error> {
     if request.method() == hyper::Method::CONNECT {
         return Ok(handle_connect(request, config, connectors, tunnels, shutdown).await);
     }
@@ -367,20 +378,45 @@ async fn handle_connect(
     connectors: Connectors,
     tunnels: Arc<tokio::sync::Mutex<JoinSet<()>>>,
     shutdown: watch::Receiver<bool>,
-) -> Response<Full<Bytes>> {
+) -> Response<ProxyBody> {
     let uri = request.uri().to_string();
-    let Target::PublicConnect(target) = classify("CONNECT", &uri) else {
-        return route_connect_fallback(&config, &connectors, &uri).await;
+    let target = match classify("CONNECT", &uri) {
+        Target::PublicConnect(target) => {
+            let decision = decide_public(&config.allowlists, &config.mode_file, target.host());
+            if !decision.allowed {
+                record(&config, target.authority());
+                return response(StatusCode::FORBIDDEN, None, "forbidden\n");
+            }
+            if decision.record_denial {
+                record(&config, target.authority());
+            }
+            let Ok(upstream) = connectors.public.connect(target).await else {
+                return response(StatusCode::BAD_GATEWAY, None, "bad gateway\n");
+            };
+            let upgrade = hyper::upgrade::on(&mut request);
+            tunnels.lock().await.spawn(async move {
+                let Ok(upgraded) = upgrade.await else {
+                    return;
+                };
+                let Ok(parts) = upgraded.downcast::<TokioIo<TcpStream>>() else {
+                    return;
+                };
+                let _ = crate::relay::relay(TokioIo::new(parts.io), upstream, shutdown).await;
+            });
+            return response(StatusCode::OK, None, "");
+        }
+        Target::LocalConnect(target) => target,
+        _ => return response(StatusCode::BAD_REQUEST, None, "bad request\n"),
     };
-    let decision = decide_public(&config.allowlists, &config.mode_file, target.host());
-    if !decision.allowed {
+    let Some(local) = &config.local else {
+        record(&config, target.authority());
+        return response(StatusCode::FORBIDDEN, None, "forbidden\n");
+    };
+    if !decide_local(&local.policy_paths, target.canonical_authority()) {
         record(&config, target.authority());
         return response(StatusCode::FORBIDDEN, None, "forbidden\n");
     }
-    if decision.record_denial {
-        record(&config, target.authority());
-    }
-    let Ok(upstream) = connectors.public.connect(target).await else {
+    let Ok(upstream) = connectors.local.connect(target).await else {
         return response(StatusCode::BAD_GATEWAY, None, "bad gateway\n");
     };
     let upgrade = hyper::upgrade::on(&mut request);
@@ -388,34 +424,9 @@ async fn handle_connect(
         let Ok(upgraded) = upgrade.await else {
             return;
         };
-        let Ok(parts) = upgraded.downcast::<TokioIo<TcpStream>>() else {
-            return;
-        };
-        let _ = crate::relay::relay(TokioIo::new(parts.io), upstream, shutdown).await;
+        let _ = crate::relay::relay(TokioIo::new(upgraded), upstream, shutdown).await;
     });
     response(StatusCode::OK, None, "")
-}
-
-async fn route_connect_fallback(
-    config: &Config,
-    connectors: &Connectors,
-    uri: &str,
-) -> Response<Full<Bytes>> {
-    let target = classify("CONNECT", uri);
-    match target {
-        Target::LocalConnect(target) => {
-            if config.local.as_ref().is_some_and(|local| {
-                decide_local(&local.policy_paths, target.canonical_authority())
-            }) {
-                connectors.local.connect(target).await;
-                response(StatusCode::BAD_GATEWAY, None, "bad gateway\n")
-            } else {
-                record(config, target.authority());
-                response(StatusCode::FORBIDDEN, None, "forbidden\n")
-            }
-        }
-        _ => response(StatusCode::BAD_REQUEST, None, "bad request\n"),
-    }
 }
 
 async fn handle_with_body_limits<B>(
@@ -424,7 +435,7 @@ async fn handle_with_body_limits<B>(
     connectors: Connectors,
     body_timeout: Duration,
     body_limit: usize,
-) -> Response<Full<Bytes>>
+) -> Response<ProxyBody>
 where
     B: Body<Data = Bytes> + Unpin,
 {
@@ -463,7 +474,7 @@ async fn route(
     uri: &str,
     config: Config,
     connectors: Connectors,
-) -> Response<Full<Bytes>> {
+) -> Response<ProxyBody> {
     let request = Request::builder()
         .method(method)
         .uri(uri)
@@ -476,7 +487,7 @@ async fn route_request(
     request: Request<Full<Bytes>>,
     config: Config,
     connectors: Connectors,
-) -> Response<Full<Bytes>> {
+) -> Response<ProxyBody> {
     let method = request.method().clone();
     let uri = request.uri().to_string();
     let target = classify(method.as_str(), &uri);
@@ -518,8 +529,10 @@ async fn route_request(
             if config.local.as_ref().is_some_and(|local| {
                 decide_local(&local.policy_paths, target.canonical_authority())
             }) {
-                connectors.local.http(target).await;
-                response(StatusCode::BAD_GATEWAY, None, "bad gateway\n")
+                match connectors.local.http(target, request).await {
+                    Ok(origin) => broker_response(origin),
+                    Err(_) => response(StatusCode::BAD_GATEWAY, None, "bad gateway\n"),
+                }
             } else {
                 record(&config, target.authority());
                 response(StatusCode::FORBIDDEN, None, "forbidden\n")
@@ -529,7 +542,7 @@ async fn route_request(
             if config.local.as_ref().is_some_and(|local| {
                 decide_local(&local.policy_paths, target.canonical_authority())
             }) {
-                connectors.local.connect(target).await;
+                let _ = connectors.local.connect(target).await;
                 response(StatusCode::BAD_GATEWAY, None, "bad gateway\n")
             } else {
                 record(&config, target.authority());
@@ -539,33 +552,42 @@ async fn route_request(
     }
 }
 
-fn origin_response(origin: PublicResponse) -> Response<Full<Bytes>> {
+fn origin_response(origin: PublicResponse) -> Response<ProxyBody> {
     let mut builder = Response::builder().status(origin.status);
     for (name, value) in &origin.headers {
         builder = builder.header(name, value);
     }
     builder
-        .body(Full::new(origin.body))
+        .body(fixed_body(origin.body))
+        .expect("origin response headers are valid")
+}
+fn broker_response(origin: BrokerResponse) -> Response<ProxyBody> {
+    let mut builder = Response::builder().status(origin.status);
+    for (name, value) in &origin.headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(origin.body.boxed_unsync())
         .expect("origin response headers are valid")
 }
 
 fn effective_mode(config: &Config) -> Mode {
     decide_public(&config.allowlists, &config.mode_file, "status.invalid").mode
 }
-fn descriptor(value: &ResponseDescriptor) -> Response<Full<Bytes>> {
+fn descriptor(value: &ResponseDescriptor) -> Response<ProxyBody> {
     response(
         StatusCode::from_u16(value.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         value.content_type,
         &value.body,
     )
 }
-fn response(status: StatusCode, content_type: Option<&str>, body: &str) -> Response<Full<Bytes>> {
+fn response(status: StatusCode, content_type: Option<&str>, body: &str) -> Response<ProxyBody> {
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = content_type {
         builder = builder.header("content-type", content_type);
     }
     builder
-        .body(Full::new(Bytes::copy_from_slice(body.as_bytes())))
+        .body(fixed_body(Bytes::copy_from_slice(body.as_bytes())))
         .expect("fixed response is valid")
 }
 fn record(config: &Config, destination: &str) {
@@ -625,6 +647,7 @@ mod tests {
     use tokio::net::TcpStream;
     use tokio::sync::{Notify, oneshot, watch};
     use tokio::time::{Duration, timeout};
+    use vhrn_policy::BrokerToken;
 
     use super::*;
     use crate::public::{
@@ -663,13 +686,13 @@ mod tests {
         }
     }
     impl LocalConnector for Counts {
-        fn http(&self, _: LocalTarget) -> BoxFuture {
+        fn http(&self, _: LocalTarget, _: Request<Full<Bytes>>) -> LocalHttpFuture<'_> {
             self.local_http.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {})
+            Box::pin(async { anyhow::bail!("test connector") })
         }
-        fn connect(&self, _: LocalTarget) -> BoxFuture {
+        fn connect(&self, _: LocalTarget) -> LocalConnectFuture<'_> {
             self.local_connect.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {})
+            Box::pin(async { anyhow::bail!("test connector") })
         }
     }
     struct PendingPublic {
@@ -1517,6 +1540,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_connect_broker_gates_upgrade_relays_buffer_and_observes_revocation() {
+        let directory = tempdir().unwrap();
+        let listener = bind_listener("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let broker = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let mut value = local_config(config(directory.path(), "enforce"), directory.path());
+        let local = value.local.as_mut().unwrap();
+        local.broker_addr = broker.local_addr().unwrap();
+        let policy = local.policy_paths[0].clone();
+        let token = BrokerToken::parse("a".repeat(64)).unwrap();
+        let (released, release) = oneshot::channel();
+        let server_broker = broker.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = server_broker.accept().await.unwrap();
+            let expected = format!("VHRN-BROKER/1 CONNECT {} localhost:8000\n", "a".repeat(64));
+            let mut frame = vec![0; expected.len()];
+            stream.read_exact(&mut frame).await.unwrap();
+            assert_eq!(String::from_utf8(frame).unwrap(), expected);
+            release.await.unwrap();
+            stream.write_all(b"OK\n").await.unwrap();
+            let mut first = [0; 8];
+            stream.read_exact(&mut first).await.unwrap();
+            assert_eq!(&first, b"sentinel");
+            stream.write_all(b"reply").await.unwrap();
+            stream.read_exact(&mut first).await.unwrap();
+            assert_eq!(&first, b"survives");
+            stream.write_all(b"again").await.unwrap();
+            let mut byte = [0];
+            assert_eq!(
+                timeout(Duration::from_millis(500), stream.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+        });
+        let (shutdown, receiver) = watch::channel(false);
+        let service = tokio::spawn(serve(
+            listener,
+            value,
+            Connectors::production(Some(BrokerConnector::new(
+                broker.local_addr().unwrap(),
+                token,
+            ))),
+            receiver,
+        ));
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"CONNECT localhost:8000 HTTP/1.1\r\nHost: localhost:8000\r\n\r\nsentinel")
+            .await
+            .unwrap();
+        let mut byte = [0];
+        assert!(
+            timeout(Duration::from_millis(80), client.read(&mut byte))
+                .await
+                .is_err()
+        );
+        released.send(()).unwrap();
+        let head = response_head(&mut client).await;
+        assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let mut reply = [0; 5];
+        timeout(Duration::from_millis(500), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"reply");
+        std::fs::write(policy, "").unwrap();
+        client.write_all(b"survives").await.unwrap();
+        timeout(Duration::from_millis(500), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"again");
+        let denied = raw_request(
+            address,
+            b"CONNECT localhost:8000 HTTP/1.1\r\nHost: localhost:8000\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(denied.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
+        assert!(
+            timeout(Duration::from_millis(80), broker.accept())
+                .await
+                .is_err()
+        );
+        client.shutdown().await.unwrap();
+        server.await.unwrap();
+        shutdown.send(true).unwrap();
+        let report = timeout(Duration::from_secs(1), service)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.aborted_tasks, 0);
+    }
+
+    #[tokio::test]
+    async fn local_connect_broker_refusal_returns_502_without_upgrade() {
+        let directory = tempdir().unwrap();
+        let listener = bind_listener("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let broker = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let broker_address = broker.local_addr().unwrap();
+        let mut value = local_config(config(directory.path(), "enforce"), directory.path());
+        value.local.as_mut().unwrap().broker_addr = broker_address;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = broker.accept().await.unwrap();
+            let mut frame = [0; 128];
+            let _ = stream.read(&mut frame).await.unwrap();
+            stream.write_all(b"ERR\n").await.unwrap();
+        });
+        let (shutdown, receiver) = watch::channel(false);
+        let service = tokio::spawn(serve(
+            listener,
+            value,
+            Connectors::production(Some(BrokerConnector::new(
+                broker_address,
+                BrokerToken::parse("a".repeat(64)).unwrap(),
+            ))),
+            receiver,
+        ));
+        let response = raw_request(
+            address,
+            b"CONNECT localhost:8000 HTTP/1.1\r\nHost: localhost:8000\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+        assert!(response.ends_with(b"\r\n\r\nbad gateway\n"));
+        assert!(!response.windows(3).any(|bytes| bytes == b"200"));
+        assert!(!response.windows(64).any(|bytes| bytes == b"a".repeat(64)));
+        server.await.unwrap();
+        shutdown.send(true).unwrap();
+        timeout(Duration::from_secs(1), service)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_https_uses_tls_and_rejects_an_untrusted_peer() {
+        let directory = tempdir().unwrap();
+        let broker = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = broker.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = broker.accept().await.unwrap();
+            let expected = format!("VHRN-BROKER/1 CONNECT {} localhost:8000\n", "a".repeat(64));
+            let mut frame = vec![0; expected.len()];
+            stream.read_exact(&mut frame).await.unwrap();
+            assert_eq!(String::from_utf8(frame).unwrap(), expected);
+            stream.write_all(b"OK\n").await.unwrap();
+            let mut hello = [0; 3];
+            timeout(Duration::from_millis(500), stream.read_exact(&mut hello))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(hello, [22, 3, 1]);
+            assert_ne!(&hello, b"GET");
+            stream.write_all(b"invalid tls peer").await.unwrap();
+        });
+        let mut value = local_config(config(directory.path(), "open"), directory.path());
+        value.local.as_mut().unwrap().broker_addr = address;
+        let connector = BrokerConnector::new(address, BrokerToken::parse("a".repeat(64)).unwrap());
+        let response = route_request(
+            proxy_request("GET", "https://localhost:8000/path", b""),
+            value,
+            Connectors::production(Some(connector.clone())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "bad gateway\n"
+        );
+        server.await.unwrap();
+        assert_eq!(connector.pool_len(), 0);
+        timeout(Duration::from_millis(500), async {
+            while connector.active_drivers() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn active_public_tunnels_close_and_reap_on_disconnect_or_shutdown() {
         for close_client in [true, false].into_iter().cycle().take(10) {
             let directory = tempdir().unwrap();
@@ -1693,6 +1901,79 @@ mod tests {
         );
         assert_eq!(counts.values(), (2, 1, 1, 1));
         assert_miss_records(directory.path());
+    }
+
+    #[tokio::test]
+    async fn local_policy_is_independent_of_public_mode_and_reopens_every_layer() {
+        for mode in ["enforce", "report", "open"] {
+            let directory = tempdir().unwrap();
+            let counts = Arc::new(Counts {
+                public_http: AtomicUsize::new(0),
+                public_connect: AtomicUsize::new(0),
+                local_http: AtomicUsize::new(0),
+                local_connect: AtomicUsize::new(0),
+            });
+            let connectors = Connectors::new(counts.clone(), counts.clone());
+            let uri = "http://LOCALHOST:08000/path";
+            assert_eq!(
+                route_status(
+                    &hyper::Method::GET,
+                    uri,
+                    config(directory.path(), mode),
+                    connectors.clone()
+                )
+                .await,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                route_status(
+                    &hyper::Method::CONNECT,
+                    "LOCALHOST:08000",
+                    config(directory.path(), mode),
+                    connectors.clone()
+                )
+                .await,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(counts.values(), (0, 0, 0, 0));
+            let local = local_config(config(directory.path(), mode), directory.path());
+            assert_eq!(
+                route_status(&hyper::Method::GET, uri, local.clone(), connectors.clone()).await,
+                StatusCode::BAD_GATEWAY
+            );
+            assert_eq!(
+                route_status(
+                    &hyper::Method::CONNECT,
+                    "LOCALHOST:08000",
+                    local.clone(),
+                    connectors.clone()
+                )
+                .await,
+                StatusCode::BAD_GATEWAY
+            );
+            assert_eq!(counts.values(), (0, 0, 1, 1));
+            let revoked = std::path::PathBuf::from(&local.local.as_ref().unwrap().policy_paths[1]);
+            std::fs::write(&revoked, "").unwrap();
+            assert_eq!(
+                route_status(&hyper::Method::GET, uri, local.clone(), connectors.clone()).await,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                route_status(
+                    &hyper::Method::CONNECT,
+                    "LOCALHOST:08000",
+                    local,
+                    connectors.clone()
+                )
+                .await,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(counts.values(), (0, 0, 1, 1));
+            let records = std::fs::read_to_string(directory.path().join("deny")).unwrap();
+            assert_eq!(records.lines().count(), 4);
+            assert!(records.contains("\tLOCALHOST:08000\n"));
+            assert!(!records.contains("token"));
+        }
     }
 
     #[tokio::test]
