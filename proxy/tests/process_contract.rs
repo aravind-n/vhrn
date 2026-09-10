@@ -26,36 +26,41 @@ struct Proxy {
     mode: PathBuf,
     log: PathBuf,
     local_policies: Option<[PathBuf; 3]>,
+    local_grant: Option<usize>,
 }
 
 impl Proxy {
-    async fn start(local: Option<(SocketAddr, &str)>) -> Self {
+    async fn start(local: Option<(SocketAddr, &str, usize)>) -> Self {
         let temp = tempfile::tempdir().expect("temporary test directory");
-        let policy = temp.path().join("public-policy");
+        let public_policies =
+            ["base", "harness", "global", "project", "run"].map(|name| temp.path().join(name));
         let mode = temp.path().join("mode");
         let log = temp.path().join("denials.log");
-        std::fs::write(&policy, "allowed.example\n").expect("policy");
+        for policy in &public_policies {
+            std::fs::write(policy, "").expect("policy");
+        }
+        std::fs::write(&public_policies[3], "allowed.example\n").expect("policy");
         std::fs::write(&mode, "enforce\n").expect("mode");
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("reserve listener address");
         let address = listener.local_addr().expect("listener address");
         drop(listener);
-        let mut command = Command::new(proxy_bin());
+        let mut command = proxy_command();
         command
-            .env("VHRN_ALLOWLIST", &policy)
+            .env("VHRN_ALLOWLISTS", join_paths(&public_policies))
             .env("VHRN_MODE_FILE", &mode)
             .env("VHRN_PROXY_LISTEN", address.to_string())
             .env("VHRN_DENY_LOG", &log)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let local_policies = if let Some((broker, authority)) = local {
+        let (local_policies, local_grant) = if let Some((broker, authority, grant)) = local {
             let policies = ["local-one", "local-two", "local-three"];
             let mut paths = Vec::new();
             for (index, name) in policies.into_iter().enumerate() {
                 let path = temp.path().join(name);
-                let contents = if index == 0 { authority } else { "localhost:1" };
-                std::fs::write(&path, format!("{contents}\n")).expect("local policy");
+                let contents = if index == grant { authority } else { "" };
+                std::fs::write(&path, contents).expect("local policy");
                 paths.push(path);
             }
             let token = temp.path().join("token");
@@ -64,19 +69,23 @@ impl Proxy {
                 .env("VHRN_LOOPBACK_ALLOWLISTS", join_paths(&paths))
                 .env("VHRN_BROKER_ADDR", broker.to_string())
                 .env("VHRN_BROKER_TOKEN_FILE", token);
-            Some(paths.try_into().expect("three local policies"))
+            (
+                Some(paths.try_into().expect("three local policies")),
+                Some(grant),
+            )
         } else {
-            None
+            (None, None)
         };
         let child = command.spawn().expect("start proxy executable");
         let proxy = Self {
             _temp: temp,
             child,
             address,
-            policy,
+            policy: public_policies[3].clone(),
             mode,
             log,
             local_policies,
+            local_grant,
         };
         proxy.ready().await;
         proxy
@@ -97,13 +106,35 @@ impl Proxy {
     }
 
     async fn start_local(broker: SocketAddr, authority: &str) -> Self {
-        Self::start(Some((broker, authority))).await
+        Self::start_local_at(broker, authority, 0).await
+    }
+
+    async fn start_local_at(broker: SocketAddr, authority: &str, grant: usize) -> Self {
+        Self::start(Some((broker, authority, grant))).await
     }
 
     fn revoke_local_grant(&self) {
         let paths = self.local_policies.as_ref().expect("local policies");
-        std::fs::write(&paths[0], "").expect("replace local grant");
+        std::fs::write(&paths[self.local_grant.expect("local grant")], "")
+            .expect("replace local grant");
     }
+}
+
+fn proxy_command() -> Command {
+    let mut command = Command::new(proxy_bin());
+    for name in [
+        "VHRN_ALLOWLISTS",
+        "VHRN_ALLOWLIST",
+        "VHRN_MODE_FILE",
+        "VHRN_PROXY_LISTEN",
+        "VHRN_DENY_LOG",
+        "VHRN_LOOPBACK_ALLOWLISTS",
+        "VHRN_BROKER_ADDR",
+        "VHRN_BROKER_TOKEN_FILE",
+    ] {
+        command.env_remove(name);
+    }
+    command
 }
 
 #[derive(Clone)]
@@ -262,6 +293,12 @@ async fn direct_endpoints_and_denial_log_follow_corpus() {
 #[tokio::test]
 async fn policy_modes_and_live_replacement_are_observed_per_request() {
     let proxy = Proxy::start(None).await;
+    let allowed = proxy.request("GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\nConnection: close\r\n\r\n").await;
+    assert_eq!(
+        status(&allowed),
+        502,
+        "enforce permits the grant from the populated public layer"
+    );
     std::fs::write(&proxy.mode, "report\n").expect("report mode");
     let report = proxy.request("GET http://blocked.example/ HTTP/1.1\r\nHost: blocked.example\r\nConnection: close\r\n\r\n").await;
     assert_eq!(
@@ -287,7 +324,7 @@ async fn policy_modes_and_live_replacement_are_observed_per_request() {
         1
     );
     std::fs::write(&proxy.mode, "enforce\n").expect("enforce mode");
-    std::fs::write(&proxy.policy, "").expect("replace policy");
+    std::fs::write(&proxy.policy, "\n").expect("replace policy");
     let denied = proxy.request("GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\nConnection: close\r\n\r\n").await;
     assert_eq!(status(&denied), 403);
 }
@@ -309,7 +346,7 @@ async fn local_startup_exchange_and_partial_configuration_are_process_checked() 
     );
 
     let directory = tempfile::tempdir().expect("temporary directory");
-    let mut child = Command::new(proxy_bin())
+    let mut child = proxy_command()
         .env("VHRN_PROXY_LISTEN", "127.0.0.1:0")
         .env("VHRN_BROKER_ADDR", "127.0.0.1:1")
         .stdout(Stdio::null())
@@ -331,6 +368,36 @@ async fn local_startup_exchange_and_partial_configuration_are_process_checked() 
         "partial local configuration must fail startup"
     );
     drop(directory);
+}
+
+#[tokio::test]
+async fn each_local_policy_layer_can_independently_grant_through_the_broker() {
+    let authority = "localhost:8122";
+    for grant in 0..3 {
+        let broker = Broker::bind().await;
+        let broker_address = broker.address();
+        let ready_broker = broker.clone();
+        let ready = tokio::spawn(async move { ready_broker.ready().await });
+        let proxy = Proxy::start_local_at(broker_address, authority, grant).await;
+        ready.await.expect("ready task");
+        let request_task = tokio::spawn({
+            let address = proxy.address;
+            async move {
+                request(
+                    address,
+                    b"GET http://localhost:8122/grant HTTP/1.1\r\nHost: localhost:8122\r\nConnection: close\r\n\r\n",
+                )
+                .await
+            }
+        });
+        let mut origin = broker.connect(authority).await;
+        let _ = read_through(&mut origin, b"\r\n\r\n").await;
+        origin
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .expect("broker response");
+        assert_eq!(status(&request_task.await.expect("request task")), 200);
+    }
 }
 
 #[tokio::test]
@@ -680,12 +747,16 @@ async fn listener_occupation_and_sigterm_have_bounded_lifecycle() {
         .expect("occupied listener");
     let address = listener.local_addr().expect("occupied address");
     let directory = tempfile::tempdir().expect("temporary directory");
-    let policy = directory.path().join("policy");
+    let policies =
+        ["base", "harness", "global", "project", "run"].map(|name| directory.path().join(name));
     let mode = directory.path().join("mode");
-    std::fs::write(&policy, "allowed.example\n").expect("policy");
+    for policy in &policies {
+        std::fs::write(policy, "").expect("policy");
+    }
+    std::fs::write(&policies[0], "allowed.example\n").expect("policy");
     std::fs::write(&mode, "enforce\n").expect("mode");
-    let mut occupied = Command::new(proxy_bin())
-        .env("VHRN_ALLOWLIST", policy)
+    let mut occupied = proxy_command()
+        .env("VHRN_ALLOWLISTS", join_paths(&policies))
         .env("VHRN_MODE_FILE", mode)
         .env("VHRN_PROXY_LISTEN", address.to_string())
         .stdout(Stdio::null())

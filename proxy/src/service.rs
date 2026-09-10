@@ -842,7 +842,15 @@ mod tests {
     fn local_config(mut value: Config, directory: &std::path::Path) -> Config {
         let paths = ["local-one", "local-two", "local-three"].map(|name| {
             let path = directory.join(name);
-            std::fs::write(&path, "localhost:8000\n").unwrap();
+            std::fs::write(
+                &path,
+                if name == "local-one" {
+                    "localhost:8000\n"
+                } else {
+                    ""
+                },
+            )
+            .unwrap();
             path.display().to_string()
         });
         value.local = Some(crate::config::LocalConfig {
@@ -1952,7 +1960,7 @@ mod tests {
                 StatusCode::BAD_GATEWAY
             );
             assert_eq!(counts.values(), (0, 0, 1, 1));
-            let revoked = std::path::PathBuf::from(&local.local.as_ref().unwrap().policy_paths[1]);
+            let revoked = std::path::PathBuf::from(&local.local.as_ref().unwrap().policy_paths[0]);
             std::fs::write(&revoked, "").unwrap();
             assert_eq!(
                 route_status(&hyper::Method::GET, uri, local.clone(), connectors.clone()).await,
@@ -1962,15 +1970,24 @@ mod tests {
                 route_status(
                     &hyper::Method::CONNECT,
                     "LOCALHOST:08000",
-                    local,
+                    local.clone(),
                     connectors.clone()
                 )
                 .await,
                 StatusCode::FORBIDDEN
             );
             assert_eq!(counts.values(), (0, 0, 1, 1));
+            std::fs::write(&revoked, "localhost:8000\n").unwrap();
+            let malformed =
+                std::path::PathBuf::from(&local.local.as_ref().unwrap().policy_paths[1]);
+            std::fs::write(malformed, "\n").unwrap();
+            assert_eq!(
+                route_status(&hyper::Method::GET, uri, local, connectors.clone()).await,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(counts.values(), (0, 0, 1, 1));
             let records = std::fs::read_to_string(directory.path().join("deny")).unwrap();
-            assert_eq!(records.lines().count(), 4);
+            assert_eq!(records.lines().count(), 5);
             assert!(records.contains("\tLOCALHOST:08000\n"));
             assert!(!records.contains("token"));
         }

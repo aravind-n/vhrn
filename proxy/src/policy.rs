@@ -112,11 +112,9 @@ fn read_local_layers(paths: &[String; 3]) -> Result<HashSet<LoopbackAuthority>, 
 ///
 /// # Errors
 ///
-/// Returns an error when any record is invalid or the layer is empty.
+/// Returns an error when any record is invalid. A zero-byte layer is a valid
+/// empty set; a blank record remains invalid.
 pub fn parse_domain_layer(contents: &str) -> Result<BTreeSet<String>, PolicyParseError> {
-    if contents.is_empty() {
-        return Err(PolicyParseError);
-    }
     contents
         .lines()
         .map(normalize_domain_entry)
@@ -127,11 +125,9 @@ pub fn parse_domain_layer(contents: &str) -> Result<BTreeSet<String>, PolicyPars
 ///
 /// # Errors
 ///
-/// Returns an error when any record is invalid or the layer is empty.
+/// Returns an error when any record is invalid. A zero-byte layer is a valid
+/// empty set; a blank record remains invalid.
 pub fn parse_local_layer(contents: &str) -> Result<HashSet<LoopbackAuthority>, PolicyParseError> {
-    if contents.is_empty() {
-        return Err(PolicyParseError);
-    }
     contents
         .lines()
         .map(LoopbackAuthority::parse)
@@ -201,18 +197,36 @@ mod tests {
         assert!(!decide_public(&paths, &mode.display().to_string(), "one.example").allowed);
     }
     #[test]
-    fn local_requires_every_layer() {
+    fn zero_byte_layers_are_valid_but_blank_records_are_not() {
+        assert!(parse_domain_layer("").unwrap().is_empty());
+        assert!(parse_local_layer("").unwrap().is_empty());
+        for contents in ["\n", "\r\n"] {
+            assert!(parse_domain_layer(contents).is_err(), "{contents:?}");
+            assert!(parse_local_layer(contents).is_err(), "{contents:?}");
+        }
+    }
+    #[test]
+    fn local_requires_readable_well_formed_layers() {
         let directory = tempdir().unwrap();
         let paths: [String; 3] =
             [0, 1, 2].map(|n| directory.path().join(n.to_string()).display().to_string());
-        for path in &paths {
-            fs::write(path, "localhost:80\n").unwrap();
-        }
         let target = LoopbackAuthority::parse("localhost:80").unwrap();
-        assert!(decide_local(&paths, &target));
+        for grant in 0..3 {
+            for (index, path) in paths.iter().enumerate() {
+                fs::write(path, if index == grant { "localhost:80\n" } else { "" }).unwrap();
+            }
+            assert!(decide_local(&paths, &target));
+        }
+        for path in &paths {
+            fs::write(path, "").unwrap();
+        }
+        assert!(!decide_local(&paths, &target));
+        fs::write(&paths[0], "localhost:80\n").unwrap();
         fs::write(&paths[1], "\n").unwrap();
         assert!(!decide_local(&paths, &target));
         fs::write(&paths[1], "not an authority\n").unwrap();
+        assert!(!decide_local(&paths, &target));
+        fs::remove_file(&paths[1]).unwrap();
         assert!(!decide_local(&paths, &target));
     }
     #[test]
@@ -223,22 +237,28 @@ mod tests {
         {
             let fields: Vec<_> = row.split('\t').collect();
             if let ["entry", input, _, _, outcome] = fields.as_slice() {
-                assert_eq!(parse_domain_layer(input).is_ok(), *outcome == "accept");
+                assert_eq!(
+                    parse_domain_layer(&format!("{input}\n")).is_ok(),
+                    *outcome == "accept"
+                );
             }
         }
     }
     #[test]
     fn public_layers_union_and_fail_closed() {
         let directory = tempdir().unwrap();
-        let paths: [String; 2] =
-            ["first", "second"].map(|name| directory.path().join(name).display().to_string());
+        let paths: [String; 5] = ["base", "harness", "global", "project", "run"]
+            .map(|name| directory.path().join(name).display().to_string());
         let mode = directory.path().join("mode");
-        fs::write(&paths[0], "one.example\none.example\n").unwrap();
-        fs::write(&paths[1], "two.example\n").unwrap();
-        fs::write(&mode, "open\n").unwrap();
+        for path in &paths {
+            fs::write(path, "").unwrap();
+        }
+        fs::write(&paths[2], "one.example\none.example\n").unwrap();
+        fs::write(&paths[4], "two.example\n").unwrap();
+        fs::write(&mode, "enforce\n").unwrap();
         assert!(decide_public(&paths, &mode.display().to_string(), "two.example").allowed);
         assert!(!decide_public(&[], &mode.display().to_string(), "two.example").allowed);
-        for contents in ["", "bad!entry\n"] {
+        for contents in ["\n", "bad!entry\n"] {
             fs::write(&paths[1], contents).unwrap();
             for stored_mode in ["report\n", "open\n"] {
                 fs::write(&mode, stored_mode).unwrap();
@@ -282,15 +302,7 @@ mod tests {
         let authority = LoopbackAuthority::parse("localhost:80").unwrap();
         for grant in 0..3 {
             for (index, path) in paths.iter().enumerate() {
-                fs::write(
-                    path,
-                    if index == grant {
-                        "localhost:80\n"
-                    } else {
-                        "127.0.0.1:81\n"
-                    },
-                )
-                .unwrap();
+                fs::write(path, if index == grant { "localhost:80\n" } else { "" }).unwrap();
             }
             assert!(decide_local(&paths, &authority));
         }
