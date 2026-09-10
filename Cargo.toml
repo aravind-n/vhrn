@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/vhrn-policy", "proxy"]
+members = [".", "crates/vhrn-policy", "proxy-rs"]
 default-members = ["."]
 resolver = "3"
 
