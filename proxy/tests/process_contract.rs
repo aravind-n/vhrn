@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
+use std::{future::Future, time::Instant};
 
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,6 +17,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
 
 const DEADLINE: Duration = Duration::from_secs(3);
+const SCENARIO_DEADLINE: Duration = Duration::from_secs(20);
 const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 struct Proxy {
@@ -27,6 +29,31 @@ struct Proxy {
     log: PathBuf,
     local_policies: Option<[PathBuf; 3]>,
     local_grant: Option<usize>,
+}
+
+struct ManagedChild(Child);
+
+impl std::ops::Deref for ManagedChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ManagedChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().expect("check child status").is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 }
 
 impl Proxy {
@@ -141,6 +168,28 @@ fn proxy_command() -> Command {
     command
 }
 
+#[test]
+fn proxy_command_removes_every_proxy_environment_variable() {
+    let command = proxy_command();
+    for name in [
+        "VHRN_ALLOWLISTS",
+        "VHRN_ALLOWLIST",
+        "VHRN_MODE_FILE",
+        "VHRN_PROXY_LISTEN",
+        "VHRN_DENY_LOG",
+        "VHRN_LOOPBACK_ALLOWLISTS",
+        "VHRN_BROKER_ADDR",
+        "VHRN_BROKER_TOKEN_FILE",
+    ] {
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == name && value.is_none()),
+            "{name} must not leak from the test process"
+        );
+    }
+}
+
 #[derive(Clone)]
 struct Broker {
     listener: Arc<TcpListener>,
@@ -220,6 +269,12 @@ async fn request(address: SocketAddr, bytes: &[u8]) -> String {
     .expect("request deadline")
 }
 
+async fn scenario(future: impl Future<Output = ()>) {
+    timeout(SCENARIO_DEADLINE, future)
+        .await
+        .expect("scenario deadline");
+}
+
 fn status(response: &str) -> u16 {
     response
         .split_whitespace()
@@ -252,23 +307,66 @@ async fn read_through(stream: &mut TcpStream, marker: &[u8]) -> Vec<u8> {
 }
 
 async fn read_line(stream: &mut TcpStream) -> Vec<u8> {
-    let mut frame = Vec::new();
-    loop {
-        let mut byte = [0_u8; 1];
-        stream
-            .read_exact(&mut byte)
-            .await
-            .expect("broker ready frame");
-        frame.push(byte[0]);
-        assert!(frame.len() <= 256, "broker frame is bounded");
-        if byte[0] == b'\n' {
-            return frame;
+    read_line_with_timeout(stream, DEADLINE)
+        .await
+        .expect("broker frame deadline")
+}
+
+async fn read_line_with_timeout(
+    stream: &mut TcpStream,
+    frame_deadline: Duration,
+) -> Result<Vec<u8>, tokio::time::error::Elapsed> {
+    timeout(frame_deadline, async {
+        let mut frame = Vec::new();
+        loop {
+            let mut byte = [0_u8; 1];
+            stream
+                .read_exact(&mut byte)
+                .await
+                .expect("broker ready frame");
+            frame.push(byte[0]);
+            assert!(frame.len() <= 256, "broker frame is bounded");
+            if byte[0] == b'\n' {
+                return frame;
+            }
         }
-    }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn partial_broker_frame_obeys_the_injected_whole_frame_deadline() {
+    scenario(async {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("broker listener");
+        let address = listener.local_addr().expect("broker address");
+        let writer = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(address).await.expect("broker connect");
+            stream.write_all(b"OK").await.expect("partial broker frame");
+            sleep(Duration::from_secs(1)).await;
+        });
+        let (mut peer, _) = accept(&listener).await;
+        let frame_deadline = Duration::from_millis(75);
+        let started = Instant::now();
+        assert!(
+            read_line_with_timeout(&mut peer, frame_deadline)
+                .await
+                .is_err(),
+            "a partial broker frame must time out before its peer closes"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the frame deadline must bound the complete read"
+        );
+        writer.await.expect("partial broker peer");
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn direct_endpoints_and_denial_log_follow_corpus() {
+    scenario(async {
     let proxy = Proxy::start(None).await;
     for (path, expected) in [("/healthz", 200), ("/__status", 200), ("/not-found", 404)] {
         let response = proxy
@@ -292,10 +390,13 @@ async fn direct_endpoints_and_denial_log_follow_corpus() {
     assert_eq!(log.lines().count(), 1);
     assert!(log.ends_with("\tblocked.example\n"));
     assert!(!log.contains(TOKEN));
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn policy_modes_and_live_replacement_are_observed_per_request() {
+    scenario(async {
     let proxy = Proxy::start(None).await;
     let allowed = proxy.request("GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\nConnection: close\r\n\r\n").await;
     assert_eq!(
@@ -331,51 +432,59 @@ async fn policy_modes_and_live_replacement_are_observed_per_request() {
     std::fs::write(&proxy.policy, "\n").expect("replace policy");
     let denied = proxy.request("GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\nConnection: close\r\n\r\n").await;
     assert_eq!(status(&denied), 403);
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn local_startup_exchange_and_partial_configuration_are_process_checked() {
-    let broker = Broker::bind().await;
-    let address = broker.address();
-    let ready = tokio::spawn(async move { broker.ready().await });
-    let proxy = Proxy::start_local(address, "localhost:80").await;
-    ready.await.expect("broker ready task");
-    assert_eq!(
-        status(
-            &proxy
-                .request("GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
-                .await
-        ),
-        200
-    );
+    scenario(async {
+        let broker = Broker::bind().await;
+        let address = broker.address();
+        let ready = tokio::spawn(async move { broker.ready().await });
+        let proxy = Proxy::start_local(address, "localhost:80").await;
+        ready.await.expect("broker ready task");
+        assert_eq!(
+            status(
+                &proxy
+                    .request("GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+                    .await
+            ),
+            200
+        );
 
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let mut child = proxy_command()
-        .env("VHRN_PROXY_LISTEN", "127.0.0.1:0")
-        .env("VHRN_BROKER_ADDR", "127.0.0.1:1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start invalid proxy");
-    let result = timeout(DEADLINE, async {
-        loop {
-            if let Some(exit) = child.try_wait().expect("status") {
-                break exit;
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut child = ManagedChild(
+            proxy_command()
+                .env("VHRN_PROXY_LISTEN", "127.0.0.1:0")
+                .env("VHRN_BROKER_ADDR", "127.0.0.1:1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start invalid proxy"),
+        );
+        let result = timeout(DEADLINE, async {
+            loop {
+                if let Some(exit) = child.try_wait().expect("status") {
+                    break exit;
+                }
+                sleep(Duration::from_millis(20)).await;
             }
-            sleep(Duration::from_millis(20)).await;
-        }
+        })
+        .await
+        .expect("invalid startup deadline");
+        assert!(
+            !result.success(),
+            "partial local configuration must fail startup"
+        );
+        drop(directory);
     })
-    .await
-    .expect("invalid startup deadline");
-    assert!(
-        !result.success(),
-        "partial local configuration must fail startup"
-    );
-    drop(directory);
+    .await;
 }
 
 #[tokio::test]
 async fn each_local_policy_layer_can_independently_grant_through_the_broker() {
+    scenario(async {
     let authority = "localhost:8122";
     for grant in 0..3 {
         let broker = Broker::bind().await;
@@ -402,10 +511,13 @@ async fn each_local_policy_layer_can_independently_grant_through_the_broker() {
             .expect("broker response");
         assert_eq!(status(&request_task.await.expect("request task")), 200);
     }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn local_http_forwards_and_streams_through_authenticated_broker() {
+    scenario(async {
     let broker = Broker::bind().await;
     let authority = "localhost:8123";
     let broker_address = broker.address();
@@ -481,56 +593,62 @@ async fn local_http_forwards_and_streams_through_authenticated_broker() {
             .is_err(),
         "revoked local request must not reach broker"
     );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn local_http_client_disconnect_closes_broker_origin_work() {
-    let broker = Broker::bind().await;
-    let authority = "localhost:8125";
-    let broker_address = broker.address();
-    let ready_broker = broker.clone();
-    let ready = tokio::spawn(async move { ready_broker.ready().await });
-    let proxy = Proxy::start_local(broker_address, authority).await;
-    ready.await.expect("ready task");
-    let mut client = TcpStream::connect(proxy.address)
-        .await
-        .expect("client connect");
-    client
-        .write_all(b"GET http://localhost:8125/cancel HTTP/1.1\r\nHost: localhost:8125\r\n\r\n")
-        .await
-        .expect("local request");
-    let mut origin = broker.connect(authority).await;
-    let _ = read_through(&mut origin, b"\r\n\r\n").await;
-    origin
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nearly")
-        .await
-        .expect("early response");
-    let _ = read_through(&mut client, b"\r\n\r\n").await;
-    let mut early = [0_u8; 5];
-    client
-        .read_exact(&mut early)
-        .await
-        .expect("early client bytes");
-    assert_eq!(&early, b"early");
-    drop(client);
-    let mut end = [0_u8; 1];
-    let count = timeout(DEADLINE, origin.read(&mut end))
-        .await
-        .expect("origin cancellation deadline")
-        .expect("origin cancellation read");
-    assert_eq!(count, 0, "client disconnect closes origin work");
-    assert!(
-        timeout(Duration::from_millis(150), broker.listener.accept())
+    scenario(async {
+        let broker = Broker::bind().await;
+        let authority = "localhost:8125";
+        let broker_address = broker.address();
+        let ready_broker = broker.clone();
+        let ready = tokio::spawn(async move { ready_broker.ready().await });
+        let proxy = Proxy::start_local(broker_address, authority).await;
+        ready.await.expect("ready task");
+        let mut client = TcpStream::connect(proxy.address)
             .await
-            .is_err(),
-        "cancellation must not create another broker connection"
-    );
-    let log = std::fs::read_to_string(&proxy.log).unwrap_or_default();
-    assert!(!log.contains(TOKEN));
+            .expect("client connect");
+        client
+            .write_all(b"GET http://localhost:8125/cancel HTTP/1.1\r\nHost: localhost:8125\r\n\r\n")
+            .await
+            .expect("local request");
+        let mut origin = broker.connect(authority).await;
+        let _ = read_through(&mut origin, b"\r\n\r\n").await;
+        origin
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nearly")
+            .await
+            .expect("early response");
+        let _ = read_through(&mut client, b"\r\n\r\n").await;
+        let mut early = [0_u8; 5];
+        client
+            .read_exact(&mut early)
+            .await
+            .expect("early client bytes");
+        assert_eq!(&early, b"early");
+        drop(client);
+        let mut end = [0_u8; 1];
+        let count = timeout(DEADLINE, origin.read(&mut end))
+            .await
+            .expect("origin cancellation deadline")
+            .expect("origin cancellation read");
+        assert_eq!(count, 0, "client disconnect closes origin work");
+        assert!(
+            timeout(Duration::from_millis(150), broker.listener.accept())
+                .await
+                .is_err(),
+            "cancellation must not create another broker connection"
+        );
+        let log = std::fs::read_to_string(&proxy.log).unwrap_or_default();
+        assert!(!log.contains(TOKEN));
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn local_broker_short_failures_are_redacted_and_do_not_upgrade() {
+    scenario(async {
     for response in [b"ERR\n".as_slice(), b"O".as_slice(), b"TOOLONG".as_slice()] {
         let broker = Broker::bind().await;
         let authority = "localhost:8126";
@@ -567,238 +685,256 @@ async fn local_broker_short_failures_are_redacted_and_do_not_upgrade() {
                 .contains(TOKEN)
         );
     }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn local_broker_timeout_is_bounded_and_redacted() {
-    let broker = Broker::bind().await;
-    let authority = "localhost:8127";
-    let broker_address = broker.address();
-    let ready_broker = broker.clone();
-    let ready = tokio::spawn(async move { ready_broker.ready().await });
-    let proxy = Proxy::start_local(broker_address, authority).await;
-    ready.await.expect("ready task");
-    let mut client = TcpStream::connect(proxy.address)
-        .await
-        .expect("client connect");
-    client
+    scenario(async {
+        let broker = Broker::bind().await;
+        let authority = "localhost:8127";
+        let broker_address = broker.address();
+        let ready_broker = broker.clone();
+        let ready = tokio::spawn(async move { ready_broker.ready().await });
+        let proxy = Proxy::start_local(broker_address, authority).await;
+        ready.await.expect("ready task");
+        let mut client = TcpStream::connect(proxy.address)
+            .await
+            .expect("client connect");
+        client
         .write_all(
             b"CONNECT localhost:8127 HTTP/1.1\r\nHost: localhost:8127\r\nConnection: close\r\n\r\n",
         )
         .await
         .expect("timeout request");
-    let (mut peer, _) = accept(&broker.listener).await;
-    assert_eq!(
-        String::from_utf8(read_line(&mut peer).await).expect("CONNECT frame"),
-        format!("VHRN-BROKER/1 CONNECT {TOKEN} {authority}\n")
-    );
-    let mut response = Vec::new();
-    timeout(Duration::from_secs(15), client.read_to_end(&mut response))
-        .await
-        .expect("broker timeout deadline")
-        .expect("timeout response");
-    let response = String::from_utf8(response).expect("timeout text");
-    assert_eq!(status(&response), 502);
-    assert!(!response.contains(TOKEN));
-    let mut end = [0_u8; 1];
-    assert_eq!(
-        timeout(DEADLINE, peer.read(&mut end))
+        let (mut peer, _) = accept(&broker.listener).await;
+        assert_eq!(
+            String::from_utf8(read_line(&mut peer).await).expect("CONNECT frame"),
+            format!("VHRN-BROKER/1 CONNECT {TOKEN} {authority}\n")
+        );
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(15), client.read_to_end(&mut response))
             .await
-            .expect("peer closure deadline")
-            .expect("peer closure"),
-        0
-    );
+            .expect("broker timeout deadline")
+            .expect("timeout response");
+        let response = String::from_utf8(response).expect("timeout text");
+        assert_eq!(status(&response), 502);
+        assert!(!response.contains(TOKEN));
+        let mut end = [0_u8; 1];
+        assert_eq!(
+            timeout(DEADLINE, peer.read(&mut end))
+                .await
+                .expect("peer closure deadline")
+                .expect("peer closure"),
+            0
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn local_connect_preserves_buffered_bytes_and_survives_revocation() {
-    let broker = Broker::bind().await;
-    let authority = "localhost:8124";
-    let broker_address = broker.address();
-    let ready_broker = broker.clone();
-    let ready = tokio::spawn(async move { ready_broker.ready().await });
-    let proxy = Proxy::start_local(broker_address, authority).await;
-    ready.await.expect("ready task");
-    let mut client = TcpStream::connect(proxy.address)
-        .await
-        .expect("client connect");
-    client
-        .write_all(b"CONNECT localhost:8124 HTTP/1.1\r\nHost: localhost:8124\r\n\r\nclient-prefix")
-        .await
-        .expect("CONNECT request");
-    let (mut origin, _) = accept(&broker.listener).await;
-    assert_eq!(
-        String::from_utf8(read_line(&mut origin).await).expect("CONNECT frame"),
-        format!("VHRN-BROKER/1 CONNECT {TOKEN} {authority}\n")
-    );
-    assert!(
-        timeout(Duration::from_millis(150), client.read_u8())
+    scenario(async {
+        let broker = Broker::bind().await;
+        let authority = "localhost:8124";
+        let broker_address = broker.address();
+        let ready_broker = broker.clone();
+        let ready = tokio::spawn(async move { ready_broker.ready().await });
+        let proxy = Proxy::start_local(broker_address, authority).await;
+        ready.await.expect("ready task");
+        let mut client = TcpStream::connect(proxy.address)
             .await
-            .is_err(),
-        "no upgrade before broker approval"
-    );
-    origin.write_all(b"OK\n").await.expect("broker approval");
-    let response = read_through(&mut client, b"\r\n\r\n").await;
-    assert!(
-        String::from_utf8(response)
-            .expect("CONNECT response")
-            .starts_with("HTTP/1.1 200")
-    );
-    let mut buffered = [0_u8; 13];
-    timeout(DEADLINE, origin.read_exact(&mut buffered))
-        .await
-        .expect("buffered relay deadline")
-        .expect("buffered relay");
-    assert_eq!(&buffered, b"client-prefix");
-    proxy.revoke_local_grant();
-    origin
-        .write_all(b"peer-data")
-        .await
-        .expect("tunnel peer data");
-    let mut peer_data = [0_u8; 9];
-    client
-        .read_exact(&mut peer_data)
-        .await
-        .expect("tunnel client data");
-    assert_eq!(&peer_data, b"peer-data");
-    let denied = proxy
+            .expect("client connect");
+        client
+            .write_all(
+                b"CONNECT localhost:8124 HTTP/1.1\r\nHost: localhost:8124\r\n\r\nclient-prefix",
+            )
+            .await
+            .expect("CONNECT request");
+        let (mut origin, _) = accept(&broker.listener).await;
+        assert_eq!(
+            String::from_utf8(read_line(&mut origin).await).expect("CONNECT frame"),
+            format!("VHRN-BROKER/1 CONNECT {TOKEN} {authority}\n")
+        );
+        assert!(
+            timeout(Duration::from_millis(150), client.read_u8())
+                .await
+                .is_err(),
+            "no upgrade before broker approval"
+        );
+        origin.write_all(b"OK\n").await.expect("broker approval");
+        let response = read_through(&mut client, b"\r\n\r\n").await;
+        assert!(
+            String::from_utf8(response)
+                .expect("CONNECT response")
+                .starts_with("HTTP/1.1 200")
+        );
+        let mut buffered = [0_u8; 13];
+        timeout(DEADLINE, origin.read_exact(&mut buffered))
+            .await
+            .expect("buffered relay deadline")
+            .expect("buffered relay");
+        assert_eq!(&buffered, b"client-prefix");
+        proxy.revoke_local_grant();
+        origin
+            .write_all(b"peer-data")
+            .await
+            .expect("tunnel peer data");
+        let mut peer_data = [0_u8; 9];
+        client
+            .read_exact(&mut peer_data)
+            .await
+            .expect("tunnel client data");
+        assert_eq!(&peer_data, b"peer-data");
+        let denied = proxy
         .request(
             "CONNECT localhost:8124 HTTP/1.1\r\nHost: localhost:8124\r\nConnection: close\r\n\r\n",
         )
         .await;
-    assert_eq!(status(&denied), 403);
-    assert!(
-        timeout(Duration::from_millis(150), broker.listener.accept())
+        assert_eq!(status(&denied), 403);
+        assert!(
+            timeout(Duration::from_millis(150), broker.listener.accept())
+                .await
+                .is_err(),
+            "denied tunnel must not reach broker"
+        );
+        client.shutdown().await.expect("client close write");
+        let mut end = [0_u8; 1];
+        let origin_count = timeout(DEADLINE, origin.read(&mut end))
             .await
-            .is_err(),
-        "denied tunnel must not reach broker"
-    );
-    client.shutdown().await.expect("client close write");
-    let mut end = [0_u8; 1];
-    let origin_count = timeout(DEADLINE, origin.read(&mut end))
-        .await
-        .expect("origin closure deadline")
-        .expect("origin closure read");
-    assert_eq!(origin_count, 0);
-    origin.shutdown().await.expect("origin close write");
-    let client_count = timeout(DEADLINE, client.read(&mut end))
-        .await
-        .expect("client closure deadline")
-        .expect("client closure read");
-    assert_eq!(client_count, 0);
+            .expect("origin closure deadline")
+            .expect("origin closure read");
+        assert_eq!(origin_count, 0);
+        origin.shutdown().await.expect("origin close write");
+        let client_count = timeout(DEADLINE, client.read(&mut end))
+            .await
+            .expect("client closure deadline")
+            .expect("client closure read");
+        assert_eq!(client_count, 0);
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn sigterm_closes_an_established_local_tunnel() {
-    let broker = Broker::bind().await;
-    let authority = "localhost:8128";
-    let broker_address = broker.address();
-    let ready_broker = broker.clone();
-    let ready = tokio::spawn(async move { ready_broker.ready().await });
-    let mut proxy = Proxy::start_local(broker_address, authority).await;
-    ready.await.expect("ready task");
-    let mut client = TcpStream::connect(proxy.address)
-        .await
-        .expect("client connect");
-    client
-        .write_all(b"CONNECT localhost:8128 HTTP/1.1\r\nHost: localhost:8128\r\n\r\n")
-        .await
-        .expect("CONNECT request");
-    let mut peer = broker.connect(authority).await;
-    let response = read_through(&mut client, b"\r\n\r\n").await;
-    assert!(
-        String::from_utf8(response)
-            .expect("CONNECT response")
-            .starts_with("HTTP/1.1 200")
-    );
-    #[cfg(unix)]
-    assert!(
-        Command::new("kill")
-            .arg("-TERM")
-            .arg(proxy.child.id().to_string())
-            .status()
-            .expect("send SIGTERM")
-            .success()
-    );
-    let mut end = [0_u8; 1];
-    let client_count = timeout(Duration::from_secs(1), client.read(&mut end))
-        .await
-        .expect("client SIGTERM deadline")
-        .expect("client SIGTERM read");
-    let peer_count = timeout(Duration::from_secs(1), peer.read(&mut end))
-        .await
-        .expect("peer SIGTERM deadline")
-        .expect("peer SIGTERM read");
-    assert_eq!(client_count, 0);
-    assert_eq!(peer_count, 0);
-    let exit = timeout(Duration::from_secs(1), async {
-        loop {
-            if let Some(exit) = proxy.child.try_wait().expect("proxy status") {
-                break exit;
+    scenario(async {
+        let broker = Broker::bind().await;
+        let authority = "localhost:8128";
+        let broker_address = broker.address();
+        let ready_broker = broker.clone();
+        let ready = tokio::spawn(async move { ready_broker.ready().await });
+        let mut proxy = Proxy::start_local(broker_address, authority).await;
+        ready.await.expect("ready task");
+        let mut client = TcpStream::connect(proxy.address)
+            .await
+            .expect("client connect");
+        client
+            .write_all(b"CONNECT localhost:8128 HTTP/1.1\r\nHost: localhost:8128\r\n\r\n")
+            .await
+            .expect("CONNECT request");
+        let mut peer = broker.connect(authority).await;
+        let response = read_through(&mut client, b"\r\n\r\n").await;
+        assert!(
+            String::from_utf8(response)
+                .expect("CONNECT response")
+                .starts_with("HTTP/1.1 200")
+        );
+        #[cfg(unix)]
+        assert!(
+            Command::new("kill")
+                .arg("-TERM")
+                .arg(proxy.child.id().to_string())
+                .status()
+                .expect("send SIGTERM")
+                .success()
+        );
+        let mut end = [0_u8; 1];
+        let client_count = timeout(Duration::from_secs(1), client.read(&mut end))
+            .await
+            .expect("client SIGTERM deadline")
+            .expect("client SIGTERM read");
+        let peer_count = timeout(Duration::from_secs(1), peer.read(&mut end))
+            .await
+            .expect("peer SIGTERM deadline")
+            .expect("peer SIGTERM read");
+        assert_eq!(client_count, 0);
+        assert_eq!(peer_count, 0);
+        let exit = timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(exit) = proxy.child.try_wait().expect("proxy status") {
+                    break exit;
+                }
+                sleep(Duration::from_millis(10)).await;
             }
-            sleep(Duration::from_millis(10)).await;
-        }
+        })
+        .await
+        .expect("SIGTERM exit deadline");
+        assert!(!exit.success());
     })
-    .await
-    .expect("SIGTERM exit deadline");
-    assert!(!exit.success());
+    .await;
 }
 
 #[tokio::test]
 async fn listener_occupation_and_sigterm_have_bounded_lifecycle() {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+    scenario(async {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("occupied listener");
+        let address = listener.local_addr().expect("occupied address");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let policies =
+            ["base", "harness", "global", "project", "run"].map(|name| directory.path().join(name));
+        let mode = directory.path().join("mode");
+        for policy in &policies {
+            std::fs::write(policy, "").expect("policy");
+        }
+        std::fs::write(&policies[0], "allowed.example\n").expect("policy");
+        std::fs::write(&mode, "enforce\n").expect("mode");
+        let mut occupied = ManagedChild(
+            proxy_command()
+                .env("VHRN_ALLOWLISTS", join_paths(&policies))
+                .env("VHRN_MODE_FILE", mode)
+                .env("VHRN_PROXY_LISTEN", address.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start occupied proxy"),
+        );
+        let exit = timeout(DEADLINE, async {
+            loop {
+                if let Some(exit) = occupied.try_wait().expect("status") {
+                    break exit;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
         .await
-        .expect("occupied listener");
-    let address = listener.local_addr().expect("occupied address");
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let policies =
-        ["base", "harness", "global", "project", "run"].map(|name| directory.path().join(name));
-    let mode = directory.path().join("mode");
-    for policy in &policies {
-        std::fs::write(policy, "").expect("policy");
-    }
-    std::fs::write(&policies[0], "allowed.example\n").expect("policy");
-    std::fs::write(&mode, "enforce\n").expect("mode");
-    let mut occupied = proxy_command()
-        .env("VHRN_ALLOWLISTS", join_paths(&policies))
-        .env("VHRN_MODE_FILE", mode)
-        .env("VHRN_PROXY_LISTEN", address.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start occupied proxy");
-    let exit = timeout(DEADLINE, async {
-        loop {
-            if let Some(exit) = occupied.try_wait().expect("status") {
-                break exit;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("occupied startup deadline");
-    assert!(!exit.success());
-    drop(listener);
+        .expect("occupied startup deadline");
+        assert!(!exit.success());
+        drop(listener);
 
-    let mut proxy = Proxy::start(None).await;
-    #[cfg(unix)]
-    {
-        let status = Command::new("kill")
-            .arg("-TERM")
-            .arg(proxy.child.id().to_string())
-            .status()
-            .expect("send SIGTERM");
-        assert!(status.success());
-    }
-    let exit = timeout(Duration::from_secs(1), async {
-        loop {
-            if let Some(exit) = proxy.child.try_wait().expect("status") {
-                break exit;
-            }
-            sleep(Duration::from_millis(10)).await;
+        let mut proxy = Proxy::start(None).await;
+        #[cfg(unix)]
+        {
+            let status = Command::new("kill")
+                .arg("-TERM")
+                .arg(proxy.child.id().to_string())
+                .status()
+                .expect("send SIGTERM");
+            assert!(status.success());
         }
+        let exit = timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(exit) = proxy.child.try_wait().expect("status") {
+                    break exit;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("SIGTERM deadline");
+        assert!(!exit.success());
     })
-    .await
-    .expect("SIGTERM deadline");
-    assert!(!exit.success());
+    .await;
 }
