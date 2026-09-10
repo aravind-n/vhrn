@@ -30,7 +30,7 @@ struct Proxy {
 }
 
 impl Proxy {
-    async fn start(local: Option<(SocketAddr, &str, usize)>) -> Self {
+    async fn start(local: Option<(String, &str, usize)>) -> Self {
         let temp = tempfile::tempdir().expect("temporary test directory");
         let public_policies =
             ["base", "harness", "global", "project", "run"].map(|name| temp.path().join(name));
@@ -67,7 +67,7 @@ impl Proxy {
             std::fs::write(&token, TOKEN).expect("token");
             command
                 .env("VHRN_LOOPBACK_ALLOWLISTS", join_paths(&paths))
-                .env("VHRN_BROKER_ADDR", broker.to_string())
+                .env("VHRN_BROKER_ADDR", broker)
                 .env("VHRN_BROKER_TOKEN_FILE", token);
             (
                 Some(paths.try_into().expect("three local policies")),
@@ -110,7 +110,11 @@ impl Proxy {
     }
 
     async fn start_local_at(broker: SocketAddr, authority: &str, grant: usize) -> Self {
-        Self::start(Some((broker, authority, grant))).await
+        Self::start(Some((broker.to_string(), authority, grant))).await
+    }
+
+    async fn start_local_hostname(broker: SocketAddr, authority: &str) -> Self {
+        Self::start(Some((format!("localhost:{}", broker.port()), authority, 0))).await
     }
 
     fn revoke_local_grant(&self) {
@@ -407,7 +411,7 @@ async fn local_http_forwards_and_streams_through_authenticated_broker() {
     let broker_address = broker.address();
     let ready_broker = broker.clone();
     let ready = tokio::spawn(async move { ready_broker.ready().await });
-    let proxy = Proxy::start_local(broker_address, authority).await;
+    let proxy = Proxy::start_local_hostname(broker_address, authority).await;
     ready.await.expect("ready task");
 
     let mut client = TcpStream::connect(proxy.address)

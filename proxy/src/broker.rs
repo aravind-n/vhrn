@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -17,11 +16,13 @@ use hyper::{HeaderMap, Request, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, lookup_host};
 use tokio::task::JoinHandle;
 use tokio::time::{Sleep, timeout};
 use tokio_rustls::TlsConnector;
 use vhrn_policy::{BrokerToken, LoopbackAuthority};
+
+use crate::config::BrokerEndpoint;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -33,7 +34,7 @@ const MAX_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// Private connector for the broker capability.
 #[derive(Clone)]
 pub(crate) struct BrokerConnector {
-    address: SocketAddr,
+    endpoint: BrokerEndpoint,
     token: BrokerToken,
     deadlines: Deadlines,
     pool: Arc<std::sync::Mutex<HashMap<BrokerKey, BrokerConnection>>>,
@@ -92,9 +93,9 @@ impl Default for Deadlines {
 }
 
 impl BrokerConnector {
-    pub(crate) fn new(address: SocketAddr, token: BrokerToken) -> Self {
+    pub(crate) fn new(endpoint: impl Into<BrokerEndpoint>, token: BrokerToken) -> Self {
         Self {
-            address,
+            endpoint: endpoint.into(),
             token,
             deadlines: Deadlines::default(),
             pool: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -108,7 +109,7 @@ impl BrokerConnector {
     /// Completes the startup exchange before the proxy can accept traffic.
     pub(crate) async fn ready(&self) -> Result<()> {
         let result = timeout(self.deadlines.ready, async {
-            let mut stream = TcpStream::connect(self.address).await.map_err(|_| ())?;
+            let mut stream = self.dial().await.map_err(|_| ())?;
             let frame = format!("VHRN-BROKER/1 READY {}\n", token_text(&self.token));
             stream.write_all(frame.as_bytes()).await.map_err(|_| ())?;
             read_response(&mut stream)
@@ -124,9 +125,7 @@ impl BrokerConnector {
 
     /// Opens an authenticated broker stream for one already-validated authority.
     pub(crate) async fn connect(&self, authority: &LoopbackAuthority) -> Result<BrokerStream> {
-        let Ok(Ok(stream)) =
-            timeout(self.deadlines.connect, TcpStream::connect(self.address)).await
-        else {
+        let Ok(Ok(stream)) = timeout(self.deadlines.connect, self.dial()).await else {
             bail!("broker connection failed");
         };
         let frame = format!(
@@ -148,9 +147,13 @@ impl BrokerConnector {
     }
 
     #[cfg(test)]
-    fn with_deadlines(address: SocketAddr, token: BrokerToken, deadlines: Deadlines) -> Self {
+    fn with_deadlines(
+        endpoint: impl Into<BrokerEndpoint>,
+        token: BrokerToken,
+        deadlines: Deadlines,
+    ) -> Self {
         Self {
-            address,
+            endpoint: endpoint.into(),
             token,
             deadlines,
             pool: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -162,12 +165,12 @@ impl BrokerConnector {
 
     #[cfg(test)]
     pub(crate) fn with_ready_timeout(
-        address: SocketAddr,
+        endpoint: impl Into<BrokerEndpoint>,
         token: BrokerToken,
         ready: Duration,
     ) -> Self {
         Self::with_deadlines(
-            address,
+            endpoint,
             token,
             Deadlines {
                 ready,
@@ -177,12 +180,12 @@ impl BrokerConnector {
     }
     #[cfg(test)]
     fn with_http_limits(
-        address: SocketAddr,
+        endpoint: impl Into<BrokerEndpoint>,
         token: BrokerToken,
         http_timeout: Duration,
         response_limit: usize,
     ) -> Self {
-        let mut connector = Self::with_deadlines(address, token, short_test_deadlines());
+        let mut connector = Self::with_deadlines(endpoint, token, short_test_deadlines());
         connector.http_timeout = http_timeout;
         connector.response_limit = response_limit;
         connector
@@ -200,6 +203,27 @@ impl BrokerConnector {
     fn clear_pool(&self) {
         if let Ok(mut pool) = self.pool.lock() {
             pool.clear();
+        }
+    }
+
+    async fn dial(&self) -> std::io::Result<TcpStream> {
+        match &self.endpoint {
+            BrokerEndpoint::Socket(address) => TcpStream::connect(address).await,
+            BrokerEndpoint::Host { host, port } => {
+                let mut last_error = None;
+                for address in lookup_host((host.as_str(), *port)).await? {
+                    match TcpStream::connect(address).await {
+                        Ok(stream) => return Ok(stream),
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+                Err(last_error.unwrap_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        "broker hostname resolved empty",
+                    )
+                }))
+            }
         }
     }
 }
@@ -476,6 +500,7 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     use super::*;
+    use crate::config::BrokerEndpoint;
 
     fn token() -> BrokerToken {
         BrokerToken::parse("a".repeat(64)).unwrap()
@@ -489,6 +514,42 @@ mod tests {
     }
     async fn listener() -> TcpListener {
         TcpListener::bind("127.0.0.1:0").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn hostname_endpoint_resolves_for_ready_and_connect() {
+        let listener = listener().await;
+        let endpoint = BrokerEndpoint::parse(&format!(
+            "localhost:{}",
+            listener.local_addr().unwrap().port()
+        ))
+        .unwrap();
+        let ready_server = tokio::spawn({
+            let listener = listener;
+            async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut frame = [0; 85];
+                stream.read_exact(&mut frame).await.unwrap();
+                stream.write_all(b"OK\n").await.unwrap();
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut frame = [0; 128];
+                let count = stream.read(&mut frame).await.unwrap();
+                assert_eq!(
+                    &frame[..count],
+                    format!("VHRN-BROKER/1 CONNECT {} localhost:80\n", "a".repeat(64)).as_bytes()
+                );
+                stream.write_all(b"OK\n").await.unwrap();
+            }
+        });
+        let connector = BrokerConnector::with_deadlines(endpoint, token(), short_deadlines());
+        connector.ready().await.unwrap();
+        drop(
+            connector
+                .connect(&LoopbackAuthority::parse("localhost:80").unwrap())
+                .await
+                .unwrap(),
+        );
+        ready_server.await.unwrap();
     }
 
     async fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {

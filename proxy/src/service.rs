@@ -21,6 +21,8 @@ use tokio::time::{Instant, timeout};
 use vhrn_policy::Mode;
 
 use crate::broker::{BrokerConnector, BrokerResponse, BrokerStream};
+#[cfg(test)]
+use crate::config::BrokerEndpoint;
 use crate::config::{Config, config_from_env, load_broker_token};
 use crate::diagnostics::{ResponseDescriptor, direct_response, write_denial};
 use crate::policy::{decide_local, decide_public};
@@ -159,7 +161,7 @@ pub async fn run_from_env(shutdown: watch::Receiver<bool>) -> Result<ServiceRepo
 
 async fn run_with_config(config: Config, shutdown: watch::Receiver<bool>) -> Result<ServiceReport> {
     let broker = if let Some(local) = &config.local {
-        let connector = BrokerConnector::new(local.broker_addr, load_broker_token(local)?);
+        let connector = BrokerConnector::new(local.broker_addr.clone(), load_broker_token(local)?);
         connector.ready().await?;
         Some(connector)
     } else {
@@ -185,7 +187,7 @@ async fn run_with_config_with_ready_timeout(
 ) -> Result<ServiceReport> {
     let broker = if let Some(local) = &config.local {
         let connector = BrokerConnector::with_ready_timeout(
-            local.broker_addr,
+            local.broker_addr.clone(),
             load_broker_token(local)?,
             ready_timeout,
         );
@@ -855,7 +857,7 @@ mod tests {
         });
         value.local = Some(crate::config::LocalConfig {
             policy_paths: paths,
-            broker_addr: "127.0.0.1:1".parse().unwrap(),
+            broker_addr: BrokerEndpoint::parse("127.0.0.1:1").unwrap(),
             token_file: directory.join("token").display().to_string(),
         });
         value
@@ -931,7 +933,7 @@ mod tests {
         config.listen = proxy_address.to_string();
         config = local_config(config, directory.path());
         let local = config.local.as_mut().unwrap();
-        local.broker_addr = broker_address;
+        local.broker_addr = broker_address.into();
         std::fs::write(&local.token_file, "a".repeat(64)).unwrap();
         let (shutdown, _) = watch::channel(false);
         let task = tokio::spawn(run_with_config(config, shutdown.subscribe()));
@@ -995,7 +997,7 @@ mod tests {
             let mut value = local_config(config(directory.path(), "enforce"), directory.path());
             value.listen = proxy_address.to_string();
             let local = value.local.as_mut().unwrap();
-            local.broker_addr = broker_address;
+            local.broker_addr = broker_address.into();
             std::fs::write(&local.token_file, "a".repeat(64)).unwrap();
             let (_, shutdown) = watch::channel(false);
             let error = timeout(
@@ -1166,7 +1168,7 @@ mod tests {
         value.listen = listener.local_addr().unwrap().to_string();
         value.local = Some(crate::config::LocalConfig {
             policy_paths: ["a".to_owned(), "b".to_owned(), "c".to_owned()],
-            broker_addr: "127.0.0.1:1".parse().unwrap(),
+            broker_addr: BrokerEndpoint::parse("127.0.0.1:1").unwrap(),
             token_file: directory.path().join("missing").display().to_string(),
         });
         let (_, receiver) = watch::channel(false);
@@ -1555,7 +1557,7 @@ mod tests {
         let broker = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
         let mut value = local_config(config(directory.path(), "enforce"), directory.path());
         let local = value.local.as_mut().unwrap();
-        local.broker_addr = broker.local_addr().unwrap();
+        local.broker_addr = broker.local_addr().unwrap().into();
         let policy = local.policy_paths[0].clone();
         let token = BrokerToken::parse("a".repeat(64)).unwrap();
         let (released, release) = oneshot::channel();
@@ -1651,7 +1653,7 @@ mod tests {
         let broker = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let broker_address = broker.local_addr().unwrap();
         let mut value = local_config(config(directory.path(), "enforce"), directory.path());
-        value.local.as_mut().unwrap().broker_addr = broker_address;
+        value.local.as_mut().unwrap().broker_addr = broker_address.into();
         let server = tokio::spawn(async move {
             let (mut stream, _) = broker.accept().await.unwrap();
             let mut frame = [0; 128];
@@ -1708,7 +1710,7 @@ mod tests {
             stream.write_all(b"invalid tls peer").await.unwrap();
         });
         let mut value = local_config(config(directory.path(), "open"), directory.path());
-        value.local.as_mut().unwrap().broker_addr = address;
+        value.local.as_mut().unwrap().broker_addr = address.into();
         let connector = BrokerConnector::new(address, BrokerToken::parse("a".repeat(64)).unwrap());
         let response = route_request(
             proxy_request("GET", "https://localhost:8000/path", b""),

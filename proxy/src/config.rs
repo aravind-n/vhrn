@@ -23,8 +23,72 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalConfig {
     pub policy_paths: [String; 3],
-    pub broker_addr: SocketAddr,
+    pub broker_addr: BrokerEndpoint,
     pub token_file: String,
+}
+
+/// A host-owned broker address, limited to an unambiguous socket or DNS name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrokerEndpoint {
+    Socket(SocketAddr),
+    Host { host: String, port: u16 },
+}
+
+impl BrokerEndpoint {
+    /// Parses a numeric socket or hostname-and-port broker endpoint.
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        if let Ok(address) = value.parse::<SocketAddr>() {
+            if address.port() != 0 {
+                return Ok(Self::Socket(address));
+            }
+            bail!("invalid broker address");
+        }
+        if value.is_empty()
+            || value.contains(['/', '?', '#', '@', '[', ']'])
+            || value.bytes().any(|byte| byte.is_ascii_whitespace())
+        {
+            bail!("invalid broker address");
+        }
+        let Some((host, port)) = value.rsplit_once(':') else {
+            bail!("invalid broker address");
+        };
+        if host.is_empty()
+            || host.contains(':')
+            || !valid_hostname(host)
+            || port.is_empty()
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            bail!("invalid broker address");
+        }
+        let port = port
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| anyhow::anyhow!("invalid broker address"))?;
+        Ok(Self::Host {
+            host: host.to_ascii_lowercase(),
+            port,
+        })
+    }
+}
+
+impl From<SocketAddr> for BrokerEndpoint {
+    fn from(address: SocketAddr) -> Self {
+        Self::Socket(address)
+    }
+}
+
+fn valid_hostname(host: &str) -> bool {
+    host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
 /// Resolves configuration from an injected environment lookup.
@@ -48,7 +112,7 @@ where
         (None, None, None) => None,
         (Some(paths), Some(addr), Some(token)) => Some(LocalConfig {
             policy_paths: parse_local_paths(&paths)?,
-            broker_addr: addr.parse().context("invalid broker address")?,
+            broker_addr: BrokerEndpoint::parse(&addr)?,
             token_file: nonempty(token, "broker token file")?,
         }),
         _ => bail!("local routing requires policy paths, broker address, and token file"),
@@ -205,7 +269,7 @@ mod tests {
         let file = directory.path().join("token");
         let config = LocalConfig {
             policy_paths: ["a".to_owned(), "b".to_owned(), "c".to_owned()],
-            broker_addr: "127.0.0.1:1".parse().unwrap(),
+            broker_addr: BrokerEndpoint::parse("127.0.0.1:1").unwrap(),
             token_file: file.display().to_string(),
         };
         let valid = "a".repeat(64);
@@ -221,5 +285,49 @@ mod tests {
         assert!(load_broker_token(&config).is_err());
         fs::remove_file(&file).unwrap();
         assert!(load_broker_token(&config).is_err());
+    }
+
+    #[test]
+    fn broker_endpoint_accepts_only_socket_or_hostname_with_port() {
+        let config = resolve_config(|key| match key {
+            "VHRN_LOOPBACK_ALLOWLISTS" => Some("one,two,three".to_owned()),
+            "VHRN_BROKER_ADDR" => Some("host.docker.internal:12345".to_owned()),
+            "VHRN_BROKER_TOKEN_FILE" => Some("token".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(
+            config.local.unwrap().broker_addr,
+            BrokerEndpoint::Host {
+                host: "host.docker.internal".to_owned(),
+                port: 12345,
+            }
+        );
+        assert_eq!(
+            BrokerEndpoint::parse("127.0.0.1:12345").unwrap(),
+            BrokerEndpoint::Socket("127.0.0.1:12345".parse().unwrap())
+        );
+        assert_eq!(
+            BrokerEndpoint::parse("[::1]:12345").unwrap(),
+            BrokerEndpoint::Socket("[::1]:12345".parse().unwrap())
+        );
+        for value in [
+            "",
+            "host.docker.internal",
+            "host.docker.internal:0",
+            "127.0.0.1:0",
+            "[::1]:0",
+            "host.docker.internal:not-a-port",
+            "http://host.docker.internal:12345",
+            "user@host.docker.internal:12345",
+            "host.docker.internal:12345/path",
+            "[host.docker.internal]:12345",
+            "[::1:12345",
+            "::1:12345",
+            ":12345",
+            "host..internal:12345",
+        ] {
+            assert!(BrokerEndpoint::parse(value).is_err(), "{value}");
+        }
     }
 }
