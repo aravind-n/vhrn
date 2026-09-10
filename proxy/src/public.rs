@@ -1,6 +1,5 @@
 //! Validated numeric public connection setup.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
@@ -17,11 +16,11 @@ use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
+use crate::idle_pool::{IDLE_POOL_CAPACITY, IDLE_POOL_LIFETIME, IdlePool, IdleValue};
 use crate::service::{
     PublicConnectFuture, PublicConnector, PublicHttpFuture, PublicResponse, sealed,
 };
@@ -169,7 +168,7 @@ fn is_shared(address: Ipv4Addr) -> bool {
 pub(crate) struct PublicConnectorAdapter {
     resolver: Arc<dyn Resolver>,
     dialer: Arc<dyn NumericDialer>,
-    pool: Mutex<HashMap<OriginKey, OriginConnection>>,
+    pool: IdlePool<OriginKey, OriginConnection>,
     response_timeout: Duration,
     response_limit: usize,
     #[cfg(test)]
@@ -199,16 +198,34 @@ impl Drop for OriginConnection {
     }
 }
 
+impl IdleValue for OriginConnection {
+    fn reusable(&self) -> bool {
+        !self.driver.is_finished() && self.sender.is_ready()
+    }
+}
+
 impl PublicConnectorAdapter {
     pub(crate) fn system() -> Self {
         Self::new(Arc::new(SystemResolver), Arc::new(SystemDialer))
     }
 
     pub(crate) fn new(resolver: Arc<dyn Resolver>, dialer: Arc<dyn NumericDialer>) -> Self {
+        Self::new_with_pool(
+            resolver,
+            dialer,
+            IdlePool::new(IDLE_POOL_CAPACITY, IDLE_POOL_LIFETIME),
+        )
+    }
+
+    fn new_with_pool(
+        resolver: Arc<dyn Resolver>,
+        dialer: Arc<dyn NumericDialer>,
+        pool: IdlePool<OriginKey, OriginConnection>,
+    ) -> Self {
         Self {
             resolver,
             dialer,
-            pool: Mutex::new(HashMap::new()),
+            pool,
             response_timeout: HTTP_TIMEOUT,
             response_limit: MAX_RESPONSE_BYTES,
             #[cfg(test)]
@@ -216,6 +233,16 @@ impl PublicConnectorAdapter {
             #[cfg(test)]
             active_drivers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    fn with_pool_limits(
+        resolver: Arc<dyn Resolver>,
+        dialer: Arc<dyn NumericDialer>,
+        capacity: usize,
+        lifetime: Duration,
+    ) -> Self {
+        Self::new_with_pool(resolver, dialer, IdlePool::new(capacity, lifetime))
     }
 
     #[cfg(test)]
@@ -228,7 +255,7 @@ impl PublicConnectorAdapter {
         Self {
             resolver,
             dialer,
-            pool: Mutex::new(HashMap::new()),
+            pool: IdlePool::new(IDLE_POOL_CAPACITY, IDLE_POOL_LIFETIME),
             response_timeout,
             response_limit,
             public_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -318,7 +345,7 @@ impl PublicConnectorAdapter {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let key = OriginKey::from_target(&target);
         let request = outbound_request(request)?;
-        let connection = self.pool.lock().await.remove(&key);
+        let connection = self.pool.take(&key);
         let mut connection = match connection {
             Some(connection) => connection,
             None => self.open_sender(&target).await?,
@@ -343,7 +370,7 @@ impl PublicConnectorAdapter {
         )
         .await
         .map_err(|_| anyhow!("origin body timed out"))??;
-        self.pool.lock().await.insert(key, connection);
+        self.pool.put(key, connection);
         Ok(PublicResponse {
             status: parts.status,
             headers: parts.headers,
@@ -358,7 +385,8 @@ impl PublicConnectorAdapter {
 
     #[cfg(test)]
     pub(crate) async fn pool_len(&self) -> usize {
-        self.pool.lock().await.len()
+        tokio::task::yield_now().await;
+        self.pool.len()
     }
 
     #[cfg(test)]
@@ -505,6 +533,202 @@ mod tests {
             .split(',')
             .map(|address| address.parse().unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn bounded_idle_pool_retires_public_drivers_and_reuses_live_key() {
+        let targets =
+            ["one", "two", "three"].map(|host| public_target(&format!("http://{host}.example/")));
+        let resolver = Arc::new(FakeResolver::new(
+            (0..targets.len())
+                .map(|_| Ok(parse_addresses("8.8.8.8")))
+                .collect(),
+        ));
+        let mut clients = Vec::new();
+        let mut closed = Vec::new();
+        for requests in [1, 2, 1] {
+            let (client, mut peer) = tokio::io::duplex(1024);
+            clients.push(Box::new(client) as BoxStream);
+            let (sender, receiver) = oneshot::channel();
+            tokio::spawn(async move {
+                for _ in 0..requests {
+                    let mut bytes = [0; 1024];
+                    assert!(
+                        timeout(Duration::from_millis(200), peer.read(&mut bytes))
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            > 0
+                    );
+                    peer.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                }
+                let mut byte = [0];
+                let _ = sender.send(
+                    timeout(Duration::from_millis(500), peer.read(&mut byte))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                );
+            });
+            closed.push(receiver);
+        }
+        let dialer = Arc::new(QueueDialer::new(clients));
+        let connector = PublicConnectorAdapter::with_pool_limits(
+            resolver,
+            dialer.clone(),
+            2,
+            Duration::from_secs(5),
+        );
+        for index in 0..3 {
+            connector
+                .http(
+                    targets[index].clone(),
+                    Request::builder()
+                        .uri(format!(
+                            "http://{}.example/",
+                            ["one", "two", "three"][index]
+                        ))
+                        .body(Full::new(Bytes::new()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(connector.pool_len().await, 2);
+        assert_eq!(
+            timeout(Duration::from_millis(50), &mut closed[0])
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        connector
+            .http(
+                targets[1].clone(),
+                Request::builder()
+                    .uri("http://two.example/reused")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(connector.public_calls(), 4);
+        assert_eq!(dialer.calls.lock().unwrap().len(), 3);
+        assert_eq!(connector.pool_len().await, 2);
+        drop(connector);
+        assert_eq!((&mut closed[1]).await.unwrap(), 0);
+        assert_eq!((&mut closed[2]).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn public_idle_pool_expires_without_a_later_request() {
+        let (client, mut peer) = tokio::io::duplex(1024);
+        let resolver = Arc::new(FakeResolver::new(vec![Ok(parse_addresses("8.8.8.8"))]));
+        let connector = PublicConnectorAdapter::with_pool_limits(
+            resolver,
+            Arc::new(QueueDialer::new(vec![Box::new(client)])),
+            2,
+            Duration::from_millis(20),
+        );
+        let peer_task = tokio::spawn(async move {
+            let mut request = [0; 1024];
+            assert!(peer.read(&mut request).await.unwrap() > 0);
+            peer.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let mut byte = [0];
+            peer.read(&mut byte).await.unwrap()
+        });
+        let target = public_target("http://expiry.example/");
+        connector
+            .http(
+                target,
+                Request::builder()
+                    .uri("http://expiry.example/")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_millis(500), async {
+            while connector.active_drivers() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(connector.pool_len().await, 0);
+        assert_eq!(
+            timeout(Duration::from_millis(500), peer_task)
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_close_response_is_not_reused() {
+        let (first, mut first_peer) = tokio::io::duplex(1024);
+        let (second, mut second_peer) = tokio::io::duplex(1024);
+        let resolver = Arc::new(FakeResolver::new(vec![
+            Ok(parse_addresses("8.8.8.8")),
+            Ok(parse_addresses("8.8.8.8")),
+        ]));
+        let dialer = Arc::new(QueueDialer::new(vec![Box::new(first), Box::new(second)]));
+        let connector = PublicConnectorAdapter::new(resolver, dialer.clone());
+        let first_server = tokio::spawn(async move {
+            let mut request = [0; 1024];
+            assert!(
+                timeout(Duration::from_millis(200), first_peer.read(&mut request))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    > 0
+            );
+            first_peer
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let second_server = tokio::spawn(async move {
+            let mut request = [0; 1024];
+            assert!(
+                timeout(Duration::from_millis(200), second_peer.read(&mut request))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    > 0
+            );
+            second_peer
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let target = public_target("http://close.example/");
+        for path in ["/first", "/second"] {
+            connector
+                .http(
+                    target.clone(),
+                    Request::builder()
+                        .uri(format!("http://close.example{path}"))
+                        .body(Full::new(Bytes::new()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        timeout(Duration::from_millis(200), first_server)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_millis(200), second_server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dialer.calls.lock().unwrap().len(), 2);
     }
 
     #[test]

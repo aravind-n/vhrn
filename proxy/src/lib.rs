@@ -4,6 +4,7 @@
 mod broker;
 pub mod config;
 pub mod diagnostics;
+mod idle_pool;
 pub mod policy;
 pub mod public;
 pub mod relay;

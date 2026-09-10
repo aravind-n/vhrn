@@ -2325,6 +2325,7 @@ mod tests {
         let adapter = Arc::new(PublicConnectorAdapter::new(resolver, dialer));
         let connectors = Connectors::new(adapter.clone(), Arc::new(InertConnector));
         let (release, wait) = oneshot::channel();
+        let (close, closed) = oneshot::channel();
         let origin_task = tokio::spawn(async move {
             let mut request = [0; 1024];
             timeout(Duration::from_millis(500), origin.read(&mut request))
@@ -2337,6 +2338,7 @@ mod tests {
                 .unwrap();
             wait.await.unwrap();
             origin.write_all(b" second").await.unwrap();
+            closed.await.unwrap();
         });
         let mut response = Box::pin(route_request(
             proxy_request("GET", "http://allowed.example/stream", b""),
@@ -2355,11 +2357,12 @@ mod tests {
             response.into_body().collect().await.unwrap().to_bytes(),
             "first second"
         );
+        assert_eq!(adapter.pool_len().await, 1);
+        close.send(()).unwrap();
         timeout(Duration::from_millis(500), origin_task)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(adapter.pool_len().await, 1);
     }
 
     #[tokio::test]

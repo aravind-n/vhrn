@@ -1,6 +1,6 @@
 //! Authenticated connector for the host-side loopback broker.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -23,6 +23,7 @@ use tokio_rustls::TlsConnector;
 use vhrn_policy::{BrokerToken, LoopbackAuthority};
 
 use crate::config::BrokerEndpoint;
+use crate::idle_pool::{IDLE_POOL_CAPACITY, IDLE_POOL_LIFETIME, IdlePool, IdleValue};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -37,7 +38,7 @@ pub(crate) struct BrokerConnector {
     endpoint: BrokerEndpoint,
     token: BrokerToken,
     deadlines: Deadlines,
-    pool: Arc<std::sync::Mutex<HashMap<BrokerKey, BrokerConnection>>>,
+    pool: IdlePool<BrokerKey, BrokerConnection>,
     http_timeout: Duration,
     response_limit: usize,
     #[cfg(test)]
@@ -58,6 +59,11 @@ struct BrokerConnection {
 impl BrokerConnection {
     fn reusable(&self) -> bool {
         !self.driver.is_finished() && self.sender.is_ready()
+    }
+}
+impl IdleValue for BrokerConnection {
+    fn reusable(&self) -> bool {
+        self.reusable()
     }
 }
 #[cfg(test)]
@@ -98,7 +104,7 @@ impl BrokerConnector {
             endpoint: endpoint.into(),
             token,
             deadlines: Deadlines::default(),
-            pool: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pool: IdlePool::new(IDLE_POOL_CAPACITY, IDLE_POOL_LIFETIME),
             http_timeout: HTTP_TIMEOUT,
             response_limit: MAX_HTTP_RESPONSE_BYTES,
             #[cfg(test)]
@@ -152,11 +158,27 @@ impl BrokerConnector {
         token: BrokerToken,
         deadlines: Deadlines,
     ) -> Self {
+        Self::with_deadlines_and_pool(
+            endpoint,
+            token,
+            deadlines,
+            IDLE_POOL_CAPACITY,
+            IDLE_POOL_LIFETIME,
+        )
+    }
+    #[cfg(test)]
+    fn with_deadlines_and_pool(
+        endpoint: impl Into<BrokerEndpoint>,
+        token: BrokerToken,
+        deadlines: Deadlines,
+        capacity: usize,
+        lifetime: Duration,
+    ) -> Self {
         Self {
             endpoint: endpoint.into(),
             token,
             deadlines,
-            pool: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pool: IdlePool::new(capacity, lifetime),
             http_timeout: HTTP_TIMEOUT,
             response_limit: MAX_HTTP_RESPONSE_BYTES,
             active_drivers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -192,7 +214,7 @@ impl BrokerConnector {
     }
     #[cfg(test)]
     pub(crate) fn pool_len(&self) -> usize {
-        self.pool.lock().map_or(0, |pool| pool.len())
+        self.pool.len()
     }
     #[cfg(test)]
     pub(crate) fn active_drivers(&self) -> usize {
@@ -201,9 +223,7 @@ impl BrokerConnector {
     }
     #[cfg(test)]
     fn clear_pool(&self) {
-        if let Ok(mut pool) = self.pool.lock() {
-            pool.clear();
-        }
+        self.pool.clear();
     }
 
     async fn dial(&self) -> std::io::Result<TcpStream> {
@@ -278,7 +298,7 @@ pub(crate) struct BrokerBody {
     incoming: Incoming,
     connection: Option<BrokerConnection>,
     key: BrokerKey,
-    pool: Arc<std::sync::Mutex<HashMap<BrokerKey, BrokerConnection>>>,
+    pool: IdlePool<BrokerKey, BrokerConnection>,
     bytes: usize,
     limit: usize,
     timeout: Duration,
@@ -297,12 +317,7 @@ impl BrokerConnector {
             secure,
             authority: authority.clone(),
         };
-        let connection = self
-            .pool
-            .lock()
-            .ok()
-            .and_then(|mut pool| pool.remove(&key))
-            .filter(BrokerConnection::reusable);
+        let connection = self.pool.take(&key);
         let mut connection = match connection {
             Some(connection) => connection,
             None => self.open_http(authority, secure).await?,
@@ -390,11 +405,7 @@ impl BrokerBody {
         let Some(connection) = self.connection.take() else {
             return;
         };
-        if connection.reusable()
-            && let Ok(mut pool) = self.pool.lock()
-        {
-            pool.insert(self.key.clone(), connection);
-        }
+        self.pool.put(self.key.clone(), connection);
     }
 }
 
@@ -595,6 +606,14 @@ mod tests {
             .unwrap()
     }
 
+    fn authority_request(authority: &LoopbackAuthority, path: &str) -> Request<Full<Bytes>> {
+        Request::builder()
+            .uri(format!("http://{authority}{path}"))
+            .header("host", authority.to_string())
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    }
+
     async fn accept_broker(listener: &TcpListener) -> TcpStream {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut frame = vec![0; 100];
@@ -602,6 +621,155 @@ mod tests {
         stream.write_all(b"OK\n").await.unwrap();
         let _ = read_http_request(&mut stream).await;
         stream
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn bounded_idle_pool_retires_broker_drivers_and_reaps_without_checkout() {
+        let listener = listener().await;
+        let address = listener.local_addr().unwrap();
+        let release = Arc::new(Notify::new());
+        let server_release = release.clone();
+        let server = tokio::spawn(async move {
+            let mut handlers = Vec::new();
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let release = server_release.clone();
+                handlers.push(tokio::spawn(async move {
+                    let mut frame = vec![0; 100];
+                    timeout(Duration::from_millis(200), stream.read_exact(&mut frame))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let frame = String::from_utf8(frame).unwrap();
+                    let authority = frame
+                        .strip_prefix("VHRN-BROKER/1 CONNECT ")
+                        .unwrap()
+                        .split_once(' ')
+                        .unwrap()
+                        .1
+                        .trim_end();
+                    assert!((80..85).any(|port| authority == format!("localhost:{port}")));
+                    let port = authority.strip_prefix("localhost:").unwrap();
+                    stream.write_all(b"OK\n").await.unwrap();
+                    for attempt in 0..if port == "81" { 2 } else { 1 } {
+                        let request =
+                            String::from_utf8(read_http_request(&mut stream).await).unwrap();
+                        assert!(
+                            request
+                                .starts_with(&format!("GET /churn/{port}/{attempt} HTTP/1.1\r\n"))
+                        );
+                        assert!(request.contains(&format!("host: {authority}\r\n")));
+                        stream
+                            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                            .await
+                            .unwrap();
+                    }
+                    release.notified().await;
+                }));
+            }
+            server_release.notified().await;
+            for handler in handlers {
+                handler.await.unwrap();
+            }
+        });
+        let connector = BrokerConnector::with_deadlines_and_pool(
+            address,
+            token(),
+            short_deadlines(),
+            2,
+            Duration::from_secs(5),
+        );
+        let authorities = (80..85)
+            .map(|port| LoopbackAuthority::parse(&format!("localhost:{port}")).unwrap())
+            .collect::<Vec<_>>();
+        for authority in authorities.iter().take(3) {
+            let port = authority.to_string().rsplit(':').next().unwrap().to_owned();
+            let response = connector
+                .http(
+                    authority,
+                    false,
+                    authority_request(authority, &format!("/churn/{port}/0")),
+                )
+                .await
+                .unwrap();
+            response.body.collect().await.unwrap();
+        }
+        assert!(connector.pool_len() <= 2);
+        let response = connector
+            .http(
+                &authorities[1],
+                false,
+                authority_request(&authorities[1], "/churn/81/1"),
+            )
+            .await
+            .unwrap();
+        response.body.collect().await.unwrap();
+        assert_eq!(connector.pool_len(), 2);
+        let response = connector
+            .http(
+                &authorities[3],
+                false,
+                authority_request(&authorities[3], "/churn/83/0"),
+            )
+            .await
+            .unwrap();
+        response.body.collect().await.unwrap();
+        assert!(connector.pool_len() <= 2);
+        let response = connector
+            .http(
+                &authorities[4],
+                false,
+                authority_request(&authorities[4], "/churn/84/0"),
+            )
+            .await
+            .unwrap();
+        response.body.collect().await.unwrap();
+        assert_eq!(connector.pool_len(), 2);
+        release.notify_waiters();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn broker_idle_pool_expires_without_a_later_request() {
+        let listener = listener().await;
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut frame = vec![0; 100];
+            stream.read_exact(&mut frame).await.unwrap();
+            assert_eq!(
+                String::from_utf8(frame).unwrap(),
+                format!("VHRN-BROKER/1 CONNECT {} localhost:80\n", "a".repeat(64))
+            );
+            stream.write_all(b"OK\n").await.unwrap();
+            let _ = read_http_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let mut byte = [0];
+            timeout(Duration::from_millis(500), stream.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        let connector = BrokerConnector::with_deadlines_and_pool(
+            address,
+            token(),
+            short_deadlines(),
+            2,
+            Duration::from_millis(20),
+        );
+        let authority = LoopbackAuthority::parse("localhost:80").unwrap();
+        let response = connector
+            .http(&authority, false, local_request())
+            .await
+            .unwrap();
+        response.body.collect().await.unwrap();
+        wait_for_no_drivers(&connector).await;
+        assert_eq!(connector.pool_len(), 0);
+        assert_eq!(server.await.unwrap(), 0);
     }
 
     #[tokio::test]
