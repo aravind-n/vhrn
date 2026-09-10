@@ -1,6 +1,4 @@
 //! Pure values used at the policy boundary.
-#![forbid(unsafe_code)]
-
 use std::fmt;
 use std::net::Ipv6Addr;
 use std::str::FromStr;

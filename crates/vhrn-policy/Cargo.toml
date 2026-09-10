@@ -1,13 +1,11 @@
 [package]
 name = "vhrn-policy"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
-description = "Policy primitives for vhrn"
-repository = "https://github.com/aravind-n/vhrn"
-readme = "../../README.md"
-keywords = ["sandbox", "policy"]
-categories = ["development-tools"]
+repository.workspace = true
+publish.workspace = true
 
 [lints]
 workspace = true

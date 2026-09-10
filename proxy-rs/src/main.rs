@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use anyhow::{Result, bail};
 use tokio::sync::watch;
 

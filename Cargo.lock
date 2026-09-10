@@ -1055,11 +1055,11 @@ dependencies = [
 
 [[package]]
 name = "vhrn-policy"
-version = "0.1.0"
+version = "0.5.0"
 
 [[package]]
 name = "vhrn-proxy"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bytes",
