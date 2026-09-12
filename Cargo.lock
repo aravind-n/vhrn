@@ -1050,12 +1050,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
- "vhrn-policy",
 ]
-
-[[package]]
-name = "vhrn-policy"
-version = "0.5.0"
 
 [[package]]
 name = "vhrn-proxy"
@@ -1072,7 +1067,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
- "vhrn-policy",
  "webpki-roots",
 ]
 

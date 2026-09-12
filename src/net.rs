@@ -3,14 +3,142 @@
 //! remains the only widening path. Modes are per-published-run files.
 
 use std::collections::HashSet;
+use std::fmt;
+use std::net::Ipv6Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 
-pub(crate) use vhrn_policy::{LoopbackAuthority, Mode};
+/// Host-side serialization for the proxy's documented policy mode file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Enforce,
+    Report,
+    Open,
+}
+impl Mode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforce => "enforce",
+            Self::Report => "report",
+            Self::Open => "open",
+        }
+    }
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "enforce" => Some(Self::Enforce),
+            "report" => Some(Self::Report),
+            "open" => Some(Self::Open),
+            _ => None,
+        }
+    }
+}
+impl fmt::Display for Mode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A host policy authority, validated according to the proxy-owned contract.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct LoopbackAuthority {
+    host: LoopbackHost,
+    port: u16,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LoopbackHost {
+    Localhost,
+    Ipv4([u8; 4]),
+    Ipv6Loopback,
+}
+impl LoopbackAuthority {
+    pub(crate) fn parse(input: &str) -> Result<Self, &'static str> {
+        if input.is_empty() || input.trim() != input || !input.is_ascii() {
+            return Err("invalid loopback authority");
+        }
+        let (host, port) = input.rsplit_once(':').ok_or("invalid loopback authority")?;
+        let port = parse_policy_port(port).ok_or("invalid loopback authority")?;
+        let host = if host.eq_ignore_ascii_case("localhost") {
+            LoopbackHost::Localhost
+        } else if let Some(ipv6) = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+        {
+            let ipv6 = Ipv6Addr::from_str(ipv6).map_err(|_| "invalid loopback authority")?;
+            if !ipv6.is_loopback() {
+                return Err("invalid loopback authority");
+            }
+            LoopbackHost::Ipv6Loopback
+        } else {
+            LoopbackHost::Ipv4(parse_loopback_ipv4(host).ok_or("invalid loopback authority")?)
+        };
+        Ok(Self { host, port })
+    }
+}
+impl fmt::Display for LoopbackAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.host {
+            LoopbackHost::Localhost => write!(formatter, "localhost:{}", self.port),
+            LoopbackHost::Ipv4(octets) => write!(
+                formatter,
+                "{}.{}.{}.{}:{}",
+                octets[0], octets[1], octets[2], octets[3], self.port
+            ),
+            LoopbackHost::Ipv6Loopback => write!(formatter, "[::1]:{}", self.port),
+        }
+    }
+}
+fn parse_policy_port(value: &str) -> Option<u16> {
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse().ok())
+        .flatten()
+        .filter(|port: &u16| *port != 0)
+}
+fn parse_loopback_ipv4(value: &str) -> Option<[u8; 4]> {
+    let mut octets = [0; 4];
+    let mut parts = value.split('.');
+    for octet in &mut octets {
+        let value = parts.next()?;
+        if value.is_empty()
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+            || (value.len() > 1 && value.starts_with('0'))
+        {
+            return None;
+        }
+        *octet = value.parse().ok()?;
+    }
+    (parts.next().is_none() && octets[0] == 127).then_some(octets)
+}
+
+fn normalize_domain_entry(input: &str) -> Result<String, ()> {
+    normalize_policy_domain(
+        input
+            .trim()
+            .strip_prefix("*.")
+            .unwrap_or(input.trim())
+            .trim_matches('.'),
+    )
+}
+fn normalize_policy_domain(value: &str) -> Result<String, ()> {
+    if !value.is_ascii() {
+        return Err(());
+    }
+    let value = value.to_ascii_lowercase();
+    if value.is_empty()
+        || value.split('.').any(str::is_empty)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || !value.bytes().any(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err(());
+    }
+    Ok(value)
+}
 
 use crate::run::set_mode;
 
@@ -77,13 +205,13 @@ pub(crate) fn normalize_domain(input: &str) -> std::result::Result<String, Strin
     if !value.is_ascii() {
         let suggestion = idna::domain_to_ascii(value)
             .ok()
-            .filter(|value| vhrn_policy::normalize_domain_entry(value).is_ok());
+            .filter(|value| normalize_domain_entry(value).is_ok());
         return Err(match suggestion {
             Some(value) => format!("domain must be ASCII; use {value:?}"),
             None => "domain must be a valid ASCII IDNA hostname".to_string(),
         });
     }
-    vhrn_policy::normalize_domain_entry(input).map_err(|_| format!("invalid domain {input:?}"))
+    normalize_domain_entry(input).map_err(|()| format!("invalid domain {input:?}"))
 }
 
 /// A byte-stable project identity. Unix paths need not be UTF-8, so neither the key
@@ -1880,7 +2008,7 @@ mod tests {
 
     #[test]
     fn loopback_authorities_match_shared_fixture() {
-        for line in include_str!("../testdata/loopback-authorities.tsv").lines() {
+        for line in include_str!("../proxy-rs/testdata/loopback-authorities.tsv").lines() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }

@@ -1,7 +1,7 @@
-# Proxy consumer contract
+# Proxy contract
 
-This document fixes the externally observable egress-proxy interface. Rows in
-`testdata/` are normative. Fields use literal bytes unless a row says otherwise;
+`vhrn-proxy` owns this externally observable egress-proxy interface. `vhrn` is a
+consumer and must conform to it. Rows in `proxy-rs/testdata/` are normative. Fields use literal bytes unless a row says otherwise;
 TSV uses `\\n` for a line-feed and an empty cell for no value. Error wording,
 timestamps, scheduling, allocation, and internal layout are not part of this
 contract.

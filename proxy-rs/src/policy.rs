@@ -2,9 +2,69 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use vhrn_policy::{
-    LoopbackAuthority, Mode, domain_entry_matches, normalize_domain_entry, normalize_domain_host,
-};
+use crate::target::LoopbackAuthority;
+
+/// Proxy-owned policy mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Enforce,
+    Report,
+    Open,
+}
+impl Mode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforce => "enforce",
+            Self::Report => "report",
+            Self::Open => "open",
+        }
+    }
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "enforce" => Some(Self::Enforce),
+            "report" => Some(Self::Report),
+            "open" => Some(Self::Open),
+            _ => None,
+        }
+    }
+    fn readable_or_enforce(value: &str) -> Self {
+        Self::parse(value).unwrap_or(Self::Enforce)
+    }
+}
+pub(crate) fn normalize_domain_entry(input: &str) -> Result<String, ()> {
+    normalize_domain(
+        input
+            .trim()
+            .strip_prefix("*.")
+            .unwrap_or(input.trim())
+            .trim_matches('.'),
+    )
+}
+pub(crate) fn normalize_domain_host(input: &str) -> Result<String, ()> {
+    normalize_domain(input.trim().strip_suffix('.').unwrap_or(input.trim()))
+}
+pub(crate) fn domain_entry_matches(entry: &str, host: &str) -> bool {
+    host == entry
+        || host
+            .strip_suffix(entry)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+fn normalize_domain(value: &str) -> Result<String, ()> {
+    if !value.is_ascii() {
+        return Err(());
+    }
+    let value = value.to_ascii_lowercase();
+    if value.is_empty()
+        || value.split('.').any(str::is_empty)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || !value.bytes().any(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err(());
+    }
+    Ok(value)
+}
 
 /// A policy layer contains an invalid record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +179,7 @@ pub fn parse_domain_layer(contents: &str) -> Result<BTreeSet<String>, PolicyPars
         .lines()
         .map(normalize_domain_entry)
         .collect::<Result<_, _>>()
-        .map_err(|_| PolicyParseError)
+        .map_err(|()| PolicyParseError)
 }
 /// Parses one local layer without filesystem access.
 ///
@@ -132,7 +192,7 @@ pub fn parse_local_layer(contents: &str) -> Result<HashSet<LoopbackAuthority>, P
         .lines()
         .map(LoopbackAuthority::parse)
         .collect::<Result<_, _>>()
-        .map_err(|_| PolicyParseError)
+        .map_err(|()| PolicyParseError)
 }
 
 #[cfg(test)]
@@ -147,7 +207,7 @@ mod tests {
         let layer = directory.path().join("layer");
         let mode = directory.path().join("mode");
         fs::write(&layer, "allowed.example\n").unwrap();
-        for row in include_str!("../../testdata/proxy-modes.tsv")
+        for row in include_str!("../testdata/proxy-modes.tsv")
             .lines()
             .filter(|r| !r.starts_with('#'))
         {
@@ -231,7 +291,7 @@ mod tests {
     }
     #[test]
     fn domain_corpus_is_accepted_by_layer_parser() {
-        for row in include_str!("../../testdata/domain-policy.tsv")
+        for row in include_str!("../testdata/domain-policy.tsv")
             .lines()
             .filter(|r| !r.starts_with('#'))
         {

@@ -2,8 +2,8 @@
 
 use std::net::SocketAddr;
 
+use crate::broker::BrokerToken;
 use anyhow::{Context, Result, bail};
-use vhrn_policy::BrokerToken;
 
 pub const DEFAULT_ALLOWLIST: &str = "/etc/vhrn/allowlist";
 pub const DEFAULT_MODE_FILE: &str = "/etc/vhrn/mode";
@@ -143,7 +143,7 @@ pub fn config_from_env() -> Result<Config> {
 pub fn load_broker_token(config: &LocalConfig) -> Result<BrokerToken> {
     let bytes = std::fs::read(&config.token_file).context("read broker token")?;
     let value = String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("invalid broker token"))?;
-    BrokerToken::parse(value).map_err(|_| anyhow::anyhow!("invalid broker token"))
+    BrokerToken::parse(value).map_err(|()| anyhow::anyhow!("invalid broker token"))
 }
 
 fn parse_local_paths(value: &str) -> Result<[String; 3]> {
@@ -175,7 +175,7 @@ mod tests {
     fn resolves_startup_corpus() {
         let config = resolve_config(|_| None).unwrap();
         assert_eq!(config.allowlists, [DEFAULT_ALLOWLIST]);
-        for row in include_str!("../../testdata/proxy-process-cases.tsv")
+        for row in include_str!("../testdata/proxy-process-cases.tsv")
             .lines()
             .filter(|r| !r.starts_with('#'))
         {

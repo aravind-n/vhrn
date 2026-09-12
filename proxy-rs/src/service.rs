@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::policy::Mode;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
@@ -18,7 +19,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout};
-use vhrn_policy::Mode;
 
 use crate::broker::{BrokerConnector, BrokerResponse, BrokerStream};
 #[cfg(test)]
@@ -642,6 +642,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context as TaskContext, Poll};
 
+    use crate::broker::BrokerToken;
     use http_body_util::BodyExt;
     use hyper::body::Frame;
     use tempfile::tempdir;
@@ -649,7 +650,6 @@ mod tests {
     use tokio::net::TcpStream;
     use tokio::sync::{Notify, oneshot, watch};
     use tokio::time::{Duration, timeout};
-    use vhrn_policy::BrokerToken;
 
     use super::*;
     use crate::public::{

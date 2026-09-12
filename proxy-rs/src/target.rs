@@ -1,8 +1,75 @@
 //! Request-target classification with no connector capability.
 
 use std::fmt;
+use std::net::Ipv6Addr;
+use std::str::FromStr;
 
-use vhrn_policy::{LoopbackAuthority, normalize_domain_host};
+use crate::policy::normalize_domain_host;
+
+/// Proxy-owned canonical local target identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LoopbackAuthority {
+    host: LoopbackHost,
+    port: u16,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LoopbackHost {
+    Localhost,
+    Ipv4([u8; 4]),
+    Ipv6Loopback,
+}
+impl LoopbackAuthority {
+    pub(crate) fn parse(input: &str) -> Result<Self, ()> {
+        if input.is_empty() || input.trim() != input || !input.is_ascii() {
+            return Err(());
+        }
+        let (host, port) = input.rsplit_once(':').ok_or(())?;
+        let port = parse_port(port).ok_or(())?;
+        let host = if host.eq_ignore_ascii_case("localhost") {
+            LoopbackHost::Localhost
+        } else if let Some(value) = host
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        {
+            let value = Ipv6Addr::from_str(value).map_err(|_| ())?;
+            if !value.is_loopback() {
+                return Err(());
+            }
+            LoopbackHost::Ipv6Loopback
+        } else {
+            LoopbackHost::Ipv4(parse_loopback_ipv4(host).ok_or(())?)
+        };
+        Ok(Self { host, port })
+    }
+}
+impl fmt::Display for LoopbackAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.host {
+            LoopbackHost::Localhost => write!(formatter, "localhost:{}", self.port),
+            LoopbackHost::Ipv4(octets) => write!(
+                formatter,
+                "{}.{}.{}.{}:{}",
+                octets[0], octets[1], octets[2], octets[3], self.port
+            ),
+            LoopbackHost::Ipv6Loopback => write!(formatter, "[::1]:{}", self.port),
+        }
+    }
+}
+fn parse_loopback_ipv4(value: &str) -> Option<[u8; 4]> {
+    let mut octets = [0; 4];
+    let mut parts = value.split('.');
+    for octet in &mut octets {
+        let value = parts.next()?;
+        if value.is_empty()
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+            || (value.len() > 1 && value.starts_with('0'))
+        {
+            return None;
+        }
+        *octet = value.parse().ok()?;
+    }
+    (parts.next().is_none() && octets[0] == 127).then_some(octets)
+}
 
 /// A fully classified request destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,7 +212,7 @@ mod tests {
     use super::*;
     #[test]
     fn classifies_http_corpus() {
-        for row in include_str!("../../testdata/proxy-http-cases.tsv")
+        for row in include_str!("../testdata/proxy-http-cases.tsv")
             .lines()
             .filter(|r| !r.starts_with('#'))
         {

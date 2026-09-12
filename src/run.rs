@@ -125,6 +125,70 @@ struct BrokerRoute {
     advertised: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProxyBroker {
+    token_file: PathBuf,
+    port: u16,
+    advertised: String,
+}
+
+struct BrokerStart {
+    bind: SocketAddr,
+    policy_dir: PathBuf,
+    project: crate::net::ProjectIdentity,
+    run_id: String,
+    cache: PathBuf,
+}
+
+trait BrokerHandle {
+    fn proxy_config(&self, advertised: String) -> ProxyBroker;
+    fn wait_ready(&self, deadline: Instant) -> Result<()>;
+    fn cleanup(&self) -> CleanupAction;
+}
+
+trait BrokerProvider {
+    fn start(&self, start: BrokerStart) -> Result<Box<dyn BrokerHandle>>;
+}
+
+fn start_broker(
+    provider: Option<&dyn BrokerProvider>,
+    start: impl FnOnce() -> BrokerStart,
+) -> Result<Option<Box<dyn BrokerHandle>>> {
+    provider.map(|provider| provider.start(start())).transpose()
+}
+
+struct BuiltinBrokerProvider;
+struct BuiltinBrokerHandle(crate::broker::Broker);
+impl BrokerProvider for BuiltinBrokerProvider {
+    fn start(&self, start: BrokerStart) -> Result<Box<dyn BrokerHandle>> {
+        let broker = crate::broker::Broker::bind(
+            start.bind,
+            &start.policy_dir,
+            start.project,
+            start.run_id,
+            &start.cache,
+        )?;
+        broker.start_accepting()?;
+        Ok(Box::new(BuiltinBrokerHandle(broker)))
+    }
+}
+impl BrokerHandle for BuiltinBrokerHandle {
+    fn proxy_config(&self, advertised: String) -> ProxyBroker {
+        ProxyBroker {
+            token_file: self.0.token_file(),
+            port: self.0.address().port(),
+            advertised,
+        }
+    }
+    fn wait_ready(&self, deadline: Instant) -> Result<()> {
+        self.0.wait_ready(deadline)
+    }
+    fn cleanup(&self) -> CleanupAction {
+        let cleanup = self.0.cleanup_handle();
+        Arc::new(move || cleanup.run())
+    }
+}
+
 fn apple_gateway(inspect: &str) -> Option<Ipv4Addr> {
     let marker = "ipv4Gateway";
     let start = inspect.find(marker)?;
@@ -337,12 +401,11 @@ impl SignalControl {
         *lock_cleanup(&self.proxy) = Some(cleanup);
     }
 
-    fn install_broker(&self, cleanup: crate::broker::BrokerCleanup) {
+    fn install_broker(&self, cleanup: CleanupAction) {
         *self
             .broker
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(Arc::new(move || cleanup.run()));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cleanup);
     }
 
     fn finish_agent(&self) {
@@ -843,9 +906,7 @@ fn start_proxy(
     project_key: &str,
     port: &str,
     network: &str,
-    token_file: &Path,
-    broker_port: u16,
-    broker_addr: &str,
+    broker: Option<&ProxyBroker>,
     control: &SignalControl,
 ) -> Result<(ProxyGuard, String)> {
     start_proxy_with(
@@ -856,9 +917,7 @@ fn start_proxy(
         project_key,
         port,
         network,
-        token_file,
-        broker_port,
-        broker_addr,
+        broker,
         |cleanup| control.install_proxy(cleanup),
         Proxy::inspect_ip,
     )
@@ -871,17 +930,13 @@ fn proxy_args(
     project_key: &str,
     port: &str,
     network: &str,
-    token_file: &Path,
-    broker_port: u16,
-    broker_addr: &str,
+    broker: Option<&ProxyBroker>,
 ) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "--volume".into(),
         format!("{}:/etc/vhrn:ro", policy_dir.display()),
         "--volume".into(),
         format!("{}:/var/log/vhrn", policy_dir.join("log").display()),
-        "--volume".into(),
-        format!("{}:/etc/vhrn-broker/token:ro", token_file.display()),
         "--network".into(),
         network.into(),
         "--env".into(),
@@ -894,15 +949,27 @@ fn proxy_args(
         "VHRN_DENY_LOG=/var/log/vhrn/denied.log".into(),
         "--env".into(),
         format!("VHRN_PROXY_LISTEN=:{port}"),
-        "--env".into(),
-        format!("VHRN_BROKER_ADDR={broker_addr}:{broker_port}"),
-        "--env".into(),
-        "VHRN_BROKER_TOKEN_FILE=/etc/vhrn-broker/token".into(),
-        "--env".into(),
-        format!(
-            "VHRN_LOOPBACK_ALLOWLISTS=/etc/vhrn/loopback.allow,/etc/vhrn/projects/{project_key}/loopback.allow,/etc/vhrn/runs/{run_id}/loopback.allow"
-        ),
-    ]
+    ];
+    if let Some(broker) = broker {
+        args.splice(
+            4..4,
+            [
+                "--volume".to_string(),
+                format!("{}:/etc/vhrn-broker/token:ro", broker.token_file.display()),
+            ],
+        );
+        args.extend([
+            "--env".into(),
+            format!("VHRN_BROKER_ADDR={}:{}", broker.advertised, broker.port),
+            "--env".into(),
+            "VHRN_BROKER_TOKEN_FILE=/etc/vhrn-broker/token".into(),
+            "--env".into(),
+            format!(
+                "VHRN_LOOPBACK_ALLOWLISTS=/etc/vhrn/loopback.allow,/etc/vhrn/projects/{project_key}/loopback.allow,/etc/vhrn/runs/{run_id}/loopback.allow"
+            ),
+        ]);
+    }
+    args
 }
 
 #[allow(clippy::too_many_arguments)] // injected lifecycle seams avoid a real engine in tests
@@ -914,9 +981,7 @@ fn start_proxy_with<F, I>(
     project_key: &str,
     port: &str,
     network: &str,
-    token_file: &Path,
-    broker_port: u16,
-    broker_addr: &str,
+    broker: Option<&ProxyBroker>,
     publish: F,
     inspect: I,
 ) -> Result<(ProxyGuard, String)>
@@ -934,9 +999,7 @@ where
             project_key,
             port,
             network,
-            token_file,
-            broker_port,
-            broker_addr,
+            broker,
         ))
         .arg(image)
         .stdout(Stdio::null()) // discard the container id; keep our stdout clean
@@ -1456,15 +1519,17 @@ fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
         if signal_control.terminating.load(Ordering::Acquire) {
             bail!("termination requested before broker startup");
         }
-        let broker = crate::broker::Broker::bind(
-            route.bind,
-            &policy_dir,
-            project.clone(),
-            run_id.clone(),
-            &vhrn_cache(&home_dir()?),
-        )?;
-        signal_control.install_broker(broker.cleanup_handle());
-        broker.start_accepting()?;
+        let cache = vhrn_cache(&home_dir()?);
+        let broker = start_broker(Some(&BuiltinBrokerProvider), || BrokerStart {
+            bind: route.bind,
+            policy_dir: policy_dir.clone(),
+            project: project.clone(),
+            run_id: run_id.clone(),
+            cache,
+        })?;
+        if let Some(broker) = &broker {
+            signal_control.install_broker(broker.cleanup());
+        }
         broker
     };
 
@@ -1480,6 +1545,9 @@ fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
         if signal_control.terminating.load(Ordering::Acquire) {
             bail!("termination requested before proxy startup");
         }
+        let proxy_broker = broker
+            .as_ref()
+            .map(|broker| broker.proxy_config(route.advertised.clone()));
         start_proxy(
             &engine,
             &proxy_image,
@@ -1488,13 +1556,13 @@ fn start_container(mut cfg: ContainerConfig, f: &RunFlags) -> Result<i32> {
             project.key(),
             &port,
             &route.network,
-            &broker.token_file(),
-            broker.address().port(),
-            &route.advertised,
+            proxy_broker.as_ref(),
             &signal_control,
         )?
     };
-    broker.wait_ready(Instant::now() + Duration::from_secs(10))?;
+    if let Some(broker) = broker {
+        broker.wait_ready(Instant::now() + Duration::from_secs(10))?;
+    }
 
     // Security banner for --open-net: a direct stderr write, not a tracing event, so
     // no RUST_LOG level can silence the token-exposure caution.
@@ -1693,9 +1761,11 @@ mod tests {
             "project-key",
             "8080",
             "bridge",
-            Path::new("/secret/token"),
-            9123,
-            "host.docker.internal",
+            Some(&ProxyBroker {
+                token_file: PathBuf::from("/secret/token"),
+                port: 9123,
+                advertised: "host.docker.internal".into(),
+            }),
         );
         let want = vec![
                 "--volume", "/state,with-comma/net:/etc/vhrn:ro",
@@ -1716,6 +1786,40 @@ mod tests {
                 .iter()
                 .any(|arg| arg.starts_with("VHRN_") && arg.contains("/state,with-comma/net")),
             "host policy root leaked into proxy environment: {args:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_args_without_broker_disable_local_routing() {
+        let args = proxy_args(
+            Path::new("/state/net"),
+            "run",
+            "project",
+            "8080",
+            "bridge",
+            None,
+        );
+        assert!(!args.iter().any(|arg| arg.starts_with("VHRN_BROKER_")));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("VHRN_LOOPBACK_ALLOWLISTS="))
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("/etc/vhrn-broker/token"))
+        );
+    }
+
+    #[test]
+    fn absent_broker_provider_does_not_start_local_routing() {
+        assert!(
+            start_broker(None::<&dyn BrokerProvider>, || panic!(
+                "must not construct broker"
+            ))
+            .unwrap()
+            .is_none()
         );
     }
 

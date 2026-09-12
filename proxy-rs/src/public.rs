@@ -733,7 +733,7 @@ mod tests {
 
     #[test]
     fn classifies_the_address_fixture() {
-        for row in include_str!("../../testdata/ip-addresses.tsv")
+        for row in include_str!("../testdata/ip-addresses.tsv")
             .lines()
             .filter(|row| !row.starts_with('#'))
         {

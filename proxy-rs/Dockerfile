@@ -6,8 +6,6 @@ WORKDIR /workspace
 
 COPY Cargo.toml Cargo.lock ./
 COPY src src
-COPY crates/vhrn-policy/Cargo.toml crates/vhrn-policy/Cargo.toml
-COPY crates/vhrn-policy/src crates/vhrn-policy/src
 COPY proxy-rs/Cargo.toml proxy-rs/Cargo.toml
 COPY proxy-rs/src proxy-rs/src
 

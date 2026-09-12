@@ -15,17 +15,65 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::net::{LoopbackAuthority, PolicyStore, ProjectIdentity};
 use anyhow::{Context, Result, bail};
 use subtle::ConstantTimeEq;
-use vhrn_policy::{BrokerRequest, BrokerToken, MAX_BROKER_FRAME_SIZE, parse_broker_request};
-
-use crate::net::{LoopbackAuthority, PolicyStore, ProjectIdentity};
 
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(3);
 const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 // The broker runs on the host, outside the container resource limits. Bound each run's
 // connections so an untrusted container cannot turn incomplete handshakes into host threads.
 const MAX_CONNECTIONS: usize = 128;
+const MAX_BROKER_FRAME_SIZE: usize = 256;
+
+#[derive(Clone)]
+struct BrokerToken(String);
+impl BrokerToken {
+    fn parse(value: impl Into<String>) -> Result<Self, ()> {
+        let value = value.into();
+        (value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+        .then_some(Self(value))
+        .ok_or(())
+    }
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+enum BrokerRequest {
+    Ready(BrokerToken),
+    Connect {
+        token: BrokerToken,
+        authority: LoopbackAuthority,
+    },
+}
+fn parse_broker_request(frame: &[u8]) -> Result<BrokerRequest, ()> {
+    if frame.len() > MAX_BROKER_FRAME_SIZE {
+        return Err(());
+    }
+    let frame = frame.strip_suffix(b"\n").ok_or(())?;
+    if frame.contains(&b'\n') {
+        return Err(());
+    }
+    let frame = std::str::from_utf8(frame).map_err(|_| ())?;
+    let fields: Vec<_> = frame.split(' ').collect();
+    match fields.as_slice() {
+        ["VHRN-BROKER/1", "READY", token] => BrokerToken::parse(*token).map(BrokerRequest::Ready),
+        ["VHRN-BROKER/1", "CONNECT", token, raw] => {
+            let authority = LoopbackAuthority::parse(raw).map_err(|_| ())?;
+            if authority.to_string() != *raw {
+                return Err(());
+            }
+            Ok(BrokerRequest::Connect {
+                token: BrokerToken::parse(*token)?,
+                authority,
+            })
+        }
+        _ => Err(()),
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct BrokerCleanup(Arc<BrokerState>);
@@ -405,7 +453,7 @@ enum Request {
 }
 fn handshake(stream: &mut TcpStream, token: &BrokerToken) -> Result<Request> {
     let line = read_line(stream, Instant::now() + HANDSHAKE_DEADLINE)?;
-    let request = parse_broker_request(&line).map_err(anyhow::Error::from)?;
+    let request = parse_broker_request(&line).map_err(|()| anyhow::anyhow!("invalid handshake"))?;
     let request_token = match &request {
         BrokerRequest::Ready(token) | BrokerRequest::Connect { token, .. } => token,
     };
@@ -494,7 +542,7 @@ fn relay(mut client: TcpStream, mut upstream: TcpStream) {
 fn random_token() -> io::Result<BrokerToken> {
     let mut bytes = [0; 32];
     fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    BrokerToken::parse(hex::encode(bytes)).map_err(io::Error::other)
+    BrokerToken::parse(hex::encode(bytes)).map_err(|()| io::Error::other("invalid broker token"))
 }
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex

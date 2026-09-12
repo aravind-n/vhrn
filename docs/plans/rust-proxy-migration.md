@@ -35,25 +35,15 @@ stops for user direction; it is neither silently preserved nor corrected.
 
 ### Workspace
 
-Retain the root `vhrn` package and add two workspace members:
+Retain the root `vhrn` package and add one workspace member:
 
 ```text
 Cargo.toml
 Cargo.lock
 src/                              vhrn CLI
-crates/
-  vhrn-policy/
-    Cargo.toml
-    src/
-      lib.rs
-      authority.rs
-      broker.rs
-      domain.rs
-      mode.rs
-proxy/
+proxy-rs/
   Cargo.toml
   Dockerfile
-  Dockerfile.rust                 temporary candidate image
   Makefile
   src/
     lib.rs
@@ -75,26 +65,13 @@ testdata/
   proxy-modes.tsv
 ```
 
-Configure the workspace with resolver 3, members `.`, `crates/vhrn-policy`, and `proxy`, and
-`default-members = ["."]`. The default preserves the meaning of root `cargo build`, `cargo test`,
-and `cargo install --path .`; workspace CI selects all members explicitly.
+Configure the workspace with the root package and `proxy-rs` member. The root package preserves
+the meaning of root `cargo build`, `cargo test`, and `cargo install --path .`; workspace CI selects
+all members explicitly.
 
-Every first-party crate uses edition 2024, inherits the workspace lint policy, and declares
-`#![forbid(unsafe_code)]`.
-
-### Shared policy crate
-
-`vhrn-policy` contains values whose bytes or meaning must agree between the host and proxy:
-
-- `Mode`, including wire spelling and the proxy's fail-closed file interpretation;
-- normalized public domain entries and label-anchored hostname matching;
-- `LoopbackAuthority` parsing, canonical formatting, and exact comparison;
-- bounded `VHRN-BROKER/1` request and response framing.
-
-Keep the crate synchronous and pure. It owns parsing and validation, with inputs passed as values.
-It has no environment reads, filesystem access, DNS, sockets, HTTP, Tokio, CLI dispatch, or host
-policy storage. Keep host-facing diagnostics and IDNA suggestions in `vhrn`; keep proxy I/O and IP
-classification in `vhrn-proxy`.
+Every first-party crate uses edition 2024 and inherits the workspace lint policy. The proxy owns
+its executable contract; `vhrn` independently implements that contract as its consumer. No Rust
+types or parsers are shared between the packages.
 
 ### Proxy crate
 
@@ -222,8 +199,8 @@ changing host parsing. Keep tokens out of logs, errors, panic messages, and stat
 
 ## Feature parity
 
-The characterization room creates a standalone normative consumer contract and language-neutral
-outcome corpora under `testdata/`; the contract and fixtures are frozen and committed before Rust
+The proxy owns its normative contract and outcome corpora under `docs/proxy/` and
+`proxy-rs/testdata/`; the contract and fixtures are frozen and committed before Rust
 work begins. Each row states the required consumer outcome and observations rather than a function
 name or implementation detail. Go characterization tests may consume those rows. Rust workers use
 only the frozen contract and fixtures, never Go materials. The orchestrator or read-only reviewer
@@ -280,15 +257,15 @@ Completion criterion: every row in the parity table has a normative expected out
 contract and fixtures are committed, all Go characterization checks pass, and each ambiguity above
 has a recorded consumer outcome. No Rust production code or Rust test has begun.
 
-### Phase 2: create the workspace and shared types
+### Phase 2: create the workspace and proxy package
 
-Add the workspace manifests, `vhrn-policy`, and the `vhrn-proxy` package skeleton. Move shared values
-one at a time, switching host callers without changing their results. Keep the root package as the
-default member and keep the Go Dockerfile as the production image.
+Add the workspace manifests and the `vhrn-proxy` package skeleton. Keep host and proxy
+implementations independent while conforming to the proxy-owned contract. Keep the root package as
+the default member and keep the Go Dockerfile as the production image.
 
 Completion criterion: format, clippy, and tests pass across the workspace; existing root build,
 test, and install commands still select `vhrn`; host policy and broker corpora pass through the
-shared crate; the packaged proxy is still Go.
+independent host and proxy implementations; the packaged proxy is still Go.
 
 ### Phase 3: build the service shell
 
@@ -389,7 +366,7 @@ cargo build --release --locked -p vhrn
 cargo build --release --locked -p vhrn-proxy
 ```
 
-Make root manifests, `crates/vhrn-policy/**`, `proxy/**`, shared `testdata/**`, and relevant workflow
+Make root manifests, `proxy-rs/**`, proxy-owned fixtures, and relevant workflow
 files trigger the affected checks. Select `-p vhrn` explicitly in binary-release workflows so the
 workspace cannot change the CLI artifact by default.
 

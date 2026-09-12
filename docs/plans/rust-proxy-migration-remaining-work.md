@@ -64,7 +64,7 @@ clean-room verdict without relying on the paused Ship ledger's conclusion.
 
 ### 2. Audit the consumer contract and characterization
 
-Revalidate `docs/proxy-consumer-contract.md` and every shared `testdata/*.tsv` row against an
+Revalidate `docs/proxy/contract.md` and every proxy-owned `proxy-rs/testdata/*.tsv` row against an
 executable consumer-visible observation of the shipping proxy. Confirm that characterization tests
 exercise production behavior rather than reconstructed policy logic, test-only stand-ins, fixture
 text, or assertions that merely restate their expected values. Revisit startup, policy replacement,
@@ -80,7 +80,7 @@ the relevant reference test; and the complete reference suite passes repeatedly.
 Review the Rust implementation from first principles rather than commit-by-commit intent. In
 particular, assess:
 
-- whether `vhrn-policy` contains only pure boundary values shared with the host;
+- whether proxy-owned contract boundaries are implemented independently by the host and proxy;
 - fail-closed policy loading and per-decision policy refresh;
 - typed separation between public dialing and authenticated broker routing;
 - single-resolution address validation, mixed-address rejection, and numeric dialing;

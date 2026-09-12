@@ -2,7 +2,7 @@
 
 use std::io::Write;
 
-use vhrn_policy::Mode;
+use crate::policy::Mode;
 
 /// A response independent of an HTTP implementation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +61,7 @@ mod tests {
     use tempfile::tempdir;
     #[test]
     fn direct_endpoint_corpus() {
-        for row in include_str!("../../testdata/proxy-process-cases.tsv")
+        for row in include_str!("../testdata/proxy-process-cases.tsv")
             .lines()
             .filter(|r| !r.starts_with('#'))
         {

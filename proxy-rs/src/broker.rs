@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::target::LoopbackAuthority;
 use anyhow::{Result, bail};
 use bytes::Bytes;
 use http_body_util::Full;
@@ -20,7 +21,28 @@ use tokio::net::{TcpStream, lookup_host};
 use tokio::task::JoinHandle;
 use tokio::time::{Sleep, timeout};
 use tokio_rustls::TlsConnector;
-use vhrn_policy::{BrokerToken, LoopbackAuthority};
+
+#[derive(Clone)]
+pub struct BrokerToken(String);
+impl std::fmt::Debug for BrokerToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BrokerToken([REDACTED])")
+    }
+}
+impl BrokerToken {
+    pub(crate) fn parse(value: impl Into<String>) -> Result<Self, ()> {
+        let value = value.into();
+        (value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+        .then_some(Self(value))
+        .ok_or(())
+    }
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
 
 use crate::config::BrokerEndpoint;
 use crate::idle_pool::{IDLE_POOL_CAPACITY, IDLE_POOL_LIFETIME, IdlePool, IdleValue};
@@ -1116,7 +1138,7 @@ mod tests {
 
     #[tokio::test]
     async fn broker_frame_fixture_drives_client_exchanges() {
-        for row in include_str!("../../testdata/broker-frames.tsv")
+        for row in include_str!("../testdata/broker-frames.tsv")
             .lines()
             .filter(|row| !row.starts_with('#'))
         {
