@@ -8,8 +8,8 @@ const USAGE: &str = r"vhrn runs coding agents in a container jailed to the curre
 default-deny network egress.
 
 Usage:
-  vhrn install <harness>                  provision images and add a shell alias
-  vhrn uninstall <harness>                remove the alias/registry entry (--image drops the image)
+  vhrn install <harness>                  provision images and record the installation
+  vhrn uninstall <harness>                remove the registry entry (--image drops the image)
   vhrn <harness> [flags] [-- ] [args...]  run a harness in the container
   vhrn list                               show known and installed harnesses
   vhrn update [<harness>...]              re-pull installed harnesses when a newer agent exists
@@ -29,8 +29,7 @@ Run flags (after the harness name, before the agent's own flags):
                            allow host loopback endpoints for this run
   --                       stop reading flags; forward the rest to the agent
 
-After `vhrn install claude` a shell alias lets you run `claude` directly; `command claude`
-or `\claude` still reaches the real binary. Examples:
+After `vhrn install claude`, run it as `vhrn claude`. Examples:
   vhrn claude --model opus         # forwards --model opus to claude
   vhrn claude --open-net           # drop the guard for this session
   vhrn claude -- --help            # the agent's own help, not this one
@@ -112,9 +111,9 @@ fn run_list(_args: &[String]) -> i32 {
             return 1;
         }
     };
-    let config_dir = crate::shell::vhrn_config_dir(&home);
+    let config_dir = crate::installed::vhrn_config_dir(&home);
     let installed: std::collections::HashMap<String, String> =
-        crate::shell::read_installed(&config_dir)
+        crate::installed::read_installed(&config_dir)
             .into_iter()
             .map(|ih| (ih.name, ih.version))
             .collect();
@@ -150,9 +149,9 @@ fn installed_detail(engine: Option<&str>, registry: &str, name: &str, tag: &str)
         .map_or_else(|| tag.to_string(), |v| format!("{tag} → {v}"))
 }
 
-/// Pull a harness's image and the matching-version proxy from the registry, record the harness+version in the installed
-/// registry, and write shell aliases. `--local` uses images already built by `make`
-/// instead of pulling (for development/offline).
+/// Pull a harness's image and the matching-version proxy from the registry, then record
+/// the harness and version in the installed registry. `--local` uses images already built
+/// by `make` instead of pulling (for development/offline).
 fn run_install(args: &[String]) -> i32 {
     let mut arg = String::new();
     let mut local = false;
@@ -199,21 +198,10 @@ fn run_install(args: &[String]) -> i32 {
         return 1;
     }
 
-    let config_dir = crate::shell::vhrn_config_dir(&home);
+    let config_dir = crate::installed::vhrn_config_dir(&home);
     let outcome = finish_base_install(
         || prewarm_tools(&engine, &registry, &h, &version),
-        || {
-            crate::shell::add_installed(&config_dir, &name, &version)?;
-            if let Err(e) = crate::shell::sync_aliases(
-                &config_dir,
-                &home,
-                crate::shell::current_shell().as_deref(),
-                crate::shell::xdg_config_home().as_deref(),
-            ) {
-                warn!("could not update shell aliases: {e}");
-            }
-            Ok(())
-        },
+        || crate::installed::add_installed(&config_dir, &name, &version).map_err(Into::into),
     );
     let tools_ok = match outcome {
         Err(e) => {
@@ -230,16 +218,13 @@ fn run_install(args: &[String]) -> i32 {
         }
     };
 
-    println!(
-        "Installed {name} ({version}). Restart your shell to use `{}`.",
-        h.alias
-    );
+    println!("{}", install_success_message(&h.name, &version));
     i32::from(!tools_ok)
 }
 
 /// Final host-state work is intentionally not conditional on tools prewarming: a tools image
-/// is an optimization atop an already provisioned harness, while aliases and the installed
-/// registry describe that base installation. Returns the prewarm result after finalization.
+/// is an optimization atop an already provisioned harness, while the installed registry
+/// describes that base installation. Returns the prewarm result after finalization.
 fn finish_base_install(
     prewarm: impl FnOnce() -> Result<()>,
     finalize: impl FnOnce() -> Result<()>,
@@ -247,6 +232,16 @@ fn finish_base_install(
     let prewarm_result = prewarm();
     finalize()?;
     Ok(prewarm_result)
+}
+
+fn install_success_message(name: &str, version: &str) -> String {
+    format!(
+        "Installed {name} ({version}).\nTo replace your system {name}, alias `{name}` to `vhrn {name}` in your shell configuration."
+    )
+}
+
+fn uninstall_success_message(name: &str) -> String {
+    format!("Uninstalled {name}.")
 }
 
 /// Re-pull each floating harness (and its derived proxy) in place and report the agent
@@ -261,14 +256,14 @@ fn run_update(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let config_dir = crate::shell::vhrn_config_dir(&home);
-    let installed = crate::shell::read_installed(&config_dir);
+    let config_dir = crate::installed::vhrn_config_dir(&home);
+    let installed = crate::installed::read_installed(&config_dir);
     if installed.is_empty() {
         println!("No harnesses installed.");
         return 0;
     }
     // Targets: the named harnesses, or every installed one.
-    let targets: Vec<crate::shell::InstalledHarness> = if args.is_empty() {
+    let targets: Vec<crate::installed::InstalledHarness> = if args.is_empty() {
         installed
     } else {
         let mut t = Vec::new();
@@ -301,7 +296,7 @@ fn run_update(args: &[String]) -> i32 {
 /// only when it is actually behind — never pulled just to discover it is already current.
 /// Returns false when the check couldn't run (registry unreachable) or the pull failed, so
 /// the caller exits non-zero.
-fn update_one(engine: &str, registry: &str, ih: &crate::shell::InstalledHarness) -> bool {
+fn update_one(engine: &str, registry: &str, ih: &crate::installed::InstalledHarness) -> bool {
     let (name, version) = (&ih.name, &ih.version);
     let Some(h) = crate::harness::lookup_harness(name) else {
         warn!("{name:?} is not a known harness; skipping");
@@ -436,7 +431,7 @@ fn prewarm_tools(
     version: &str,
 ) -> Result<()> {
     let home = crate::run::home_dir()?;
-    let config = crate::config::load_config_file(&crate::shell::vhrn_config_dir(&home))?;
+    let config = crate::config::load_config_file(&crate::installed::vhrn_config_dir(&home))?;
     let from = crate::image::harness_image_ref(registry, h, version);
     prewarm_profiles(&config, |tools| {
         crate::image::ensure_tools_image(engine, &from, &h.image, &tools.apt, &tools.run)
@@ -445,9 +440,8 @@ fn prewarm_tools(
     })
 }
 
-/// Drop a harness from the installed registry and regenerate the shell aliases so its
-/// alias disappears. With `--image` it also deletes the harness image (the shared base
-/// and proxy are left in place for other harnesses).
+/// Drop a harness from the installed registry. With `--image` it also deletes the harness
+/// image (the shared base and proxy are left in place for other harnesses).
 fn run_uninstall(args: &[String]) -> i32 {
     let mut name = String::new();
     let mut rm_image = false;
@@ -469,29 +463,19 @@ fn run_uninstall(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let config_dir = crate::shell::vhrn_config_dir(&home);
+    let config_dir = crate::installed::vhrn_config_dir(&home);
 
     // Capture the version before dropping the entry, so --image deletes the exact ref
     // that was installed (a versioned registry ref, or the bare local name).
-    let version = crate::shell::installed_version(&config_dir, &name);
+    let version = crate::installed::installed_version(&config_dir, &name);
 
-    if let Err(e) = crate::shell::remove_installed(&config_dir, &name) {
+    if let Err(e) = crate::installed::remove_installed(&config_dir, &name) {
         error!("{e}");
         return 1;
     }
-    if let Err(e) = crate::shell::sync_aliases(
-        &config_dir,
-        &home,
-        crate::shell::current_shell().as_deref(),
-        crate::shell::xdg_config_home().as_deref(),
-    ) {
-        warn!("could not update shell aliases: {e}");
-    }
 
-    let mut alias = name.clone();
     match crate::harness::lookup_harness(&name) {
         Some(h) => {
-            alias.clone_from(&h.alias);
             if rm_image && version.is_none() {
                 warn!("{name:?} was not installed; no image to remove");
             } else if rm_image && let Ok(engine) = crate::run::detect_engine() {
@@ -506,7 +490,7 @@ fn run_uninstall(args: &[String]) -> i32 {
                 }
             }
         }
-        // Unknown harness: nothing to alias, and no image ref we can form to remove.
+        // Unknown harness: no image ref can be formed to remove.
         None => {
             if rm_image {
                 warn!("unknown harness {name:?}; cannot remove its image");
@@ -514,7 +498,7 @@ fn run_uninstall(args: &[String]) -> i32 {
         }
     }
 
-    println!("Uninstalled {name}. Restart your shell to drop the `{alias}` alias.");
+    println!("{}", uninstall_success_message(&name));
     0
 }
 
@@ -723,20 +707,31 @@ mod tests {
 
     #[test]
     fn base_install_finalizes_after_prewarm_failure() {
-        let finalized = std::cell::Cell::new(false);
+        let dir = crate::testutil::temp_dir();
         let outcome = finish_base_install(
             || bail!("tools failed"),
-            || {
-                finalized.set(true);
-                Ok(())
-            },
+            || crate::installed::add_installed(dir.path(), "claude", "latest").map_err(Into::into),
         )
         .unwrap();
-        assert!(
-            finalized.get(),
-            "registry/alias finalization must still run"
+        assert_eq!(
+            crate::installed::installed_version(dir.path(), "claude").as_deref(),
+            Some("latest"),
+            "registry finalization must still run"
         );
         assert!(outcome.is_err(), "the command must still return nonzero");
+    }
+
+    #[test]
+    fn install_success_message_is_exact() {
+        assert_eq!(
+            install_success_message("claude", "v2.1.30"),
+            "Installed claude (v2.1.30).\nTo replace your system claude, alias `claude` to `vhrn claude` in your shell configuration."
+        );
+    }
+
+    #[test]
+    fn uninstall_success_message_has_no_shell_instruction() {
+        assert_eq!(uninstall_success_message("claude"), "Uninstalled claude.");
     }
 
     #[test]

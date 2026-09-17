@@ -11,17 +11,25 @@ Run coding agents inside a container jailed to the current project directory, wi
 
 ## Getting Started
 
-Install the CLI, then install a harness (pulls its images and adds a shell alias):
+Install the CLI, then install a harness (pulls its images):
 
 ```sh
 curl -fsSL https://aravind-n.github.io/vhrn/install.sh | sh
 vhrn install <harness>
 ```
 
-Restart your shell to pick up the alias. Pin or roll back a harness to a specific agent
-version with `@` (`vhrn install claude@2.1.30`, or `@nightly` for the latest master build),
-and `vhrn update` re-pulls installed harnesses only when the registry has a newer agent.
-`VHRN_VERSION` pins the CLI installer.
+Run it with `vhrn <harness>`. Pin or roll back a harness to a specific agent version with
+`@` (`vhrn install claude@2.1.30`, or `@nightly` for the latest master build), and `vhrn
+update` re-pulls installed harnesses only when the registry has a newer agent. `VHRN_VERSION`
+pins the CLI installer.
+
+### Upgrading from an alias-managing version
+
+vhrn leaves aliases created by older releases untouched. To remove them manually, delete the
+content between `# >>> vhrn managed aliases >>>` and `# <<< vhrn managed aliases <<<` in your
+bash/zsh configuration, and delete
+`${XDG_CONFIG_HOME:-~/.config}/fish/conf.d/vhrn.fish` for fish. Current releases never read or
+write those shell configuration locations.
 
 | Harness | Agent | Logging in |
 | --- | --- | --- |
@@ -44,8 +52,7 @@ each provider explicitly. Installing a harness never changes egress policy.
 
 ## Usage
 
-A shell alias runs the harness directly (e.g. `claude` → `vhrn claude`); `command
-<harness>` or `\<harness>` reaches the real binary.
+Invoke a harness through the vhrn subcommand:
 
 ```sh
 vhrn <harness>                   # guarded: egress limited to the allowlist
@@ -66,7 +73,7 @@ vhrn net open|guard|report       # change mode for active runs only
 
 vhrn list                        # known + installed harnesses
 vhrn update [<harness>]          # re-pull installed harnesses when a newer agent is published
-vhrn uninstall <harness>         # drop the alias/registry entry (--image also deletes the image)
+vhrn uninstall <harness>         # drop the registry entry (--image also deletes the image)
 ```
 
 Wrapper flags (`--open-net`, `--allow`, and the exact pair
