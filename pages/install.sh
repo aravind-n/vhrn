@@ -62,5 +62,5 @@ else
 fi
 
 echo "vhrn: installed ${dest}"
-echo "Next: run 'vhrn install <harness>' (claude, codex, or pi) to pull the images and add a"
-echo "shell alias, then run that harness in any project. 'vhrn list' shows what is available."
+echo "Next: run 'vhrn install <harness>' (claude, codex, or pi) to pull the images, then"
+echo "run 'vhrn <harness>' in any project. 'vhrn list' shows what is available."

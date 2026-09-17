@@ -1188,7 +1188,7 @@ fn prepare_container(h: &Harness) -> Result<ContainerConfig> {
     let engine = detect_engine()?;
 
     // Config first: a blocked cwd must abort before any host-side work.
-    let config_dir_host = crate::shell::vhrn_config_dir(&home);
+    let config_dir_host = crate::installed::vhrn_config_dir(&home);
     let conf = crate::config::load_project_config(&config_dir_host, &project_s)?;
     crate::config::check_blocked_dir(
         &project_s,
@@ -1197,7 +1197,7 @@ fn prepare_container(h: &Harness) -> Result<ContainerConfig> {
     )?;
 
     // Resolve the container image from the installed registry; VHRN_IMAGE overrides it.
-    let installed = crate::shell::installed_version(&config_dir_host, &h.name);
+    let installed = crate::installed::installed_version(&config_dir_host, &h.name);
     let img_override = std::env::var("VHRN_IMAGE").unwrap_or_default();
     if installed.is_none() && img_override.is_empty() {
         bail!(

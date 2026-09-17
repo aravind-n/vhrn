@@ -8,7 +8,6 @@ pub(crate) struct Harness {
     pub name: String,    // registry key and subcommand, e.g. "claude"
     pub image: String,   // container image built for it, e.g. "vhrn-claude"
     pub command: String, // in-container argv[0], e.g. "claude"
-    pub alias: String,   // shell alias installed for it
 
     /// Immutable selected-harness egress minimum captured in each launch snapshot.
     pub allow_domains: Vec<String>,
@@ -88,7 +87,6 @@ fn registry() -> Vec<Harness> {
             name: "claude".into(),
             image: "vhrn-claude".into(),
             command: "claude".into(),
-            alias: "claude".into(),
             allow_domains: vec![
                 "api.anthropic.com".into(),
                 "claude.ai".into(),
@@ -120,7 +118,6 @@ fn registry() -> Vec<Harness> {
             name: "codex".into(),
             image: "vhrn-codex".into(),
             command: "codex".into(),
-            alias: "codex".into(),
             // The proxy matches label-anchored, so openai.com already covers api. and auth.
             // Deliberately the wide set for a first install: a user who cannot authenticate
             // cannot get far, and widening is a host command they would have to discover.
@@ -163,7 +160,6 @@ fn registry() -> Vec<Harness> {
             name: "pi".into(),
             image: "vhrn-pi".into(),
             command: "pi".into(),
-            alias: "pi".into(),
             // Pi has no universal provider domain. The user grants each provider explicitly.
             allow_domains: vec![],
             state_dir: ".pi/agent".into(),
@@ -231,7 +227,6 @@ mod tests {
         let h = lookup_harness("claude").expect("claude should be a known harness");
         assert_eq!(h.image, "vhrn-claude");
         assert_eq!(h.command, "claude");
-        assert_eq!(h.alias, "claude");
         assert_eq!(h.config_dir_env, "CLAUDE_CONFIG_DIR");
         assert_eq!(h.state_dir, ".claude");
         assert!(
@@ -275,10 +270,7 @@ mod tests {
     #[test]
     fn lookup_harness_pi() {
         let h = lookup_harness("pi").expect("pi should be a known harness");
-        assert_eq!(
-            (h.image.as_str(), h.command.as_str(), h.alias.as_str()),
-            ("vhrn-pi", "pi", "pi")
-        );
+        assert_eq!((h.image.as_str(), h.command.as_str()), ("vhrn-pi", "pi"));
         assert_eq!(h.state_dir, ".pi/agent");
         assert_eq!(h.host_config, ".pi/agent");
         assert_eq!(h.config_dir_env, "PI_CODING_AGENT_DIR");

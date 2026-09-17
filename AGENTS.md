@@ -13,8 +13,8 @@ The CLI is harness-agnostic.
 A small monorepo with three independently-built parts plus packaging:
 
 - **`src/`** — the CLI (Rust, crate `vhrn`, `#![forbid(unsafe_code)]`; `main.rs` is a thin
-  shim over `lib.rs`). Subcommand-first: `vhrn install <harness>` pulls images and wires a
-  shell alias, `vhrn <harness> …` runs the agent in the container,
+  shim over `lib.rs`). Subcommand-first: `vhrn install <harness>` pulls images and records the
+  installation, `vhrn <harness> …` runs the agent in the container,
   `vhrn uninstall`/`list`/`net`/`help`/`--version` manage the environment. It orchestrates
   and shells out to rsync/cp/gh and the container engine.
 - **`proxy/`** — a hand-rolled Go CONNECT/HTTP egress proxy (a static binary in a `scratch`
@@ -33,7 +33,7 @@ Core behavioral invariants — keep these intact:
   then forwards the rest to the agent verbatim. Don't bake agent flags in. Bare `vhrn` prints
   help.
 - **Harnesses are data, not forks.** `src/harness.rs` holds the registry; a `Harness` spec
-  carries the image name, in-container command, alias, default egress domains, and the
+  carries the image name, in-container command, default egress domains, and the
   persistence descriptors. Dispatch, install, run, and persistence all read from it. Adding
   a harness = a spec + a `FROM vhrn-base` Dockerfile under `image/<harness>/` + a matrix
   entry in `_build-images.yml`. No CLI fork. See `docs/adding-a-harness.md`.
@@ -148,13 +148,10 @@ Core behavioral invariants — keep these intact:
   global plus every distinct normalized project profile deterministically; failures attempt all
   profiles, leave the base operation complete, and return nonzero. PATH is not managed by vhrn —
   the entrypoint sources `~/.profile` at runtime so build-time installers register themselves.
-- **Shell aliases and the installed registry are host state.** `install`/`uninstall` mutate
-  `~/.config/vhrn/installed` and regenerate reversible marker-delimited alias blocks in the
-  bash/zsh rc files (existing files + the current shell's). fish is not an rc file: it gets a
-  vhrn-owned `<xdg>/fish/conf.d/vhrn.fish` (whole-file, no markers, deleted on uninstall),
-  managed when the fish config dir exists or fish is the current shell. Both roots resolve
-  through `xdg_config_root`, so `$XDG_CONFIG_HOME` is honored. `command <name>`/`\<name>`
-  still reach the real binary.
+- **The installed registry is host state; shell configuration is user-owned.**
+  `install`/`uninstall` mutate `<xdg>/vhrn/installed`, with the root resolved through
+  `$XDG_CONFIG_HOME`. Install prints a shell-neutral hint for creating a user-owned alias.
+  vhrn never reads or writes shell configuration, including alias files created by older releases.
 - The harness binary is baked into the image (native, in `~/.local`; no host install) and
   honors `HTTPS_PROXY`. The entrypoint clears a stale `$PWD/.git/index.lock` on boot (needs
   `procps`).
@@ -222,8 +219,8 @@ The suite runs per changed component on PRs and in full on master:
 Tests cover flag parsing, the history-key encoding, terminal env, allowlist add/dedup and typed
 loopback authorities, broker authentication/lifetime, engine routing, Pi seed/mirror/session
 descriptors,
-engine-inspect IP parsing, the harness registry, the installed registry, shell-alias blocks,
-install/uninstall arg assembly, the guide composition and its source chain, the system
+engine-inspect IP parsing, the harness registry, the installed registry, install/uninstall
+messages and arg assembly, the guide composition and its source chain, the system
 config layer (host copy, trust-table strip, sandbox-mode injection, env-policy yielding),
 credential-env forwarding,
 per-project session stores, the persistence state store (creds bootstrap + `.claude.json`

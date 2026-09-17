@@ -9,12 +9,12 @@ mod config;
 mod env;
 mod harness;
 mod image;
+mod installed;
 mod logging;
 mod net;
 mod persist;
 mod registry;
 mod run;
-mod shell;
 
 #[cfg(test)]
 mod testutil;
