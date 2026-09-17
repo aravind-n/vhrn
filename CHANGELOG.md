@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-16
+
+### Changed
+
+- `vhrn install` and `vhrn uninstall` no longer create, update, or remove shell aliases. Run
+  harnesses as `vhrn <harness>` or define a user-owned alias; aliases created by older releases
+  are left untouched.
+
 ## [0.5.0] - 2026-09-06
 
 ### Added
@@ -247,7 +255,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `toolchains.tools` derived image rebuilds when its harness image updates (the base image
   identity is folded into the toolchain hash), so `vhrn update` no longer keeps the old agent.
 
-[unreleased]: https://github.com/aravind-n/vhrn/compare/v0.5.0...HEAD
+[unreleased]: https://github.com/aravind-n/vhrn/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/aravind-n/vhrn/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/aravind-n/vhrn/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/aravind-n/vhrn/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/aravind-n/vhrn/compare/v0.3.0...v0.4.0
