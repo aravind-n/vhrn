@@ -1,6 +1,4 @@
 //! Safe operational diagnostics and asynchronous denial auditing.
-#![allow(dead_code)] // Outbound routing consumes the denial recorder.
-
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -1,7 +1,9 @@
 //! Values and decisions for the network boundary.
 mod config;
+mod connect;
 mod diagnostics;
 mod domain;
+mod headers;
 mod server;
 mod shutdown;
 
@@ -14,7 +16,11 @@ pub use shutdown::Shutdown;
 ///
 /// Returns any startup, listener, or service error.
 pub async fn run(config: Config, shutdown: Shutdown) -> anyhow::Result<()> {
-    let context = std::sync::Arc::new(server::router::RequestContext::new(config));
+    let tls = connect::tls::production_client_config()?;
+    let context = std::sync::Arc::new(server::router::RequestContext::new(
+        config,
+        connect::public::PublicConnector::system_with_tls(tls),
+    ));
     let listener = server::listener::bind(context.config.listen).await?;
     server::listener::serve(listener, context, shutdown).await
 }
