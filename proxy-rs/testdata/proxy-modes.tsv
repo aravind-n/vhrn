@@ -1,0 +1,14 @@
+# TSV: stored mode<TAB>input state<TAB>host matched<TAB>allow<TAB>recorded<TAB>effective mode
+enforce	valid	yes	yes	no	enforce
+enforce	valid	no	no	yes	enforce
+report	valid	yes	yes	no	report
+report	valid	no	yes	yes	report
+open	valid	yes	yes	no	open
+open	valid	no	yes	no	open
+unknown	valid	yes	yes	no	enforce
+unknown	valid	no	no	yes	enforce
+open	missing-layer	yes	no	yes	enforce
+open	malformed-layer	yes	no	yes	enforce
+open	read-error	yes	no	yes	enforce
+open	missing-mode	yes	no	yes	enforce
+enforce	replace	yes	yes	no	enforce
