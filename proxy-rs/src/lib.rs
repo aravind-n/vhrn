@@ -20,6 +20,7 @@ pub async fn run(config: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let context = std::sync::Arc::new(server::router::RequestContext::new(
         config,
         connect::public::PublicConnector::system_with_tls(tls),
+        shutdown.clone(),
     ));
     let listener = server::listener::bind(context.config.listen).await?;
     server::listener::serve(listener, context, shutdown).await
