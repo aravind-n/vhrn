@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use crate::connect::broker::BrokerToken;
 use anyhow::{Context, Result, bail};
 
 pub const DEFAULT_ALLOWLIST: &str = "/etc/vhrn/allowlist";
@@ -47,7 +48,7 @@ impl PolicyPaths {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalPolicyPaths([PathBuf; 3]);
 impl LocalPolicyPaths {
-    #[allow(dead_code)] // Broker routing consumes local layers.
+    #[allow(dead_code)] // Loopback routing consumes local policy layers.
     pub(crate) fn as_array(&self) -> &[PathBuf; 3] {
         &self.0
     }
@@ -58,6 +59,13 @@ impl std::ops::Index<usize> for LocalPolicyPaths {
         &self.0[index]
     }
 }
+#[cfg(test)]
+impl LocalPolicyPaths {
+    pub(crate) fn test(paths: [PathBuf; 3]) -> Self {
+        Self(paths)
+    }
+}
+
 /// Inputs used exclusively for local routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalConfig {
@@ -180,6 +188,21 @@ where
     })
 }
 
+/// Loads the local credential only when local routing is configured.
+///
+/// # Errors
+///
+/// Returns an error when the credential file cannot be read or is invalid.
+#[allow(dead_code)] // Proxy startup consumes the broker credential.
+pub(crate) fn load_broker_token(config: &LocalConfig) -> Result<BrokerToken> {
+    let bytes = std::fs::read(&config.token_file)
+        .with_context(|| format!("read broker token from {}", config.token_file.display()))?;
+    let value = String::from_utf8(bytes).context("decode broker token as UTF-8")?;
+    value
+        .parse::<BrokerToken>()
+        .map_err(|_| anyhow::anyhow!("validate broker token format"))
+}
+
 fn parse_local_paths(value: &str) -> Result<LocalPolicyPaths> {
     let paths: [PathBuf; 3] = value
         .split(',')
@@ -212,6 +235,8 @@ fn parse_listener(value: &str) -> Result<SocketAddr> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn resolves_startup_corpus() {
@@ -303,6 +328,34 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn token_file_is_literal_and_redacted() {
+        let directory = tempdir().unwrap();
+        let file = directory.path().join("token");
+        let config = LocalConfig {
+            policy_paths: LocalPolicyPaths::test([
+                PathBuf::from("a"),
+                PathBuf::from("b"),
+                PathBuf::from("c"),
+            ]),
+            broker_addr: BrokerEndpoint::parse("127.0.0.1:1").unwrap(),
+            token_file: file.clone(),
+        };
+        let valid = "a".repeat(64);
+        fs::write(&file, &valid).unwrap();
+        let token = load_broker_token(&config).unwrap();
+        assert!(!format!("{token:?}").contains(&valid));
+        for contents in [format!("{valid}\n"), "A".repeat(64)] {
+            fs::write(&file, contents).unwrap();
+            let error = load_broker_token(&config).unwrap_err();
+            assert!(!error.to_string().contains(&valid));
+        }
+        fs::write(&file, [0xff]).unwrap();
+        assert!(load_broker_token(&config).is_err());
+        fs::remove_file(&file).unwrap();
+        assert!(load_broker_token(&config).is_err());
+    }
+
     #[test]
     fn broker_endpoint_accepts_only_socket_or_hostname_with_port() {
         let config = resolve_config(|key| match key {
