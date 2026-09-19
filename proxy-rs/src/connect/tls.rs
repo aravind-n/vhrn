@@ -27,7 +27,6 @@ pub(crate) fn client_config(roots: rustls::RootCertStore) -> Result<Arc<rustls::
 }
 
 /// Produces the verified TLS identity for an already validated local authority.
-#[allow(dead_code)] // Brokered HTTPS routing consumes the local identity.
 pub(crate) fn local_server_name(authority: &LoopbackAuthority) -> Result<ServerName<'static>> {
     match authority.tls_identity() {
         LocalTlsIdentity::DnsLocalhost => {
