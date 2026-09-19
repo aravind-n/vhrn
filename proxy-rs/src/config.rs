@@ -48,7 +48,6 @@ impl PolicyPaths {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalPolicyPaths([PathBuf; 3]);
 impl LocalPolicyPaths {
-    #[allow(dead_code)] // Loopback routing consumes local policy layers.
     pub(crate) fn as_array(&self) -> &[PathBuf; 3] {
         &self.0
     }
@@ -193,7 +192,6 @@ where
 /// # Errors
 ///
 /// Returns an error when the credential file cannot be read or is invalid.
-#[allow(dead_code)] // Proxy startup consumes the broker credential.
 pub(crate) fn load_broker_token(config: &LocalConfig) -> Result<BrokerToken> {
     let bytes = std::fs::read(&config.token_file)
         .with_context(|| format!("read broker token from {}", config.token_file.display()))?;
