@@ -1,6 +1,6 @@
-# Pull-request gate. Only the changed component (CLI / proxy / images / scripts) is
-# exercised; ci-gate is the single required status check, so a skipped component never
-# blocks the merge. master runs the full suite unfiltered (see nightly.yml).
+# Pull-request gate. Only changed CLI, proxy candidate, shipping proxy, image, and script
+# components are exercised; ci-gate is the single required status check, so a skipped
+# component never blocks the merge. master runs the full suite unfiltered (see nightly.yml).
 name: ci
 
 on:
@@ -17,8 +17,9 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     outputs:
-      rust: ${{ steps.filter.outputs.rust }}
-      proxy: ${{ steps.filter.outputs.proxy }}
+      cli: ${{ steps.filter.outputs.cli }}
+      proxy_rs: ${{ steps.filter.outputs.proxy_rs }}
+      proxy_go: ${{ steps.filter.outputs.proxy_go }}
       images: ${{ steps.filter.outputs.images }}
       scripts: ${{ steps.filter.outputs.scripts }}
       workflows: ${{ steps.filter.outputs.workflows }}
@@ -28,14 +29,20 @@ jobs:
         id: filter
         with:
           filters: |
-            rust:
+            cli:
               - 'cli/**'
-              - 'proxy-rs/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'Cross.toml'
-            proxy:
+              - 'shared/testdata/**'
+            proxy_rs:
+              - 'proxy-rs/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'shared/testdata/**'
+            proxy_go:
               - 'proxy/**'
+              - 'shared/testdata/**'
             images:
               - 'image/**'
             scripts:
@@ -48,13 +55,14 @@ jobs:
     needs: changes
     uses: ./.github/workflows/_test.yml
     with:
-      run_rust: ${{ needs.changes.outputs.rust == 'true' }}
-      run_proxy: ${{ needs.changes.outputs.proxy == 'true' }}
+      run_cli: ${{ needs.changes.outputs.cli == 'true' }}
+      run_proxy_rs: ${{ needs.changes.outputs.proxy_rs == 'true' }}
+      run_proxy_go: ${{ needs.changes.outputs.proxy_go == 'true' }}
       run_scripts: ${{ needs.changes.outputs.scripts == 'true' }}
 
   images:
     needs: changes
-    if: ${{ needs.changes.outputs.images == 'true' || needs.changes.outputs.proxy == 'true' }}
+    if: ${{ needs.changes.outputs.images == 'true' || needs.changes.outputs.proxy_go == 'true' }}
     permissions:
       contents: read
       packages: write

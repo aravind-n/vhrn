@@ -104,3 +104,104 @@ CI exposes independent `cli`, `proxy-rs`, and `proxy-go` lanes; path filters and
 commands do not cross-trigger component work except for explicit shared workspace/fixture inputs;
 shipping image validation remains attached only to the shipping implementation; the Phase 13
 rename/removal is fully specified; workflow validation passes; and rereview is clean.
+
+## Implementation evidence
+
+Phase 2 was `Ready` before implementation began. Changes were limited to the two owned workflow
+files and this evidence record; no Go source, tests, or module file was opened. The reusable
+workflow now has independent direct input guards and no dependencies between its `cli`, `proxy-rs`,
+and `proxy-go` jobs. Nightly and release callers continue to select all jobs through the inputs'
+`true` defaults.
+
+### Interface mapping
+
+| Interface | Before | After |
+| --- | --- | --- |
+| Rust path-filter output | `rust` | `cli`, `proxy_rs` |
+| Shipping proxy path-filter output | `proxy` | `proxy_go` |
+| Rust reusable input | `run_rust` | `run_cli`, `run_proxy_rs` |
+| Shipping proxy reusable input | `run_proxy` | `run_proxy_go` |
+| Rust job ID | `rust` | `cli`, `proxy-rs` |
+| Shipping proxy job ID | `proxy` | `proxy-go` |
+| Script filter, input, and job | `scripts`, `run_scripts`, `scripts` | unchanged |
+
+The `cli` job runs `cargo fmt`, strict Clippy, tests, and a release build with package `vhrn`
+selected on every command. The `proxy-rs` job runs the same four checks with package
+`vhrn-proxy` selected. The shipping Go job body is unchanged; only its input and job were given the
+explicit `proxy-go` identity. No generic `rust` or ambiguous `proxy` job remains.
+
+### Path-filter and eligibility truth tables
+
+The following table was evaluated by parsing the actual embedded `dorny/paths-filter` YAML. The
+image-job column evaluates its real condition, `images || proxy_go`.
+
+| Changed-path case | `cli` | `proxy_rs` | `proxy_go` | `images` | `scripts` | `workflows` | Image job |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `cli/**` only | true | false | false | false | false | false | skipped |
+| `proxy-rs/**` only | false | true | false | false | false | false | skipped |
+| `proxy/**` only | false | false | true | false | false | false | eligible |
+| `Cargo.toml` or `Cargo.lock` only | true | true | false | false | false | false | skipped |
+| `Cross.toml` only | true | false | false | false | false | false | skipped |
+| `shared/testdata/**` only | true | true | true | false | false | false | eligible |
+| `.github/workflows/**` only | false | false | false | false | false | true | skipped |
+| `pages/**` only | false | false | false | false | true | false | skipped |
+| CLI + candidate + shipping proxy + image + script + workflow | true | true | true | true | true | true | eligible |
+
+For each reusable input, `act` 0.2.89 invoked the reusable workflow's `workflow_call` event in
+dry-run mode with that input `true` and every other input `false`. Its GitHub-expression evaluator
+reported the selected job eligible and each other job skipped:
+
+| Selected input | Eligible job |
+| --- | --- |
+| `run_cli` | `cli` |
+| `run_proxy_rs` | `proxy-rs` |
+| `run_proxy_go` | `proxy-go` |
+| `run_scripts` | `scripts` |
+
+The called `test` workflow remains one of the four `ci-gate` needs, alongside `changes`, `images`,
+and `actionlint`; its result aggregates all independently guarded reusable jobs. Exhaustive
+evaluation of `success`, `skipped`, `failure`, and `cancelled` across those four needs confirmed the
+gate passes only when every result is `success` or `skipped`. Thus a skipped component lane cannot
+mask another component's failure.
+
+### Phase 13 cutover transition
+
+Phase 13 will remove the `proxy_go` filter, `run_proxy_go` input, and `proxy-go` job; rename the
+`proxy_rs` filter, `run_proxy_rs` input, and `proxy-rs` job to `proxy`; and change that lane's path
+from `proxy-rs/**` to `proxy/**`. The `cli` filter, input, job, and path stay `cli`; no `rust` lane is
+reintroduced.
+
+## Validation evidence
+
+- `actionlint` 1.7.12 linted all nine workflow files with ShellCheck 0.11.0 passed explicitly via
+  `-shellcheck`: zero parse errors and zero total errors. Debug output confirmed inline scripts were
+  sent to ShellCheck and the ShellCheck rule found zero errors.
+- A static parser exercised CLI-only, candidate-only, shipping-proxy-only, both root Cargo files,
+  `Cross.toml`, shared-fixture-only, workflow-only, script-only, and combined changes against the
+  checked-in filter definition. Every row matched the table above. It also verified shipping-image
+  selection, reusable-call input completeness, and the exhaustive green-or-skipped gate model.
+- Four independent `act` 0.2.89 `workflow_call` dry runs exercised `run_cli`, `run_proxy_rs`,
+  `run_proxy_go`, and `run_scripts`. In each run the selected input evaluated to `true`; all three
+  other inputs evaluated to `false` and their jobs were reported skipped.
+- `cargo fmt --package vhrn -- --check` and
+  `cargo clippy --package vhrn --all-targets --locked -- -D warnings` passed. The package-scoped CLI
+  tests passed all 183 tests and `cargo build --release --locked -p vhrn` passed. The first test run
+  was denied local socket binds by the execution sandbox; the unrestricted rerun passed.
+- `cargo fmt --package vhrn-proxy -- --check` and
+  `cargo clippy --package vhrn-proxy --all-targets --locked -- -D warnings` passed. The
+  package-scoped candidate tests passed 75 unit tests and 12 process tests, and
+  `cargo build --release --locked -p vhrn-proxy` passed. The first test run had the same sandbox
+  socket-bind denial; the unrestricted rerun passed.
+- `git diff --check` passed. Searches over the two workflow files found no old `run_rust`, `rust`
+  output/job, or ambiguous `proxy` job reference. The shipping image build still uses `proxy/` and
+  is selected by `proxy_go`, never by `proxy_rs`.
+
+## Review evidence
+
+Independent read-only review covered workflow correctness, regressions, gate semantics, path
+selection, shipping-image ownership, clean-room integrity, and editable-path scope without opening
+Go source, tests, or module files. The workflow implementation was clean. The review's sole
+completion-blocking finding was that this implementation and validation record had not yet been
+written; this section and the evidence above resolve that finding. Independent rereview found the
+resolution complete and reported no remaining correctness, regression, security, gate,
+path-filter, validation-coverage, clean-room, or scope finding.

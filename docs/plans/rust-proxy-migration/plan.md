@@ -54,8 +54,8 @@ does not open predecessor or pre-flight documents to reconstruct readiness.
 | Pre-flight 1 | Complete | — | [Consumer contract record](preflight-01-consumer-contract.md) |
 | Pre-flight 2 | Complete | Pre-flight 1 | [Phase-planning record](preflight-02-phase-planning.md) |
 | Phase 1 | Complete | — | [Candidate scaffold](phase-01-candidate-scaffold.md) |
-| Phase 2 | Ready | Both pre-flights and Phase 1 complete | [CLI and proxy CI ownership](phase-02-ci-ownership.md) |
-| Phase 3 | Blocked | Phase 2 | [Strict live policy](phase-03-policy.md) |
+| Phase 2 | Complete | Both pre-flights and Phase 1 complete | [CLI and proxy CI ownership](phase-02-ci-ownership.md) |
+| Phase 3 | Ready | Phase 2 | [Strict live policy](phase-03-policy.md) |
 | Phase 4 | Blocked | Phase 3 | [Startup and audit health](phase-04-startup-audit.md) |
 | Phase 5 | Blocked | Phase 4 | [Targets and safe outcomes](phase-05-targets-outcomes.md) |
 | Phase 6 | Blocked | Phase 5 | [HTTP/1 ingress](phase-06-http-ingress.md) |
