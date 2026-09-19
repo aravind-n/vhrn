@@ -1,23 +1,46 @@
-[package]
-name = "vhrn"
+[workspace]
+members = ["proxy-rs"]
+
+[workspace.package]
 version = "0.5.1"
 edition = "2024"
 license = "MIT"
-description = "Run coding agents in a filesystem- and network-jailed container"
 repository = "https://github.com/aravind-n/vhrn"
-keywords = ["sandbox", "container", "agent", "egress", "cli"]
-categories = ["command-line-utilities", "development-tools", "virtualization"]
+publish = false
 
-[lints.clippy]
+[workspace.dependencies]
+anyhow = "1.0.104"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tempfile = "3.27.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
 cargo = "warn"
 pedantic = "warn"
 
+[package]
+name = "vhrn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Run coding agents in a filesystem and network jailed container"
+keywords = ["sandbox", "container", "agent", "egress", "cli"]
+categories = ["command-line-utilities", "development-tools", "virtualization"]
+
+[lints]
+workspace = true
+
 [dependencies]
-anyhow = "1.0.104"
+anyhow.workspace = true
 hex = "0.4.3"
 idna = "1.1.0"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde.workspace = true
+serde_json.workspace = true
 sha2 = "0.11.0"
 signal-hook = "0.4.4"
 subtle = "2.6.1"
@@ -27,4 +50,4 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ureq = "3.3.0"
 
 [dev-dependencies]
-tempfile = "3.27.0"
+tempfile.workspace = true

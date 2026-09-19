@@ -30,6 +30,7 @@ jobs:
           filters: |
             src:
               - 'src/**'
+              - 'proxy-rs/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'Cross.toml'

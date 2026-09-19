@@ -30,8 +30,10 @@ jobs:
           rustup default stable
           rustup component add clippy rustfmt
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked -p vhrn
+      - run: cargo build --release --locked -p vhrn-proxy
 
   proxy:
     if: ${{ inputs.run_proxy }}
