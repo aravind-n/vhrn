@@ -5,10 +5,13 @@ name: test
 on:
   workflow_call:
     inputs:
-      run_rust:
+      run_cli:
         type: boolean
         default: true
-      run_proxy:
+      run_proxy_rs:
+        type: boolean
+        default: true
+      run_proxy_go:
         type: boolean
         default: true
       run_scripts:
@@ -19,8 +22,8 @@ permissions:
   contents: read
 
 jobs:
-  rust:
-    if: ${{ inputs.run_rust }}
+  cli:
+    if: ${{ inputs.run_cli }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -29,14 +32,28 @@ jobs:
           rustup update stable
           rustup default stable
           rustup component add clippy rustfmt
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      - run: cargo fmt --package vhrn -- --check
+      - run: cargo clippy --package vhrn --all-targets --locked -- -D warnings
+      - run: cargo test --package vhrn --locked
       - run: cargo build --release --locked -p vhrn
+
+  proxy-rs:
+    if: ${{ inputs.run_proxy_rs }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust (latest stable)
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add clippy rustfmt
+      - run: cargo fmt --package vhrn-proxy -- --check
+      - run: cargo clippy --package vhrn-proxy --all-targets --locked -- -D warnings
+      - run: cargo test --package vhrn-proxy --locked
       - run: cargo build --release --locked -p vhrn-proxy
 
-  proxy:
-    if: ${{ inputs.run_proxy }}
+  proxy-go:
+    if: ${{ inputs.run_proxy_go }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
