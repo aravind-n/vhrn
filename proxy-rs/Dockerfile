@@ -5,7 +5,9 @@ RUN apk add --no-cache binutils build-base
 WORKDIR /workspace
 
 COPY Cargo.toml Cargo.lock ./
-COPY src src
+# Cargo validates every member manifest and the shared lockfile before selecting `-p`.
+COPY cli/Cargo.toml cli/Cargo.toml
+RUN mkdir -p cli/src && touch cli/src/lib.rs
 COPY proxy-rs/Cargo.toml proxy-rs/Cargo.toml
 COPY proxy-rs/src proxy-rs/src
 

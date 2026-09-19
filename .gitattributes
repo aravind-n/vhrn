@@ -1,1 +1,1 @@
-proxy-rs/testdata/loopback-authorities.tsv whitespace=-blank-at-eol
+shared/testdata/loopback-authorities.tsv whitespace=-blank-at-eol

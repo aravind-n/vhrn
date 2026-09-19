@@ -322,7 +322,7 @@ mod tests {
     }
     #[test]
     fn loopback_authority_fixture_is_preserved() {
-        for row in include_str!("../../testdata/loopback-authorities.tsv")
+        for row in include_str!("../../../shared/testdata/loopback-authorities.tsv")
             .lines()
             .filter(|row| !row.starts_with('#'))
         {

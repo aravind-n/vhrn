@@ -12,7 +12,7 @@ The CLI is harness-agnostic.
 
 A small monorepo with three independently-built parts plus packaging:
 
-- **`src/`** — the CLI (Rust, crate `vhrn`, `#![forbid(unsafe_code)]`; `main.rs` is a thin
+- **`cli/`** — the CLI (Rust, package `vhrn`, `#![forbid(unsafe_code)]`; `main.rs` is a thin
   shim over `lib.rs`). Subcommand-first: `vhrn install <harness>` pulls images and records the
   installation, `vhrn <harness> …` runs the agent in the container,
   `vhrn uninstall`/`list`/`net`/`help`/`--version` manage the environment. It orchestrates
@@ -23,6 +23,8 @@ A small monorepo with three independently-built parts plus packaging:
 - **`image/`** — the container image recipes: `image/base/` (`Dockerfile` + `entrypoint.sh`)
   is the shared `vhrn-base`; `image/<harness>/` (`image/claude/`, `image/codex/`, `image/pi/`) is a thin
   `FROM vhrn-base` plus the agent binary.
+- **`shared/testdata/`** — language-neutral contract fixtures consumed across components. Keep
+  shared cases here instead of duplicating them under a package.
 - **`pages/`** — the `curl | sh` installer and landing page, served over GitHub Pages.
   **`.github/workflows/`** — the CI/CD pipeline. **`docs/`** — release docs.
 
@@ -32,13 +34,13 @@ Core behavioral invariants — keep these intact:
   consumes only its own flags (`--open-net`, `--allow`, and `--allow --local <authorities>`),
   then forwards the rest to the agent verbatim. Don't bake agent flags in. Bare `vhrn` prints
   help.
-- **Harnesses are data, not forks.** `src/harness.rs` holds the registry; a `Harness` spec
+- **Harnesses are data, not forks.** `cli/src/harness.rs` holds the registry; a `Harness` spec
   carries the image name, in-container command, default egress domains, and the
   persistence descriptors. Dispatch, install, run, and persistence all read from it. Adding
   a harness = a spec + a `FROM vhrn-base` Dockerfile under `image/<harness>/` + a matrix
   entry in `_build-images.yml`. No CLI fork. See `docs/adding-a-harness.md`.
 - **Both Apple `container` and Docker must work, for build and run.** `image/Makefile`,
-  `proxy/Makefile`, and `src/run.rs` (`detect_engine`) select the engine (explicit
+  `proxy/Makefile`, and `cli/src/run.rs` (`detect_engine`) select the engine (explicit
   `ENGINE`/`VHRN_ENGINE`, else auto-detect `container` then `docker`) — keep them in sync.
   The CLIs differ (`container image delete` vs `docker image rm`; inspect output differs,
   and Apple escapes the CIDR slash in `ipv4Address`), so an engine switch isn't a string swap.
@@ -130,12 +132,12 @@ Core behavioral invariants — keep these intact:
   Override the registry with `VHRN_REGISTRY`. `--local` uses `make`-built images (version
   `local`). The installed registry (`~/.config/vhrn/installed`, `name <tag>` per line) records
   only the agent tag the run path resolves from. `vhrn update` queries the registry (OCI
-  tags-list / manifest digest over the anonymous bearer-challenge flow, `src/registry.rs`) and
+  tags-list / manifest digest over the anonymous bearer-challenge flow, `cli/src/registry.rs`) and
   re-pulls a floating install only when a newer agent is published — never pulling just to
   diff; an unreachable registry is a hard error, not a blind pull. A daily `harness-images.yml`
   cron rebuilds a harness when its agent updates — both independent of a CLI release.
 - **Config precedence: flags > host XDG config (normally `~/.config/vhrn/config.toml`) > defaults**
-  (`src/config.rs`, `toml` crate). Config is **host-owned only** — nothing is read from the
+  (`cli/src/config.rs`, `toml` crate). Config is **host-owned only** — nothing is read from the
   project directory, so repo content can never configure the jail. Global `[tools]` and
   `[resources]` are defaults; singular `[project."<absolute canonical path>"]` blocks may
   override only their tools/resources fields, selected by an exact `pwd -P` cwd match (no
@@ -161,7 +163,7 @@ Core behavioral invariants — keep these intact:
 Three parts, each built by its own tool — there is **no root build wrapper**, so invoke
 them directly:
 
-- **CLI:** `cargo build --release` → `target/release/vhrn`; `cargo install --path .` installs
+- **CLI:** `cargo build --release -p vhrn` → `target/release/vhrn`; `cargo install --path cli` installs
   it to `~/.cargo/bin`.
 - **Images:** `make -C image` builds `vhrn-base` then the harnesses (`build-base`,
   `build-claude`, `build-codex`, `build-pi`; each harness is `FROM vhrn-base`, so base first).
@@ -174,7 +176,7 @@ gcc/g++/cmake/ninja), python3/uv, gh, ripgrep/fd, zip/unzip, plus
 openssh-client/wget/rsync/xz-utils/gnupg/sqlite3 and nftables — a non-root `dev` user, no sudo.
 
 Day to day you build nothing — `vhrn install <harness>` pulls prebuilt images from ghcr.
-For a local-image dev loop: `cargo install --path . && make -C image && make -C proxy`, then
+For a local-image dev loop: `cargo install --path cli && make -C image && make -C proxy`, then
 `vhrn install claude --local`.
 
 **CI/CD** (`.github/workflows/`): `ci.yml` is the PR gate (path-filtered per component behind
@@ -185,7 +187,7 @@ a `v*` tag. Three reusable workflows (`_test`, `_build-images`, `_build-binaries
 
 ## Code style guidelines
 
-- **Rust** (`src/`, crate `vhrn`, `#![forbid(unsafe_code)]`): the code is `cargo fmt`-clean
+- **Rust** (`cli/src/`, package `vhrn`, `#![forbid(unsafe_code)]`): the code is `cargo fmt`-clean
   (enforced in CI with default settings — no `rustfmt.toml`); reach for `#[rustfmt::skip]`
   only on aligned test-case tables. Comments explain *why*, terse, one line where it fits.
   Group `use` imports std / external / crate, blank-line separated. Prefer small single-file
@@ -204,8 +206,8 @@ a `v*` tag. Three reusable workflows (`_test`, `_build-images`, `_build-binaries
 
 The suite runs per changed component on PRs and in full on master:
 
-- **CLI:** `cargo fmt --all -- --check`, then `cargo clippy --all-targets -- -D warnings`,
-  then `cargo test` (fmt runs before clippy).
+- **CLI:** `cargo fmt --all -- --check`, then `cargo clippy -p vhrn --all-targets -- -D warnings`,
+  then `cargo test -p vhrn` (fmt runs before clippy).
 - **Proxy:** `cd proxy && gofmt -l . && go vet ./... && go test ./...`, then `govulncheck
   ./...` (`go install golang.org/x/vuln/cmd/govulncheck@latest`). The stdlib is the only
   dependency, so a reachable toolchain CVE is the only kind this binary can have — and
@@ -256,9 +258,9 @@ exfiltrating freely. Guard these:
   addresses stay distinct from `localhost`. `open` and `report` never grant loopback access.
   Every run starts the generic host broker, even with zero grants. The proxy alone mounts its
   per-run token, and the broker caps a run at 128 connections.
-- **The broker is host-side and capability-gated.** `src/broker.rs` authenticates a proxy-only
+- **The broker is host-side and capability-gated.** `cli/src/broker.rs` authenticates a proxy-only
   per-run token and rechecks the three loopback policy layers before an exact loopback dial;
-  `src/run.rs` owns engine routing and cleanup, and `proxy/` routes authorized local requests.
+  `cli/src/run.rs` owns engine routing and cleanup, and `proxy/` routes authorized local requests.
   SIGTERM tears down agent, proxy, broker, and policy. A SIGKILL closes the broker listener and
   relays, but its containers and token staging require explicit cleanup; lease reaping retires
   only run policy.
