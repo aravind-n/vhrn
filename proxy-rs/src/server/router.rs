@@ -2,6 +2,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use anyhow::Context as _;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{
@@ -26,11 +27,16 @@ const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) struct RequestContext {
     pub(crate) config: Config,
     pub(crate) public: PublicConnector,
+    pub(crate) shutdown: crate::Shutdown,
 }
 
 impl RequestContext {
-    pub(crate) fn new(config: Config, public: PublicConnector) -> Self {
-        Self { config, public }
+    pub(crate) fn new(config: Config, public: PublicConnector, shutdown: crate::Shutdown) -> Self {
+        Self {
+            config,
+            public,
+            shutdown,
+        }
     }
 }
 
@@ -58,11 +64,12 @@ fn classify_http(method: &Method, uri: &hyper::Uri) -> HttpRoute {
 }
 
 pub(crate) async fn handle(
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
     context: Arc<RequestContext>,
+    tunnels: Arc<tokio::sync::Mutex<tokio::task::JoinSet<anyhow::Result<()>>>>,
 ) -> Response<ProxyBody> {
     if request.method() == Method::CONNECT {
-        return fixed(StatusCode::BAD_REQUEST, None, "bad request\n");
+        return handle_connect(&mut request, context, tunnels).await;
     }
     handle_http(request, context).await
 }
@@ -87,6 +94,89 @@ where
             }
         }
     }
+}
+
+async fn handle_connect(
+    request: &mut Request<Incoming>,
+    context: Arc<RequestContext>,
+    tunnels: Arc<tokio::sync::Mutex<tokio::task::JoinSet<anyhow::Result<()>>>>,
+) -> Response<ProxyBody> {
+    match classify(request.method(), request.uri()) {
+        Target::PublicConnect(target) => {
+            let decision = match decide_public(
+                context.config.allowlists.as_slice(),
+                &context.config.mode_file,
+                target.host(),
+            )
+            .await
+            {
+                Ok((value, warning)) => {
+                    if let Some(warning) = warning {
+                        report(&warning);
+                    }
+                    value
+                }
+                Err(error) => {
+                    report(&error);
+                    record_best_effort(&context, &target).await;
+                    return fixed(StatusCode::FORBIDDEN, None, "forbidden\n");
+                }
+            };
+            if !decision.allowed {
+                record_best_effort(&context, &target).await;
+                return fixed(StatusCode::FORBIDDEN, None, "forbidden\n");
+            }
+            if decision.record_denial
+                && let Err(error) = record(&context, &target).await
+            {
+                report(&error);
+                return fixed(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    None,
+                    "internal server error\n",
+                );
+            }
+            match context.public.connect_target(target).await {
+                Ok(upstream) => {
+                    spawn_tunnel(request, upstream, context.shutdown.clone(), tunnels.clone())
+                        .await;
+                    fixed(StatusCode::OK, None, "")
+                }
+                Err(error) => {
+                    report(&error);
+                    fixed(StatusCode::BAD_GATEWAY, None, "bad gateway\n")
+                }
+            }
+        }
+        Target::LocalConnect(target) => {
+            record_best_effort(&context, &target).await;
+            fixed(StatusCode::FORBIDDEN, None, "forbidden\n")
+        }
+        _ => fixed(StatusCode::BAD_REQUEST, None, "bad request\n"),
+    }
+}
+
+async fn spawn_tunnel<S>(
+    request: &mut Request<Incoming>,
+    upstream: S,
+    shutdown: crate::Shutdown,
+    tunnels: Arc<tokio::sync::Mutex<tokio::task::JoinSet<anyhow::Result<()>>>>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let upgrade = hyper::upgrade::on(request);
+    tunnels.lock().await.spawn(async move {
+        match upgrade.await {
+            Ok(upgraded) => crate::server::relay::relay(
+                hyper_util::rt::TokioIo::new(upgraded),
+                upstream,
+                shutdown,
+            )
+            .await
+            .context("relay CONNECT tunnel"),
+            Err(error) => Err(anyhow::Error::new(error).context("upgrade CONNECT request")),
+        }
+    });
 }
 
 async fn authorize(parts: &hyper::http::request::Parts, context: &RequestContext) -> HeadDecision {
@@ -264,7 +354,11 @@ mod tests {
             _ => None,
         })
         .unwrap();
-        Arc::new(RequestContext::new(config, PublicConnector::system()))
+        Arc::new(RequestContext::new(
+            config,
+            PublicConnector::system(),
+            crate::Shutdown::new(),
+        ))
     }
 
     #[tokio::test]

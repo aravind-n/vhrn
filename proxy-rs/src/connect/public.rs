@@ -509,7 +509,6 @@ impl PublicConnector {
         Self::open_with(self.resolver.clone(), self.dialer.clone(), target).await
     }
 
-    #[allow(dead_code)] // CONNECT routing consumes the raw public stream.
     pub(crate) async fn connect_target(&self, target: PublicTarget) -> Result<PublicStream> {
         self.open_target(target).await
     }
