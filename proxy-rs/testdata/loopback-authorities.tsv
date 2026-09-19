@@ -1,0 +1,33 @@
+# kind	input	canonical authority for valid rows
+valid	localhost:1234	localhost:1234
+valid	LOCALHOST:001234	localhost:1234
+valid	127.0.0.1:00080	127.0.0.1:80
+valid	127.255.255.255:65535	127.255.255.255:65535
+valid	[::1]:443	[::1]:443
+valid	[0:0:0:0:0:0:0:1]:00443	[::1]:443
+valid	[::0001]:1	[::1]:1
+invalid	+127.0.0.1:80
+invalid	-127.0.0.1:80
+invalid	[localhost]:80
+invalid	127.0.0.1.1:80
+invalid	127.0.0.1x:80
+invalid	localhost
+invalid	localhost:0
+invalid	localhost:65536
+invalid	localhost:+1
+invalid	localhost: 1
+invalid	localhost.:80
+invalid	http://localhost:80
+invalid	127.0.0.1
+invalid	127.00.0.1:80
+invalid	127.0.0.256:80
+invalid	126.255.255.255:80
+invalid	128.0.0.1:80
+invalid	[::]:80
+invalid	[::ffff:127.0.0.1]:80
+invalid	[fe80::1%en0]:80
+invalid	::1:80
+invalid	[::1]:0
+invalid	localhost:80/path
+invalid	 localhost:80
+invalid	localhost:80 
