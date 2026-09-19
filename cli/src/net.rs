@@ -2008,7 +2008,7 @@ mod tests {
 
     #[test]
     fn domain_policy_fixture_remains_proxy_compatible() {
-        for row in include_str!("../proxy-rs/testdata/domain-policy.tsv")
+        for row in include_str!("../../proxy-rs/testdata/domain-policy.tsv")
             .lines()
             .filter(|row| !row.starts_with('#'))
         {
@@ -2025,7 +2025,7 @@ mod tests {
 
     #[test]
     fn loopback_authorities_match_shared_fixture() {
-        for line in include_str!("../proxy-rs/testdata/loopback-authorities.tsv").lines() {
+        for line in include_str!("../../shared/testdata/loopback-authorities.tsv").lines() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }

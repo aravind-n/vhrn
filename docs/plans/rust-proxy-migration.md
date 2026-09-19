@@ -261,8 +261,9 @@ HTTP, and local CONNECT outcome.
 
 ### Inputs and editable paths
 
-Read the frozen contract and local/broker fixtures, `AGENTS.md`, `src/broker.rs`, `src/net.rs`,
-`src/run.rs`, and Rust candidate broker/routing modules and tests. Do not inspect Go materials.
+Read the frozen contract and local/broker fixtures, `AGENTS.md`, `cli/src/broker.rs`,
+`cli/src/net.rs`, `cli/src/run.rs`, and Rust candidate broker/routing modules and tests. Do not
+inspect Go materials.
 
 ### Required implementation
 

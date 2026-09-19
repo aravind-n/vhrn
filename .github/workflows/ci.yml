@@ -1,4 +1,4 @@
-# Pull-request gate. Only the changed component (src / proxy / images / scripts) is
+# Pull-request gate. Only the changed component (CLI / proxy / images / scripts) is
 # exercised; ci-gate is the single required status check, so a skipped component never
 # blocks the merge. master runs the full suite unfiltered (see nightly.yml).
 name: ci
@@ -17,7 +17,7 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     outputs:
-      src: ${{ steps.filter.outputs.src }}
+      rust: ${{ steps.filter.outputs.rust }}
       proxy: ${{ steps.filter.outputs.proxy }}
       images: ${{ steps.filter.outputs.images }}
       scripts: ${{ steps.filter.outputs.scripts }}
@@ -28,8 +28,8 @@ jobs:
         id: filter
         with:
           filters: |
-            src:
-              - 'src/**'
+            rust:
+              - 'cli/**'
               - 'proxy-rs/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -48,7 +48,7 @@ jobs:
     needs: changes
     uses: ./.github/workflows/_test.yml
     with:
-      run_rust: ${{ needs.changes.outputs.src == 'true' }}
+      run_rust: ${{ needs.changes.outputs.rust == 'true' }}
       run_proxy: ${{ needs.changes.outputs.proxy == 'true' }}
       run_scripts: ${{ needs.changes.outputs.scripts == 'true' }}
 

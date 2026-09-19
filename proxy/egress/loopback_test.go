@@ -15,7 +15,7 @@ import (
 )
 
 func TestNormalizeLoopbackAuthoritySharedCases(t *testing.T) {
-	f, err := os.Open(filepath.Join("..", "..", "testdata", "loopback-authorities.tsv"))
+	f, err := os.Open(filepath.Join("..", "..", "shared", "testdata", "loopback-authorities.tsv"))
 	if err != nil {
 		t.Fatal(err)
 	}

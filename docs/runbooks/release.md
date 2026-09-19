@@ -116,10 +116,10 @@ the tag printed in step 2:
 [X.Y.Z]: https://github.com/aravind-n/vhrn/compare/vPREVIOUS...vX.Y.Z
 ```
 
-Set `Cargo.toml` package `version` to `$RELEASE_VERSION`, then:
+Set the workspace `version` in `Cargo.toml` to `$RELEASE_VERSION`, then:
 
 ```sh
-cargo build --release
+cargo build --release -p vhrn
 ```
 
 Completion criterion: exactly `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`
@@ -135,8 +135,8 @@ publication; it never falls back to generated PR notes.
 git diff --check
 git diff -- CHANGELOG.md Cargo.toml Cargo.lock
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --locked
+cargo clippy -p vhrn --all-targets -- -D warnings
+cargo test -p vhrn --locked
 git status --short
 ```
 

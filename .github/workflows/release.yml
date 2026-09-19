@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Tag must match Cargo.toml version
+      - name: Tag must match workspace version
         run: |
           tag="${GITHUB_REF_NAME#v}"
           crate=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)

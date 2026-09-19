@@ -1,6 +1,6 @@
 //! vhrn runs coding agents ("harnesses") in a container jailed to the current
 //! project, with default-deny network egress. Logic lives here (testable);
-//! `src/main.rs` is a thin shim. Comments explain why, not what, and stay terse.
+//! `cli/src/main.rs` is a thin shim. Comments explain why, not what, and stay terse.
 mod broker;
 mod cli;
 mod config;
