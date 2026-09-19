@@ -11,6 +11,8 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+hyper = "1.8.1"
+tokio = { version = "1.49.0", features = ["fs", "macros", "rt-multi-thread"] }
 
 [dev-dependencies]
 tempfile.workspace = true
