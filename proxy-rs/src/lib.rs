@@ -14,12 +14,24 @@ pub use shutdown::Shutdown;
 ///
 /// # Errors
 ///
-/// Returns any startup, listener, or service error.
+/// Returns any startup, broker, listener, or service error.
 pub async fn run(config: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let tls = connect::tls::production_client_config()?;
+    let local = if let Some(value) = &config.local {
+        let connector = connect::broker::BrokerConnector::with_tls_config(
+            value.broker_addr.clone(),
+            config::load_broker_token(value)?,
+            tls.clone(),
+        );
+        connector.ready().await?;
+        Some(connector)
+    } else {
+        None
+    };
     let context = std::sync::Arc::new(server::router::RequestContext::new(
         config,
         connect::public::PublicConnector::system_with_tls(tls),
+        local,
         shutdown.clone(),
     ));
     let listener = server::listener::bind(context.config.listen).await?;

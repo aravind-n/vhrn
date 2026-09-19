@@ -1,4 +1,5 @@
 //! Safe operational diagnostics and asynchronous denial auditing.
+
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 

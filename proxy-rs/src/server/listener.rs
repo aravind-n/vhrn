@@ -350,6 +350,7 @@ mod tests {
         let context = Arc::new(RequestContext::new(
             config,
             crate::connect::public::PublicConnector::test_with_stream(upstream),
+            None,
             shutdown.clone(),
         ));
         let (mut client, server_stream) = tokio::io::duplex(1024);
@@ -386,6 +387,84 @@ mod tests {
             .await
             .expect("client tunnel read");
         assert_eq!(&upstream_bytes, b"upstream-reply");
+        client.shutdown().await.expect("client shutdown");
+        peer.shutdown().await.expect("peer shutdown");
+        server
+            .await
+            .expect("server task")
+            .expect("serve connection");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_connect_survives_past_connection_drain_timeout() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let allowlist = directory.path().join("allowlist");
+        let mode = directory.path().join("mode");
+        let local = [
+            directory.path().join("local-global"),
+            directory.path().join("local-project"),
+            directory.path().join("local-run"),
+        ];
+        std::fs::write(&allowlist, "allowed.example\n").expect("allowlist");
+        std::fs::write(&mode, "enforce\n").expect("mode");
+        std::fs::write(&local[0], "localhost:1234\n").expect("local allowlist");
+        std::fs::write(&local[1], "").expect("local allowlist");
+        std::fs::write(&local[2], "").expect("local allowlist");
+        let config = crate::Config::resolve(|name| match name {
+            "VHRN_ALLOWLIST" => Some(allowlist.display().to_string()),
+            "VHRN_MODE_FILE" => Some(mode.display().to_string()),
+            "VHRN_PROXY_LISTEN" => Some("127.0.0.1:8080".to_owned()),
+            "VHRN_LOOPBACK_ALLOWLISTS" => Some(
+                local
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            "VHRN_BROKER_ADDR" => Some("127.0.0.1:1".to_owned()),
+            "VHRN_BROKER_TOKEN_FILE" => Some(directory.path().join("token").display().to_string()),
+            _ => None,
+        })
+        .expect("test config");
+        let shutdown = crate::Shutdown::new();
+        let (upstream, mut peer) = tokio::io::duplex(1024);
+        let context = Arc::new(RequestContext::new(
+            config,
+            crate::connect::public::PublicConnector::system(),
+            Some(crate::connect::broker::BrokerConnector::test_with_connect_stream(upstream)),
+            shutdown.clone(),
+        ));
+        let (mut client, server_stream) = tokio::io::duplex(1024);
+        let server =
+            tokio::spawn(
+                async move { serve_test_connection(server_stream, context, shutdown).await },
+            );
+        client
+            .write_all(b"CONNECT localhost:1234 HTTP/1.1\r\nHost: localhost:1234\r\n\r\n")
+            .await
+            .expect("CONNECT request");
+        read_connect_response(&mut client).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(CONNECTION_DRAIN_TIMEOUT + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        client
+            .write_all(b"local-client")
+            .await
+            .expect("client tunnel write");
+        let mut client_bytes = [0; 12];
+        peer.read_exact(&mut client_bytes)
+            .await
+            .expect("broker tunnel read");
+        assert_eq!(&client_bytes, b"local-client");
+        peer.write_all(b"local-upstream")
+            .await
+            .expect("broker tunnel write");
+        let mut upstream_bytes = [0; 14];
+        client
+            .read_exact(&mut upstream_bytes)
+            .await
+            .expect("client tunnel read");
+        assert_eq!(&upstream_bytes, b"local-upstream");
         client.shutdown().await.expect("client shutdown");
         peer.shutdown().await.expect("peer shutdown");
         server
