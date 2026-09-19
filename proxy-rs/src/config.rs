@@ -47,6 +47,7 @@ impl PolicyPaths {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalPolicyPaths([PathBuf; 3]);
 impl LocalPolicyPaths {
+    #[allow(dead_code)] // Broker routing consumes local layers.
     pub(crate) fn as_array(&self) -> &[PathBuf; 3] {
         &self.0
     }
