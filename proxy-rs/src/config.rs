@@ -40,9 +40,17 @@ impl PolicyPaths {
         }
         Ok(Self(paths))
     }
+    pub(crate) fn as_slice(&self) -> &[PathBuf] {
+        &self.0
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalPolicyPaths([PathBuf; 3]);
+impl LocalPolicyPaths {
+    pub(crate) fn as_array(&self) -> &[PathBuf; 3] {
+        &self.0
+    }
+}
 impl std::ops::Index<usize> for LocalPolicyPaths {
     type Output = PathBuf;
     fn index(&self, index: usize) -> &Self::Output {
@@ -208,7 +216,7 @@ mod tests {
     fn resolves_startup_corpus() {
         let config = resolve_config(|_| None).unwrap();
         assert_eq!(
-            config.allowlists.0.as_slice(),
+            config.allowlists.as_slice(),
             [PathBuf::from(DEFAULT_ALLOWLIST)]
         );
         for row in include_str!("../testdata/proxy-process-cases.tsv")
@@ -262,7 +270,6 @@ mod tests {
             ]))
             .unwrap()
             .allowlists
-            .0
             .as_slice(),
             [PathBuf::from("one"), PathBuf::from("two")]
         );
