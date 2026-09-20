@@ -106,7 +106,7 @@ jobs:
       version: pr-${{ github.event.number }}
 
   build-proxy-go:
-    needs: [changes, test, build-cli]
+    needs: [changes, test]
     if: >-
       ${{
         always() &&
@@ -114,7 +114,6 @@ jobs:
           needs.test.result == 'success' ||
           (needs.test.result == 'skipped' && needs.changes.outputs.test_selected != 'true')
         ) &&
-        (needs['build-cli'].result == 'success' || needs['build-cli'].result == 'skipped') &&
         needs.changes.outputs.build_proxy_go == 'true'
       }}
     permissions:
@@ -126,7 +125,7 @@ jobs:
       push: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
 
   build-proxy-rs:
-    needs: [changes, test, build-cli]
+    needs: [changes, test]
     if: >-
       ${{
         always() &&
@@ -134,13 +133,12 @@ jobs:
           needs.test.result == 'success' ||
           (needs.test.result == 'skipped' && needs.changes.outputs.test_selected != 'true')
         ) &&
-        (needs['build-cli'].result == 'success' || needs['build-cli'].result == 'skipped') &&
         needs.changes.outputs.build_proxy_rs == 'true'
       }}
     uses: ./.github/workflows/_build-proxy-rs.yml
 
   build-harness-images:
-    needs: [changes, test, build-cli, build-proxy-go, build-proxy-rs]
+    needs: [changes, test]
     if: >-
       ${{
         always() &&
@@ -148,9 +146,6 @@ jobs:
           needs.test.result == 'success' ||
           (needs.test.result == 'skipped' && needs.changes.outputs.test_selected != 'true')
         ) &&
-        (needs['build-cli'].result == 'success' || needs['build-cli'].result == 'skipped') &&
-        (needs['build-proxy-go'].result == 'success' || needs['build-proxy-go'].result == 'skipped') &&
-        (needs['build-proxy-rs'].result == 'success' || needs['build-proxy-rs'].result == 'skipped') &&
         needs.changes.outputs.build_harness_images == 'true'
       }}
     permissions:

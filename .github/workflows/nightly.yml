@@ -42,7 +42,7 @@ jobs:
       version: ${{ needs.version.outputs.version }}
 
   build-proxy-go:
-    needs: [test, version, build-cli]
+    needs: [test, version]
     permissions:
       contents: read
       packages: write
@@ -53,11 +53,11 @@ jobs:
       extra_tag: ${{ needs.version.outputs.image_tag }}
 
   build-proxy-rs:
-    needs: [test, build-cli]
+    needs: test
     uses: ./.github/workflows/_build-proxy-rs.yml
 
   build-harness-images:
-    needs: [test, version, build-cli, build-proxy-go, build-proxy-rs]
+    needs: [test, version]
     permissions:
       contents: read
       packages: write

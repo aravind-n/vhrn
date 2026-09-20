@@ -47,7 +47,7 @@ jobs:
       version: ${{ github.ref_name }}
 
   build-proxy-go:
-    needs: [approve, test, build-cli]
+    needs: [approve, test]
     permissions:
       contents: read
       packages: write
@@ -57,11 +57,11 @@ jobs:
       push: true
 
   build-proxy-rs:
-    needs: [approve, test, build-cli]
+    needs: [approve, test]
     uses: ./.github/workflows/_build-proxy-rs.yml
 
   build-harness-images:
-    needs: [approve, test, build-cli, build-proxy-go, build-proxy-rs]
+    needs: [approve, test]
     permissions:
       contents: read
       packages: write
