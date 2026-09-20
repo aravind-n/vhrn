@@ -168,6 +168,7 @@ impl DirectTarget {
 pub(crate) struct PublicTarget {
     authority: String,
     host: PublicHost,
+    ipv6_scope: Option<String>,
     port: u16,
     explicit_port: bool,
     path_and_query: Vec<u8>,
@@ -187,6 +188,14 @@ impl PublicTarget {
 
     pub(crate) fn host(&self) -> &PublicHost {
         &self.host
+    }
+
+    pub(crate) const fn has_ipv6_scope(&self) -> bool {
+        self.ipv6_scope.is_some()
+    }
+
+    pub(crate) fn ipv6_scope(&self) -> Option<&str> {
+        self.ipv6_scope.as_deref()
     }
 
     pub(crate) const fn port(&self) -> u16 {
@@ -406,10 +415,16 @@ fn classify_authority(
             }
         }
         ParsedHost::Public(host) => {
-            let authority = canonical_public_authority(&host, parsed.port, parsed.explicit_port);
+            let authority = canonical_public_authority(
+                &host,
+                parsed.ipv6_scope.as_deref(),
+                parsed.port,
+                parsed.explicit_port,
+            );
             let target = PublicTarget {
                 authority,
                 host,
+                ipv6_scope: parsed.ipv6_scope,
                 port: parsed.port,
                 explicit_port: parsed.explicit_port,
                 path_and_query,
@@ -424,6 +439,7 @@ fn classify_authority(
 
 struct ParsedAuthority {
     host: ParsedHost,
+    ipv6_scope: Option<String>,
     port: u16,
     explicit_port: bool,
 }
@@ -454,20 +470,15 @@ fn parse_authority(
         let host = &value[..close];
         let suffix = &value[close + 1..];
         let (port, explicit_port) = parse_authority_port(suffix, default_port, port_required)?;
-        if host.contains('%') {
-            return None;
-        }
-        let address = host.parse::<Ipv6Addr>().ok()?;
-        if address.to_ipv4_mapped().is_some() {
-            return None;
-        }
-        let host = if address.is_loopback() {
+        let (address, ipv6_scope) = parse_ipv6_host(host)?;
+        let host = if ipv6_scope.is_none() && address.is_loopback() {
             ParsedHost::Local(LoopbackHost::Ipv6Loopback)
         } else {
             ParsedHost::Public(PublicHost::Ip(IpAddr::V6(address)))
         };
         return Some(ParsedAuthority {
             host,
+            ipv6_scope,
             port,
             explicit_port,
         });
@@ -497,6 +508,7 @@ fn parse_authority(
         };
         return Some(ParsedAuthority {
             host,
+            ipv6_scope: None,
             port,
             explicit_port,
         });
@@ -515,6 +527,7 @@ fn parse_authority(
     };
     Some(ParsedAuthority {
         host,
+        ipv6_scope: None,
         port,
         explicit_port,
     })
@@ -534,11 +547,34 @@ fn parse_authority_port(
     }
 }
 
-fn canonical_public_authority(host: &PublicHost, port: u16, explicit_port: bool) -> String {
+fn parse_ipv6_host(host: &str) -> Option<(Ipv6Addr, Option<String>)> {
+    let Some((address, zone)) = host.split_once("%25") else {
+        return Some((host.parse().ok()?, None));
+    };
+    if zone.is_empty()
+        || zone.contains('%')
+        || !zone
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+    {
+        return None;
+    }
+    Some((address.parse().ok()?, Some(zone.to_owned())))
+}
+
+fn canonical_public_authority(
+    host: &PublicHost,
+    ipv6_scope: Option<&str>,
+    port: u16,
+    explicit_port: bool,
+) -> String {
     let host = match host {
         PublicHost::Dns(name) => name.to_string(),
         PublicHost::Ip(IpAddr::V4(address)) => address.to_string(),
-        PublicHost::Ip(IpAddr::V6(address)) => format!("[{address}]"),
+        PublicHost::Ip(IpAddr::V6(address)) => ipv6_scope.map_or_else(
+            || format!("[{address}]"),
+            |zone| format!("[{address}%25{zone}]"),
+        ),
     };
     if explicit_port {
         format!("{host}:{port}")
@@ -771,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn numeric_hosts_reject_ambiguous_ipv4_mapped_and_scoped_forms() {
+    fn numeric_hosts_reject_ambiguity_and_preserve_unsafe_ipv6_literals() {
         for raw in [
             "http://127.00.0.1/",
             "http://127.0.0.1./",
@@ -779,8 +815,6 @@ mod tests {
             "http://192.0.2.1./",
             "http://256.1.1.1/",
             "http://1.2.3/",
-            "http://[::ffff:127.0.0.1]/",
-            "http://[fe80::1%25eth0]/",
             "http://2001:db8::1/",
         ] {
             assert_eq!(classify_text(&Method::GET, raw), Target::Malformed, "{raw}");
@@ -793,6 +827,40 @@ mod tests {
             classify_text(&Method::GET, "http://[2606:4700:4700::1111]/"),
             Target::PublicHttp(_)
         ));
+        for (method, raw, expected_host, expected_authority) in [
+            (
+                Method::GET,
+                "http://[::ffff:127.0.0.1]/",
+                "::ffff:127.0.0.1",
+                "[::ffff:127.0.0.1]",
+            ),
+            (
+                Method::GET,
+                "http://[fe80::1%25eth0]/",
+                "fe80::1",
+                "[fe80::1%25eth0]",
+            ),
+            (
+                Method::CONNECT,
+                "[::ffff:127.0.0.1]:443",
+                "::ffff:127.0.0.1",
+                "[::ffff:127.0.0.1]:443",
+            ),
+            (
+                Method::CONNECT,
+                "[fe80::1%25eth0]:443",
+                "fe80::1",
+                "[fe80::1%25eth0]:443",
+            ),
+        ] {
+            let target = classify_text(&method, raw);
+            let target = match target {
+                Target::PublicHttp(target) | Target::PublicConnect(target) => target,
+                other => panic!("unsafe IPv6 literal was not public: {other:?}"),
+            };
+            assert_eq!(target.host().to_string(), expected_host, "{raw}");
+            assert_eq!(target.authority(), expected_authority, "{raw}");
+        }
         for raw in ["127.0.0.1.:443", "192.0.2.1.:443"] {
             assert_eq!(
                 classify_text(&Method::CONNECT, raw),

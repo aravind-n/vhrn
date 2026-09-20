@@ -1,0 +1,56 @@
+# IANA IPv4 and IPv6 Special-Purpose Address Space, last updated 2025-10-09.
+# Sources:
+# https://www.iana.org/assignments/iana-ipv4-special-registry/
+# https://www.iana.org/assignments/iana-ipv6-special-registry/
+# TSV: prefix<TAB>Destination<TAB>Forwardable<TAB>Globally Reachable; N is N/A or blank.
+0.0.0.0/8	F	F	F
+0.0.0.0/32	F	F	F
+10.0.0.0/8	T	T	F
+100.64.0.0/10	T	T	F
+127.0.0.0/8	F	F	F
+169.254.0.0/16	T	F	F
+172.16.0.0/12	T	T	F
+192.0.0.0/24	F	F	F
+192.0.0.0/29	T	T	F
+192.0.0.8/32	F	F	F
+192.0.0.9/32	T	T	T
+192.0.0.10/32	T	T	T
+192.0.0.170/32	F	F	F
+192.0.0.171/32	F	F	F
+192.0.2.0/24	F	F	F
+192.31.196.0/24	T	T	T
+192.52.193.0/24	T	T	T
+192.88.99.0/24	N	N	N
+192.88.99.2/32	T	T	F
+192.168.0.0/16	T	T	F
+192.175.48.0/24	T	T	T
+198.18.0.0/15	T	T	F
+198.51.100.0/24	F	F	F
+203.0.113.0/24	F	F	F
+240.0.0.0/4	F	F	F
+255.255.255.255/32	T	F	F
+::1/128	F	F	F
+::/128	F	F	F
+::ffff:0:0/96	F	F	F
+64:ff9b::/96	T	T	T
+64:ff9b:1::/48	T	T	F
+100::/64	T	T	F
+100:0:0:1::/64	T	F	F
+2001::/23	F	F	F
+2001::/32	T	T	N
+2001:1::1/128	T	T	T
+2001:1::2/128	T	T	T
+2001:1::3/128	T	T	T
+2001:2::/48	T	T	F
+2001:3::/32	T	T	T
+2001:4:112::/48	T	T	T
+2001:10::/28	N	N	N
+2001:20::/28	T	T	T
+2001:30::/28	T	T	T
+2001:db8::/32	F	F	F
+2002::/16	T	T	N
+2620:4f:8000::/48	T	T	T
+3fff::/20	F	F	F
+5f00::/16	T	T	F
+fc00::/7	T	T	F
+fe80::/10	T	F	F

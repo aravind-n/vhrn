@@ -1,15 +1,16 @@
 //! Validated numeric public connection setup.
 
-#[cfg(test)]
+mod registry;
+
+use std::fmt;
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-#[cfg(test)]
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
@@ -18,19 +19,23 @@ use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 
+use crate::Shutdown;
 use crate::connect::origin_body::{BoundedOriginBody, OriginBodyLimits, SharedOriginResponse};
 use crate::connect::pool::IdlePool;
 use crate::domain::target::{PublicHost, PublicTarget};
 use crate::headers::sanitize_hop_by_hop;
 
-const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
-const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+use self::registry::{ipv4_is_global, ipv6_is_global};
+
+const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
+const MAX_DNS_ANSWERS: usize = 64;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// A validated, numeric public connection.
+#[derive(Debug)]
 pub(crate) enum PublicStream {
     Tcp(TcpStream),
     #[cfg(test)]
@@ -81,40 +86,70 @@ impl AsyncWrite for PublicStream {
     }
 }
 
-#[cfg(test)]
-pub(crate) type ResolveFuture = Pin<Box<dyn Future<Output = Result<Vec<IpAddr>>> + Send>>;
-#[cfg(test)]
+pub(crate) type ResolveFuture = Pin<Box<dyn Future<Output = Result<Vec<ResolvedAddress>>> + Send>>;
 pub(crate) type DialFuture = Pin<Box<dyn Future<Output = Result<PublicStream>> + Send>>;
 
+/// One resolver result with scope metadata retained until validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedAddress {
+    address: IpAddr,
+    scope_id: u32,
+}
+
+impl ResolvedAddress {
+    fn from_socket(address: SocketAddr) -> Self {
+        match address {
+            SocketAddr::V4(address) => Self {
+                address: IpAddr::V4(*address.ip()),
+                scope_id: 0,
+            },
+            SocketAddr::V6(address) => Self {
+                address: IpAddr::V6(*address.ip()),
+                scope_id: address.scope_id(),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn unscoped(address: IpAddr) -> Self {
+        Self {
+            address,
+            scope_id: 0,
+        }
+    }
+
+    #[cfg(test)]
+    const fn scoped(address: IpAddr, scope_id: u32) -> Self {
+        Self { address, scope_id }
+    }
+}
+
 /// Resolves one normalized public name for one connection attempt.
-#[cfg(test)]
 pub(crate) trait Resolver: Send + Sync + 'static {
     fn resolve(&self, host: String, port: u16) -> ResolveFuture;
 }
 
 /// Opens a connection to one validated numeric socket address.
-#[cfg(test)]
 pub(crate) trait NumericDialer: Send + Sync + 'static {
     fn dial(&self, address: SocketAddr) -> DialFuture;
 }
 
-#[cfg(test)]
 struct SystemResolver;
-#[cfg(test)]
 impl Resolver for SystemResolver {
     fn resolve(&self, host: String, port: u16) -> ResolveFuture {
         Box::pin(async move {
             let addresses = tokio::net::lookup_host((host.as_str(), port))
                 .await
                 .map_err(|_| anyhow!("public name resolution failed"))?;
-            Ok(addresses.map(|address| address.ip()).collect())
+            Ok(addresses
+                .take(MAX_DNS_ANSWERS + 1)
+                .map(ResolvedAddress::from_socket)
+                .collect())
         })
     }
 }
 
-#[cfg(test)]
 struct SystemDialer;
-#[cfg(test)]
 impl NumericDialer for SystemDialer {
     fn dial(&self, address: SocketAddr) -> DialFuture {
         Box::pin(async move {
@@ -126,10 +161,41 @@ impl NumericDialer for SystemDialer {
     }
 }
 
+/// A safe, response-classified public connection failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicConnectError {
+    PolicyDenied,
+    Unavailable,
+    DeadlineExceeded,
+    Cancelled,
+    OriginFailure,
+}
+
+impl PublicConnectError {
+    pub(crate) const fn is_policy_denial(self) -> bool {
+        matches!(self, Self::PolicyDenied)
+    }
+}
+
+impl fmt::Display for PublicConnectError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::PolicyDenied => "public address rejected",
+            Self::Unavailable => "public destination unavailable",
+            Self::DeadlineExceeded => "public connection deadline exceeded",
+            Self::Cancelled => "public connection cancelled",
+            Self::OriginFailure => "public origin exchange failed",
+        })
+    }
+}
+
+impl std::error::Error for PublicConnectError {}
+
 /// Stable identity for a public origin connection pool.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct OriginKey {
     host: PublicHost,
+    ipv6_scope: Option<String>,
     port: u16,
 }
 
@@ -138,22 +204,23 @@ impl OriginKey {
     pub fn from_target(target: &PublicTarget) -> Self {
         Self {
             host: target.host().clone(),
+            ipv6_scope: target.ipv6_scope().map(str::to_owned),
             port: target.port(),
         }
     }
 }
 
 /// An address which is safe for a public origin dial.
-///
-/// The exclusions below mirror IANA's IPv4 and IPv6 Special-Purpose Address
-/// Registries.  Addresses absent from those registries are globally routable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GloballyRoutableIp(IpAddr);
 
 impl GloballyRoutableIp {
     fn new(address: IpAddr) -> Option<Self> {
-        let address = canonical_ip(address);
-        (!is_special_purpose(address)).then_some(Self(address))
+        let eligible = match address {
+            IpAddr::V4(address) => ipv4_is_global(address),
+            IpAddr::V6(address) => ipv6_is_global(address),
+        };
+        eligible.then_some(Self(address))
     }
 
     fn socket_addr(self, port: u16) -> SocketAddr {
@@ -161,111 +228,39 @@ impl GloballyRoutableIp {
     }
 }
 
-fn validated_answers(answers: Vec<IpAddr>) -> Result<GloballyRoutableIp> {
-    let mut first = None;
-    for answer in answers {
-        let Some(address) = GloballyRoutableIp::new(answer) else {
-            return Err(anyhow!("public address rejected"));
-        };
-        first.get_or_insert(address);
-    }
-    first.ok_or_else(|| anyhow!("public name returned no addresses"))
-}
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedAnswers(Vec<GloballyRoutableIp>);
 
-fn canonical_ip(address: IpAddr) -> IpAddr {
-    match address {
-        IpAddr::V6(address) => address
-            .to_ipv4_mapped()
-            .map_or(IpAddr::V6(address), IpAddr::V4),
-        IpAddr::V4(address) => IpAddr::V4(address),
-    }
-}
-
-fn is_special_purpose(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => ipv4_special(address),
-        IpAddr::V6(address) => ipv6_special(address),
-    }
-}
-
-fn ipv4_special(address: Ipv4Addr) -> bool {
-    // IANA IPv4 Special-Purpose Address Registry, 2026-09-18.
-    let blocked = [
-        (Ipv4Addr::UNSPECIFIED, 8),
-        (Ipv4Addr::new(10, 0, 0, 0), 8),
-        (Ipv4Addr::new(100, 64, 0, 0), 10),
-        (Ipv4Addr::new(127, 0, 0, 0), 8),
-        (Ipv4Addr::new(169, 254, 0, 0), 16),
-        (Ipv4Addr::new(172, 16, 0, 0), 12),
-        (Ipv4Addr::new(192, 0, 0, 0), 24),
-        (Ipv4Addr::new(192, 0, 2, 0), 24),
-        (Ipv4Addr::new(192, 88, 99, 0), 24),
-        (Ipv4Addr::new(192, 168, 0, 0), 16),
-        (Ipv4Addr::new(198, 18, 0, 0), 15),
-        (Ipv4Addr::new(198, 51, 100, 0), 24),
-        (Ipv4Addr::new(203, 0, 113, 0), 24),
-        (Ipv4Addr::new(224, 0, 0, 0), 4),
-        (Ipv4Addr::new(240, 0, 0, 0), 4),
-    ];
-    // PCP and TURN anycast are the two globally reachable exceptions in 192.0.0/24.
-    address != Ipv4Addr::new(192, 0, 0, 9)
-        && address != Ipv4Addr::new(192, 0, 0, 10)
-        && blocked
+impl ValidatedAnswers {
+    fn from_dns(answers: Vec<ResolvedAddress>) -> std::result::Result<Self, PublicConnectError> {
+        if answers.is_empty() {
+            return Err(PublicConnectError::Unavailable);
+        }
+        if answers.len() > MAX_DNS_ANSWERS {
+            return Err(PublicConnectError::PolicyDenied);
+        }
+        answers
             .into_iter()
-            .any(|(network, prefix)| ipv4_in_prefix(address, network, prefix))
-}
+            .map(|answer| {
+                if answer.scope_id != 0 {
+                    return Err(PublicConnectError::PolicyDenied);
+                }
+                GloballyRoutableIp::new(answer.address).ok_or(PublicConnectError::PolicyDenied)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(Self)
+    }
 
-fn ipv6_special(address: std::net::Ipv6Addr) -> bool {
-    let in_prefix = |network, prefix| ipv6_in_prefix(address, network, prefix);
-    if in_prefix([0, 0, 0, 0, 0, 0, 0, 0], 96)
-        || in_prefix([0, 0, 0, 0, 0, 0, 0, 1], 128)
-        // IANA's IPv4-translated prefix is distinct from IPv4-mapped
-        // addresses, which `canonical_ip` deliberately converts to IPv4.
-        || in_prefix([0, 0, 0, 0, 0xffff, 0, 0, 0], 96)
-        || in_prefix([0x64, 0xff9b, 1, 0, 0, 0, 0, 0], 48)
-        || in_prefix([0x100, 0, 0, 0, 0, 0, 0, 0], 64)
-        || in_prefix([0x100, 0, 0, 1, 0, 0, 0, 0], 64)
-        || in_prefix([0x5f00, 0, 0, 0, 0, 0, 0, 0], 16)
-        || in_prefix([0x2002, 0, 0, 0, 0, 0, 0, 0], 16)
-        || in_prefix([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0], 32)
-        || in_prefix([0x3fff, 0, 0, 0, 0, 0, 0, 0], 20)
-        || in_prefix([0xfc00, 0, 0, 0, 0, 0, 0, 0], 7)
-        || in_prefix([0xfe80, 0, 0, 0, 0, 0, 0, 0], 10)
-        || in_prefix([0xff00, 0, 0, 0, 0, 0, 0, 0], 8)
-    {
-        return true;
+    fn from_literal(address: IpAddr) -> std::result::Result<Self, PublicConnectError> {
+        GloballyRoutableIp::new(address)
+            .map(|address| Self(vec![address]))
+            .ok_or(PublicConnectError::PolicyDenied)
     }
-    if in_prefix([0x64, 0xff9b, 0, 0, 0, 0, 0, 0], 96) {
-        return false;
-    }
-    if !in_prefix([0x2001, 0, 0, 0, 0, 0, 0, 0], 23) {
-        return false;
-    }
-    !in_prefix([0x2001, 1, 0, 0, 0, 0, 0, 1], 128)
-        && !in_prefix([0x2001, 1, 0, 0, 0, 0, 0, 2], 128)
-        && !in_prefix([0x2001, 1, 0, 0, 0, 0, 0, 3], 128)
-        && !in_prefix([0x2001, 0, 3, 0, 0, 0, 0, 0], 32)
-        && !in_prefix([0x2001, 4, 0x112, 0, 0, 0, 0, 0], 48)
-        && !in_prefix([0x2001, 0x20, 0, 0, 0, 0, 0, 0], 28)
-        && !in_prefix([0x2001, 0x30, 0, 0, 0, 0, 0, 0], 28)
-}
-
-fn ipv4_in_prefix(address: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> bool {
-    let mask = u32::MAX << (32 - u32::from(prefix));
-    u32::from(address) & mask == u32::from(network) & mask
-}
-fn ipv6_in_prefix(address: std::net::Ipv6Addr, network: [u16; 8], prefix: u8) -> bool {
-    let bits = u128::from_be_bytes(address.octets());
-    let base = u128::from_be_bytes(std::net::Ipv6Addr::from(network).octets());
-    let mask = u128::MAX << (128 - u32::from(prefix));
-    bits & mask == base & mask
 }
 
 /// Public connector that resolves and opens one validated numeric stream.
 pub(crate) struct PublicConnector {
-    #[cfg(test)]
     resolver: Arc<dyn Resolver>,
-    #[cfg(test)]
     dialer: Arc<dyn NumericDialer>,
     pool: IdlePool<OriginKey, OriginConnection>,
     response_timeout: Duration,
@@ -304,23 +299,17 @@ fn origin_connection_reusable(connection: &OriginConnection) -> bool {
 }
 
 impl PublicConnector {
-    #[cfg(not(test))]
     pub(crate) fn system() -> Self {
-        Self {
-            pool: IdlePool::new(),
-            response_timeout: HTTP_TIMEOUT,
-            response_limit: MAX_RESPONSE_BYTES,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn system() -> Self {
-        Self::new(Arc::new(SystemResolver), Arc::new(SystemDialer))
+        Self::from_parts(
+            Arc::new(SystemResolver),
+            Arc::new(SystemDialer),
+            IdlePool::new(),
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn new(resolver: Arc<dyn Resolver>, dialer: Arc<dyn NumericDialer>) -> Self {
-        Self::new_with_pool(resolver, dialer, IdlePool::new())
+        Self::from_parts(resolver, dialer, IdlePool::new())
     }
 
     #[cfg(test)]
@@ -328,7 +317,11 @@ impl PublicConnector {
         struct OneResolver;
         impl Resolver for OneResolver {
             fn resolve(&self, _: String, _: u16) -> ResolveFuture {
-                Box::pin(async { Ok(vec!["8.8.8.8".parse().expect("test address")]) })
+                Box::pin(async {
+                    Ok(vec![ResolvedAddress::unscoped(
+                        "8.8.8.8".parse().expect("test address"),
+                    )])
+                })
             }
         }
         struct OneDialer(std::sync::Mutex<Option<PublicStream>>);
@@ -346,8 +339,7 @@ impl PublicConnector {
         )
     }
 
-    #[cfg(test)]
-    fn new_with_pool(
+    fn from_parts(
         resolver: Arc<dyn Resolver>,
         dialer: Arc<dyn NumericDialer>,
         pool: IdlePool<OriginKey, OriginConnection>,
@@ -372,7 +364,7 @@ impl PublicConnector {
         capacity: std::num::NonZeroUsize,
         lifetime: crate::connect::pool::NonZeroDuration,
     ) -> Self {
-        Self::new_with_pool(resolver, dialer, IdlePool::with_limits(capacity, lifetime))
+        Self::from_parts(resolver, dialer, IdlePool::with_limits(capacity, lifetime))
     }
 
     #[cfg(test)]
@@ -393,68 +385,86 @@ impl PublicConnector {
         }
     }
 
-    #[cfg(test)]
-    async fn open_with(
+    async fn open_with_budget(
         resolver: Arc<dyn Resolver>,
         dialer: Arc<dyn NumericDialer>,
         target: PublicTarget,
-    ) -> Result<PublicStream> {
-        Self::open_with_deadlines(resolver, dialer, target, RESOLVE_TIMEOUT, DIAL_TIMEOUT).await
+        cancellation: &Shutdown,
+        budget: Duration,
+    ) -> std::result::Result<PublicStream, PublicConnectError> {
+        let deadline = Instant::now() + budget;
+        if target.has_ipv6_scope() {
+            return Err(PublicConnectError::PolicyDenied);
+        }
+        let answers = match target.host() {
+            PublicHost::Ip(address) => ValidatedAnswers::from_literal(*address)?,
+            PublicHost::Dns(_) => {
+                let resolution_result = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return Err(PublicConnectError::Cancelled),
+                    result = timeout_at(
+                        deadline,
+                        resolver.resolve(target.host().to_string(), target.port()),
+                    ) => result,
+                };
+                let answers = resolution_result
+                    .map_err(|_| PublicConnectError::DeadlineExceeded)?
+                    .map_err(|_| PublicConnectError::Unavailable)?;
+                ValidatedAnswers::from_dns(answers)?
+            }
+        };
+
+        for address in answers.0 {
+            let attempt_result = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(PublicConnectError::Cancelled),
+                result = timeout_at(
+                    deadline,
+                    dialer.dial(address.socket_addr(target.port())),
+                ) => result,
+            };
+            match attempt_result {
+                Err(_) => return Err(PublicConnectError::DeadlineExceeded),
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(_)) => {}
+            }
+        }
+        Err(PublicConnectError::Unavailable)
     }
 
-    #[cfg(test)]
-    async fn open_with_deadlines(
-        resolver: Arc<dyn Resolver>,
-        dialer: Arc<dyn NumericDialer>,
+    async fn open_target(
+        &self,
         target: PublicTarget,
-        resolve_timeout: Duration,
-        dial_timeout: Duration,
-    ) -> Result<PublicStream> {
-        let answers = timeout(
-            resolve_timeout,
-            resolver.resolve(target.host().to_string(), target.port()),
+        cancellation: &Shutdown,
+    ) -> std::result::Result<PublicStream, PublicConnectError> {
+        Self::open_with_budget(
+            self.resolver.clone(),
+            self.dialer.clone(),
+            target,
+            cancellation,
+            CONNECT_DEADLINE,
         )
         .await
-        .map_err(|_| anyhow!("public name resolution timed out"))??;
-        let address = validated_answers(answers)?.socket_addr(target.port());
-        timeout(dial_timeout, dialer.dial(address))
-            .await
-            .map_err(|_| anyhow!("public connection timed out"))?
     }
 
-    #[cfg(not(test))]
-    async fn open_target(&self, target: PublicTarget) -> Result<PublicStream> {
-        let answers = timeout(
-            RESOLVE_TIMEOUT,
-            tokio::net::lookup_host((target.host().to_string(), target.port())),
-        )
-        .await
-        .map_err(|_| anyhow!("public name resolution timed out"))?
-        .map_err(|_| anyhow!("public name resolution failed"))?
-        .map(|address| address.ip())
-        .collect();
-        let address = validated_answers(answers)?.socket_addr(target.port());
-        let stream = timeout(DIAL_TIMEOUT, TcpStream::connect(address))
-            .await
-            .map_err(|_| anyhow!("public connection timed out"))?
-            .map_err(|_| anyhow!("public connection failed"))?;
-        Ok(PublicStream::Tcp(stream))
+    pub(crate) async fn connect_target(
+        &self,
+        target: PublicTarget,
+        cancellation: &Shutdown,
+    ) -> std::result::Result<PublicStream, PublicConnectError> {
+        self.open_target(target, cancellation).await
     }
 
-    #[cfg(test)]
-    async fn open_target(&self, target: PublicTarget) -> Result<PublicStream> {
-        Self::open_with(self.resolver.clone(), self.dialer.clone(), target).await
-    }
-
-    pub(crate) async fn connect_target(&self, target: PublicTarget) -> Result<PublicStream> {
-        self.open_target(target).await
-    }
-
-    async fn open_sender(&self, target: &PublicTarget) -> Result<OriginConnection> {
-        let stream = self.open_target(target.clone()).await?;
+    async fn open_sender(
+        &self,
+        target: &PublicTarget,
+        cancellation: &Shutdown,
+    ) -> std::result::Result<OriginConnection, PublicConnectError> {
+        let stream = self.open_target(target.clone(), cancellation).await?;
         let (sender, connection) = timeout(HTTP_TIMEOUT, http1::handshake(TokioIo::new(stream)))
             .await
-            .map_err(|_| anyhow!("origin handshake timed out"))??;
+            .map_err(|_| PublicConnectError::OriginFailure)?
+            .map_err(|_| PublicConnectError::OriginFailure)?;
         #[cfg(test)]
         let driver_guard = {
             self.active_drivers
@@ -473,24 +483,25 @@ impl PublicConnector {
         &self,
         target: PublicTarget,
         request: Request<Full<Bytes>>,
-    ) -> Result<PublicResponse> {
+        cancellation: &Shutdown,
+    ) -> std::result::Result<PublicResponse, PublicConnectError> {
         #[cfg(test)]
         self.public_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let key = OriginKey::from_target(&target);
-        let request = outbound_request(request)?;
+        let request = outbound_request(request).map_err(|_| PublicConnectError::OriginFailure)?;
         let connection = self.pool.take_if_reusable(&key, origin_connection_reusable);
         let mut connection = match connection {
             Some(connection) => connection,
-            None => self.open_sender(&target).await?,
+            None => self.open_sender(&target, cancellation).await?,
         };
         let response = timeout(
             self.response_timeout,
             connection.sender.send_request(request),
         )
         .await
-        .with_context(|| format!("origin response timed out for {}", target.authority()))?
-        .with_context(|| format!("receive origin response from {}", target.authority()))?;
+        .map_err(|_| PublicConnectError::OriginFailure)?
+        .map_err(|_| PublicConnectError::OriginFailure)?;
         let (parts, incoming) = response.into_parts();
         Ok(PublicResponse {
             status: parts.status,
@@ -516,13 +527,16 @@ impl PublicConnector {
         &self,
         target: PublicTarget,
         request: Request<Full<Bytes>>,
-    ) -> Result<PublicResponse> {
-        self.send(target, request).await
+    ) -> std::result::Result<PublicResponse, PublicConnectError> {
+        self.send(target, request, &Shutdown::new()).await
     }
 
     #[cfg(test)]
-    async fn open(&self, target: PublicTarget) -> Result<PublicStream> {
-        Self::open_with(self.resolver.clone(), self.dialer.clone(), target).await
+    async fn open(
+        &self,
+        target: PublicTarget,
+    ) -> std::result::Result<PublicStream, PublicConnectError> {
+        self.open_target(target, &Shutdown::new()).await
     }
 
     #[cfg(test)]
@@ -559,7 +573,10 @@ fn outbound_request(request: Request<Full<Bytes>>) -> Result<Request<Full<Bytes>
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
@@ -568,11 +585,11 @@ mod tests {
     use crate::domain::target::{Target, classify};
 
     struct FakeResolver {
-        answers: Mutex<VecDeque<Result<Vec<IpAddr>>>>,
+        answers: Mutex<VecDeque<Result<Vec<ResolvedAddress>>>>,
         calls: Mutex<Vec<(String, u16)>>,
     }
     impl FakeResolver {
-        fn new(answers: Vec<Result<Vec<IpAddr>>>) -> Self {
+        fn new(answers: Vec<Result<Vec<ResolvedAddress>>>) -> Self {
             Self {
                 answers: Mutex::new(answers.into()),
                 calls: Mutex::new(Vec::new()),
@@ -637,16 +654,61 @@ mod tests {
             Box::pin(async move { stream.ok_or_else(|| anyhow!("missing test stream")) })
         }
     }
+    struct ScriptedDialer {
+        calls: Mutex<Vec<SocketAddr>>,
+        results: Mutex<VecDeque<Result<PublicStream>>>,
+    }
+    impl ScriptedDialer {
+        fn new(results: Vec<Result<PublicStream>>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                results: Mutex::new(results.into()),
+            }
+        }
+    }
+    impl NumericDialer for ScriptedDialer {
+        fn dial(&self, address: SocketAddr) -> DialFuture {
+            self.calls.lock().unwrap().push(address);
+            let result = self.results.lock().unwrap().pop_front().unwrap();
+            Box::pin(async move { result })
+        }
+    }
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    struct DroppingResolver(Arc<AtomicBool>);
+    impl Resolver for DroppingResolver {
+        fn resolve(&self, _: String, _: u16) -> ResolveFuture {
+            let dropped = self.0.clone();
+            Box::pin(async move {
+                let _drop = DropFlag(dropped);
+                std::future::pending().await
+            })
+        }
+    }
+    struct DroppingDialer(Arc<AtomicBool>);
+    impl NumericDialer for DroppingDialer {
+        fn dial(&self, _: SocketAddr) -> DialFuture {
+            let dropped = self.0.clone();
+            Box::pin(async move {
+                let _drop = DropFlag(dropped);
+                std::future::pending().await
+            })
+        }
+    }
     fn public_target(value: &str) -> PublicTarget {
         let Target::PublicHttp(target) = classify(&hyper::Method::GET, value.as_bytes()) else {
             panic!("expected public target");
         };
         target
     }
-    fn parse_addresses(value: &str) -> Vec<IpAddr> {
+    fn parse_addresses(value: &str) -> Vec<ResolvedAddress> {
         value
             .split(',')
-            .map(|address| address.parse().unwrap())
+            .map(|address| ResolvedAddress::unscoped(address.parse().unwrap()))
             .collect()
     }
 
@@ -855,7 +917,7 @@ mod tests {
     fn classifies_the_address_fixture() {
         for row in include_str!("../../testdata/ip-addresses.tsv")
             .lines()
-            .filter(|row| !row.starts_with('#'))
+            .filter(|row| !row.is_empty() && !row.starts_with('#'))
         {
             let fields: Vec<_> = row.split('\t').collect();
             let [input, expected, dial] = fields.as_slice() else {
@@ -865,20 +927,38 @@ mod tests {
                 "empty answer set" => Vec::new(),
                 _ => parse_addresses(input),
             };
-            let result = validated_answers(answers);
-            assert_eq!(result.is_ok(), *expected == "allow", "{input}");
-            if let Ok(address) = result {
-                assert_eq!(address.0.to_string(), *dial);
+            let result = ValidatedAnswers::from_dns(answers);
+            let outcome = match &result {
+                Ok(_) => "allow",
+                Err(PublicConnectError::PolicyDenied) => "deny",
+                Err(PublicConnectError::Unavailable) => "bad-gateway",
+                Err(error) => panic!("unexpected fixture error {error:?}: {input}"),
+            };
+            assert_eq!(outcome, *expected, "{input}");
+            if let Ok(addresses) = result {
+                assert_eq!(
+                    addresses
+                        .0
+                        .iter()
+                        .map(|address| address.0.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    *dial
+                );
             }
         }
     }
 
     #[tokio::test]
-    async fn resolves_once_validates_all_answers_then_dials_first() {
+    async fn resolves_once_and_retains_the_validated_answer_set() {
         let resolver = Arc::new(FakeResolver::new(vec![Ok(parse_addresses(
             "8.8.8.8,1.1.1.1",
         ))]));
-        let dialer = Arc::new(FakeDialer::success());
+        let (stream, _) = tokio::io::duplex(1);
+        let dialer = Arc::new(ScriptedDialer::new(vec![
+            Err(anyhow!("first refused")),
+            Ok(PublicStream::Test(stream)),
+        ]));
         let connector = PublicConnector::new(resolver.clone(), dialer.clone());
         let _stream = connector
             .open(public_target("http://API.Example.COM.:0080/"))
@@ -890,7 +970,7 @@ mod tests {
         );
         assert_eq!(
             *dialer.calls.lock().unwrap(),
-            vec!["8.8.8.8:80".parse().unwrap()]
+            vec!["8.8.8.8:80".parse().unwrap(), "1.1.1.1:80".parse().unwrap()]
         );
     }
 
@@ -914,20 +994,27 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_answers_never_dial() {
-        for answers in [
-            Vec::new(),
-            parse_addresses("8.8.8.8,127.0.0.1"),
-            parse_addresses("8.8.8.8,::ffff:0:127.0.0.1"),
-            parse_addresses("::1"),
+        for (answers, expected) in [
+            (Vec::new(), PublicConnectError::Unavailable),
+            (
+                parse_addresses("8.8.8.8,127.0.0.1"),
+                PublicConnectError::PolicyDenied,
+            ),
+            (
+                parse_addresses("8.8.8.8,::ffff:8.8.8.8"),
+                PublicConnectError::PolicyDenied,
+            ),
+            (parse_addresses("::1"), PublicConnectError::PolicyDenied),
         ] {
             let resolver = Arc::new(FakeResolver::new(vec![Ok(answers)]));
             let dialer = Arc::new(FakeDialer::success());
             let connector = PublicConnector::new(resolver.clone(), dialer.clone());
-            assert!(
+            assert_eq!(
                 connector
                     .open(public_target("http://allowed.example/"))
                     .await
-                    .is_err()
+                    .unwrap_err(),
+                expected
             );
             assert_eq!(resolver.calls.lock().unwrap().len(), 1);
             assert!(dialer.calls.lock().unwrap().is_empty());
@@ -935,77 +1022,258 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mapped_public_address_dials_ipv4() {
-        let resolver = Arc::new(FakeResolver::new(vec![Ok(parse_addresses(
-            "::ffff:8.8.8.8",
-        ))]));
+    async fn literal_skips_resolution_and_uses_the_same_boundary() {
+        let resolver = Arc::new(FakeResolver::new(Vec::new()));
         let dialer = Arc::new(FakeDialer::success());
-        let connector = PublicConnector::new(resolver, dialer.clone());
+        let connector = PublicConnector::new(resolver.clone(), dialer.clone());
         let _stream = connector
-            .open(public_target("http://allowed.example/"))
+            .open(public_target("http://8.8.8.8/"))
             .await
             .unwrap();
+        assert!(resolver.calls.lock().unwrap().is_empty());
         assert_eq!(
             *dialer.calls.lock().unwrap(),
             vec!["8.8.8.8:80".parse().unwrap()]
         );
+
+        let dialer = Arc::new(FakeDialer::success());
+        let connector = PublicConnector::new(resolver.clone(), dialer.clone());
+        assert_eq!(
+            connector
+                .open(public_target("http://[2001:db8::1]/"))
+                .await
+                .unwrap_err(),
+            PublicConnectError::PolicyDenied
+        );
+        assert!(resolver.calls.lock().unwrap().is_empty());
+        assert!(dialer.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn resolver_and_dial_failures_are_bounded() {
+    async fn scoped_and_mapped_literals_reach_the_boundary_without_network_work() {
+        for target in ["http://[fe80::1%25en0]/", "http://[::ffff:8.8.8.8]/"] {
+            let resolver = Arc::new(FakeResolver::new(Vec::new()));
+            let dialer = Arc::new(FakeDialer::success());
+            let connector = PublicConnector::new(resolver.clone(), dialer.clone());
+            assert_eq!(
+                connector.open(public_target(target)).await.unwrap_err(),
+                PublicConnectError::PolicyDenied,
+                "{target}"
+            );
+            assert!(resolver.calls.lock().unwrap().is_empty(), "{target}");
+            assert!(dialer.calls.lock().unwrap().is_empty(), "{target}");
+        }
+    }
+
+    #[test]
+    fn dns_answer_count_accepts_one_through_sixty_four_only() {
+        for (count, expected) in [
+            (0, Err(PublicConnectError::Unavailable)),
+            (1, Ok(())),
+            (64, Ok(())),
+            (65, Err(PublicConnectError::PolicyDenied)),
+        ] {
+            let result = ValidatedAnswers::from_dns(vec![
+                ResolvedAddress::unscoped(
+                    "8.8.8.8".parse().unwrap()
+                );
+                count
+            ])
+            .map(|_| ());
+            assert_eq!(result, expected, "answer count {count}");
+        }
+    }
+
+    #[test]
+    fn scoped_dns_answers_are_denied_without_reinterpretation() {
+        assert_eq!(
+            ValidatedAnswers::from_dns(vec![ResolvedAddress::scoped(
+                "2606:4700:4700::1111".parse().unwrap(),
+                4,
+            )]),
+            Err(PublicConnectError::PolicyDenied)
+        );
+    }
+
+    #[tokio::test]
+    async fn refusal_falls_back_across_address_families() {
+        let resolver = Arc::new(FakeResolver::new(vec![Ok(parse_addresses(
+            "2606:4700:4700::1111,8.8.8.8",
+        ))]));
+        let (stream, _) = tokio::io::duplex(1);
+        let dialer = Arc::new(ScriptedDialer::new(vec![
+            Err(anyhow!("IPv6 refused")),
+            Ok(PublicStream::Test(stream)),
+        ]));
+        let connector = PublicConnector::new(resolver.clone(), dialer.clone());
+
+        connector
+            .open(public_target("http://allowed.example:8080/"))
+            .await
+            .unwrap();
+
+        assert_eq!(resolver.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            *dialer.calls.lock().unwrap(),
+            vec![
+                "[2606:4700:4700::1111]:8080".parse().unwrap(),
+                "8.8.8.8:8080".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolution_failure_and_exhausted_refusals_are_bad_gateway() {
         let resolver = Arc::new(FakeResolver::new(vec![Err(anyhow!("resolver input"))]));
         let dialer = Arc::new(FakeDialer::success());
         let connector = PublicConnector::new(resolver, dialer.clone());
-        assert!(
+        assert_eq!(
             connector
                 .open(public_target("http://allowed.example/"))
                 .await
-                .is_err()
+                .unwrap_err(),
+            PublicConnectError::Unavailable
         );
         assert!(dialer.calls.lock().unwrap().is_empty());
 
-        let resolver = Arc::new(FakeResolver::new(vec![Ok(parse_addresses("8.8.8.8"))]));
-        let dialer = Arc::new(FakeDialer {
-            calls: Mutex::new(Vec::new()),
-            result: Mutex::new(Some(Err(anyhow!("dial input")))),
-        });
+        let resolver = Arc::new(FakeResolver::new(vec![Ok(parse_addresses(
+            "8.8.8.8,1.1.1.1",
+        ))]));
+        let dialer = Arc::new(ScriptedDialer::new(vec![
+            Err(anyhow!("first refused")),
+            Err(anyhow!("second refused")),
+        ]));
         let connector = PublicConnector::new(resolver, dialer.clone());
-        assert!(
+        assert_eq!(
             connector
                 .open(public_target("http://allowed.example/"))
                 .await
-                .is_err()
+                .unwrap_err(),
+            PublicConnectError::Unavailable
         );
-        assert_eq!(dialer.calls.lock().unwrap().len(), 1);
+        assert_eq!(dialer.calls.lock().unwrap().len(), 2);
+    }
 
+    #[tokio::test(start_paused = true)]
+    async fn resolution_and_every_dial_share_one_deadline() {
+        struct SlowResolver;
+        impl Resolver for SlowResolver {
+            fn resolve(&self, _: String, _: u16) -> ResolveFuture {
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_secs(6)).await;
+                    Ok(parse_addresses("8.8.8.8,1.1.1.1"))
+                })
+            }
+        }
+        struct SlowDialer {
+            calls: Arc<Mutex<Vec<(SocketAddr, Duration)>>>,
+            started: Instant,
+        }
+        impl NumericDialer for SlowDialer {
+            fn dial(&self, address: SocketAddr) -> DialFuture {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((address, self.started.elapsed()));
+                let attempt = self.calls.lock().unwrap().len();
+                Box::pin(async move {
+                    if attempt == 1 {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        Err(anyhow!("first refused"))
+                    } else {
+                        std::future::pending().await
+                    }
+                })
+            }
+        }
         let resolver = Arc::new(PendingResolver);
-        let dialer = Arc::new(FakeDialer::success());
-        assert!(
-            PublicConnector::open_with_deadlines(
-                resolver,
-                dialer.clone(),
-                public_target("http://allowed.example/"),
-                Duration::from_millis(1),
-                Duration::from_millis(1),
-            )
-            .await
-            .is_err()
-        );
-        assert!(dialer.calls.lock().unwrap().is_empty());
-
-        let resolver = Arc::new(FakeResolver::new(vec![Ok(parse_addresses("8.8.8.8"))]));
         let dialer = Arc::new(PendingDialer);
-        assert!(
-            PublicConnector::open_with_deadlines(
+        let cancellation = Shutdown::new();
+        let started = Instant::now();
+        assert_eq!(
+            PublicConnector::open_with_budget(
                 resolver,
                 dialer,
                 public_target("http://allowed.example/"),
-                Duration::from_millis(1),
-                Duration::from_millis(1),
+                &cancellation,
+                Duration::from_secs(10),
             )
             .await
-            .is_err()
+            .unwrap_err(),
+            PublicConnectError::DeadlineExceeded
         );
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let started = Instant::now();
+        let error = PublicConnector::open_with_budget(
+            Arc::new(SlowResolver),
+            Arc::new(SlowDialer {
+                calls: calls.clone(),
+                started,
+            }),
+            public_target("http://allowed.example/"),
+            &cancellation,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, PublicConnectError::DeadlineExceeded);
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                ("8.8.8.8:80".parse().unwrap(), Duration::from_secs(6)),
+                ("1.1.1.1:80".parse().unwrap(), Duration::from_secs(9)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_resolution_and_current_dial_futures() {
+        let resolver_dropped = Arc::new(AtomicBool::new(false));
+        let cancellation = Shutdown::new();
+        let task_cancellation = cancellation.clone();
+        let task_resolver_dropped = resolver_dropped.clone();
+        let task = tokio::spawn(async move {
+            PublicConnector::open_with_budget(
+                Arc::new(DroppingResolver(task_resolver_dropped)),
+                Arc::new(FakeDialer::success()),
+                public_target("http://allowed.example/"),
+                &task_cancellation,
+                Duration::from_secs(30),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        cancellation.request();
+        assert_eq!(
+            task.await.unwrap().unwrap_err(),
+            PublicConnectError::Cancelled
+        );
+        assert!(resolver_dropped.load(Ordering::SeqCst));
+
+        let dial_dropped = Arc::new(AtomicBool::new(false));
+        let cancellation = Shutdown::new();
+        let task_cancellation = cancellation.clone();
+        let task_dial_dropped = dial_dropped.clone();
+        let task = tokio::spawn(async move {
+            PublicConnector::open_with_budget(
+                Arc::new(FakeResolver::new(vec![Ok(parse_addresses("8.8.8.8"))])),
+                Arc::new(DroppingDialer(task_dial_dropped)),
+                public_target("http://allowed.example/"),
+                &task_cancellation,
+                Duration::from_secs(30),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        cancellation.request();
+        assert_eq!(
+            task.await.unwrap().unwrap_err(),
+            PublicConnectError::Cancelled
+        );
+        assert!(dial_dropped.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1013,8 +1281,12 @@ mod tests {
         let first = OriginKey::from_target(&public_target("http://API.Example.COM.:0080/"));
         let same = OriginKey::from_target(&public_target("http://api.example.com/"));
         let port = OriginKey::from_target(&public_target("http://api.example.com:81/"));
+        let unscoped = OriginKey::from_target(&public_target("http://[2606:4700:4700::1111]/"));
+        let scoped =
+            OriginKey::from_target(&public_target("http://[2606:4700:4700::1111%25eth0]/"));
         assert_eq!(first, same);
         assert_ne!(first, port);
+        assert_ne!(unscoped, scoped);
     }
 
     #[test]
