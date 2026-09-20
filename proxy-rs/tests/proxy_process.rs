@@ -23,6 +23,7 @@ const ACCEPT_DEADLINE: Duration = Duration::from_secs(10);
 const SCENARIO_DEADLINE: Duration = Duration::from_secs(20);
 const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const START_ATTEMPTS: usize = 5;
+const POLICY_LIMIT: usize = 1024 * 1024;
 const PROXY_ENV_VARS: &[&str] = &[
     "VHRN_ALLOWLISTS",
     "VHRN_ALLOWLIST",
@@ -486,6 +487,29 @@ async fn request(address: SocketAddr, bytes: &[u8]) -> String {
     .expect("request deadline")
 }
 
+async fn read_http_response(stream: &mut TcpStream) -> String {
+    let mut response = read_through(stream, b"\r\n\r\n").await;
+    let headers = String::from_utf8(response.clone()).expect("HTTP response headers are text");
+    let fields = header_fields(&headers);
+    let length = header_value(&fields, "content-length")
+        .expect("test response has Content-Length")
+        .parse::<usize>()
+        .expect("test response Content-Length is numeric");
+    let mut body = vec![0_u8; length];
+    timeout(DEADLINE, stream.read_exact(&mut body))
+        .await
+        .expect("response body deadline")
+        .expect("response body");
+    response.extend_from_slice(&body);
+    String::from_utf8(response).expect("HTTP response is text")
+}
+
+fn atomic_replace(path: &std::path::Path, contents: &[u8]) {
+    let replacement = path.with_extension("process-replacement");
+    std::fs::write(&replacement, contents).expect("write replacement");
+    std::fs::rename(replacement, path).expect("publish replacement");
+}
+
 async fn scenario(future: impl Future<Output = ()>) {
     timeout(SCENARIO_DEADLINE, future)
         .await
@@ -666,6 +690,61 @@ async fn policy_modes_and_live_replacement_are_observed_per_request() {
     std::fs::write(&proxy.policy, "\n").expect("replace policy");
     let denied = proxy.request("GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\nConnection: close\r\n\r\n").await;
     assert_eq!(status(&denied), 403);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn persistent_client_reopens_bounded_policy_and_observes_atomic_repair() {
+    scenario(async {
+        let proxy = Proxy::start(None).await;
+        let mut client = TcpStream::connect(proxy.address)
+            .await
+            .expect("persistent client connect");
+        let request = b"GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\n\r\n";
+
+        let mut exact = b"allowed.example\n".to_vec();
+        while exact.len() < POLICY_LIMIT {
+            exact.extend_from_slice(b"a\n");
+        }
+        assert_eq!(exact.len(), POLICY_LIMIT);
+        atomic_replace(&proxy.policy, &exact);
+        client
+            .write_all(request)
+            .await
+            .expect("exact-limit request");
+        assert_eq!(
+            status(&read_http_response(&mut client).await),
+            502,
+            "an exact-limit policy retains its matching grant"
+        );
+
+        let mut oversized = exact;
+        oversized.push(b'a');
+        assert_eq!(oversized.len(), POLICY_LIMIT + 1);
+        atomic_replace(&proxy.policy, &oversized);
+        client.write_all(request).await.expect("oversized request");
+        assert_eq!(
+            status(&read_http_response(&mut client).await),
+            403,
+            "an oversized policy fails the decision closed"
+        );
+
+        atomic_replace(&proxy.policy, b"allowed.example\n");
+        client.write_all(request).await.expect("repaired request");
+        assert_eq!(
+            status(&read_http_response(&mut client).await),
+            502,
+            "atomic repair is live without restarting the process or client"
+        );
+
+        atomic_replace(&proxy.policy, b"other.example\n");
+        client.write_all(request).await.expect("revoked request");
+        assert_eq!(
+            status(&read_http_response(&mut client).await),
+            403,
+            "a later atomic replacement revokes the grant on the same client"
+        );
     })
     .await;
 }

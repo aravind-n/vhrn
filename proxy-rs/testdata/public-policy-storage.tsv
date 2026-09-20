@@ -1,0 +1,20 @@
+# canonical persisted entry<TAB>outcome
+example.com	accept
+sub.example.com	accept
+_service.example	accept
+-edge.example	accept
+edge-.example	accept
+8.8.8.8	accept
+01.2.3.4	accept
+github.COM	reject
+*.example.com	reject
+.example.com	reject
+example.com.	reject
+example..com	reject
+example com	reject
+ example.com	reject
+example.com 	reject
+https://example.com	reject
+---	reject
+_	reject
+2606:4700:4700::1111	reject
