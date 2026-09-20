@@ -23,7 +23,9 @@ pub(crate) enum ProxyFailure {
     LocalDenied(String),
     HttpsRequiresConnect,
     ReportLogUnavailable,
+    ServiceUnavailable,
     BadGateway,
+    GatewayTimeout,
 }
 
 impl ProxyFailure {
@@ -60,12 +62,17 @@ impl ProxyFailure {
                 "HTTPS requires CONNECT\n".to_owned(),
                 true,
             ),
-            Self::ReportLogUnavailable => (
+            Self::ReportLogUnavailable | Self::ServiceUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "proxy temporarily unavailable\n".to_owned(),
                 true,
             ),
             Self::BadGateway => (StatusCode::BAD_GATEWAY, "bad gateway\n".to_owned(), false),
+            Self::GatewayTimeout => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "gateway timeout\n".to_owned(),
+                false,
+            ),
         }
     }
 }
@@ -395,9 +402,21 @@ mod tests {
                 true,
             ),
             (
+                ProxyFailure::ServiceUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "proxy temporarily unavailable\n",
+                true,
+            ),
+            (
                 ProxyFailure::BadGateway,
                 StatusCode::BAD_GATEWAY,
                 "bad gateway\n",
+                false,
+            ),
+            (
+                ProxyFailure::GatewayTimeout,
+                StatusCode::GATEWAY_TIMEOUT,
+                "gateway timeout\n",
                 false,
             ),
         ];

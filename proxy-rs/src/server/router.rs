@@ -17,7 +17,10 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
 
 use crate::{
     config::Config,
-    connect::{broker::BrokerConnector, public::PublicConnector},
+    connect::{
+        broker::BrokerConnector,
+        public::{PublicConnectError, PublicConnector},
+    },
     diagnostics::{AuditResult, AuditService, DenialDestination, Health, HealthService, report},
     domain::{
         policy::{Mode, decide_local, decide_public},
@@ -46,7 +49,6 @@ pub(crate) struct RequestContext {
     pub(crate) config: Config,
     pub(crate) public: PublicConnector,
     pub(crate) local: Option<BrokerConnector>,
-    #[cfg(test)]
     pub(crate) shutdown: crate::Shutdown,
     audit: AuditService,
     health: Arc<HealthService>,
@@ -91,13 +93,10 @@ impl RequestContext {
         audit: AuditService,
         health: Arc<HealthService>,
     ) -> Self {
-        #[cfg(not(test))]
-        let _ = shutdown;
         Self {
             config,
             public,
             local,
-            #[cfg(test)]
             shutdown: shutdown.clone(),
             audit,
             health,
@@ -118,10 +117,16 @@ use crate::domain::target::classify_parsed;
 enum AuthorizedRoute {
     Direct(DirectTarget),
     Asterisk,
-    PublicHttp(PublicTarget),
+    PublicHttp(AuthorizedPublic),
     LocalHttp(LocalTarget),
-    PublicConnect(PublicTarget),
+    PublicConnect(AuthorizedPublic),
     LocalConnect(LocalTarget),
+}
+
+struct AuthorizedPublic {
+    target: PublicTarget,
+    effective_mode: Mode,
+    already_audited: bool,
 }
 
 pub(crate) struct Http1Outcome {
@@ -261,13 +266,13 @@ pub(crate) async fn connect_http1(
 ) -> Result<BoxTunnel, ProxyFailure> {
     let target = classify(&head.method, &head.raw_target);
     match authorize(target, context).await? {
-        AuthorizedRoute::PublicConnect(target) => match context.public.connect_target(target).await
+        AuthorizedRoute::PublicConnect(public) => match context
+            .public
+            .connect_target(public.target.clone(), &context.shutdown)
+            .await
         {
             Ok(stream) => Ok(Box::new(stream)),
-            Err(error) => {
-                report(&error);
-                Err(ProxyFailure::BadGateway)
-            }
+            Err(error) => Err(public_failure(error, &public, context).await),
         },
         AuthorizedRoute::LocalConnect(target) => match &context.local {
             Some(connector) => match connector.connect(target.canonical_authority()).await {
@@ -361,16 +366,17 @@ async fn handle_connect<B>(
     }
     let target = classify_parsed(request.method(), request.uri());
     match authorize(target, &context).await {
-        Ok(AuthorizedRoute::PublicConnect(target)) => {
-            match context.public.connect_target(target).await {
+        Ok(AuthorizedRoute::PublicConnect(public)) => {
+            match context
+                .public
+                .connect_target(public.target.clone(), &context.shutdown)
+                .await
+            {
                 Ok(value) => {
                     spawn_tunnel(request, value, context.shutdown.clone(), tunnels.clone()).await;
                     fixed(StatusCode::OK, None, "")
                 }
-                Err(error) => {
-                    report(&error);
-                    failure(ProxyFailure::BadGateway, false)
-                }
+                Err(error) => failure(public_failure(error, &public, &context).await, false),
             }
         }
         Ok(AuthorizedRoute::LocalConnect(target)) => match &context.local {
@@ -463,7 +469,8 @@ async fn authorize_public(
         record_best_effort(context, &target, decision.effective_mode).await;
         return Err(ProxyFailure::PublicDenied(target.host().to_string()));
     }
-    if decision.record_denial {
+    let already_audited = decision.record_denial;
+    if already_audited {
         match record(context, &target, decision.effective_mode).await {
             AuditResult::AppendFailed => {
                 report(&"denial_log_append_failed");
@@ -473,9 +480,19 @@ async fn authorize_public(
         }
     }
     if connect {
-        Ok(AuthorizedRoute::PublicConnect(target))
+        let public = AuthorizedPublic {
+            target,
+            effective_mode: decision.effective_mode,
+            already_audited,
+        };
+        Ok(AuthorizedRoute::PublicConnect(public))
     } else {
-        Ok(AuthorizedRoute::PublicHttp(target))
+        let public = AuthorizedPublic {
+            target,
+            effective_mode: decision.effective_mode,
+            already_audited,
+        };
+        Ok(AuthorizedRoute::PublicHttp(public))
     }
 }
 
@@ -520,12 +537,13 @@ async fn dispatch(
     head: bool,
 ) -> Response<ProxyBody> {
     match route {
-        AuthorizedRoute::PublicHttp(target) => match context.public.send(target, request).await {
+        AuthorizedRoute::PublicHttp(public) => match context
+            .public
+            .send(public.target.clone(), request, &context.shutdown)
+            .await
+        {
             Ok(value) => origin(value, head),
-            Err(error) => {
-                report(&error);
-                failure(ProxyFailure::BadGateway, head)
-            }
+            Err(error) => failure(public_failure(error, &public, &context).await, head),
         },
         AuthorizedRoute::LocalHttp(target) => match &context.local {
             Some(connector) => match connector.http(target.canonical_authority(), request).await {
@@ -544,6 +562,29 @@ async fn dispatch(
         | AuthorizedRoute::Asterisk
         | AuthorizedRoute::PublicConnect(_)
         | AuthorizedRoute::LocalConnect(_) => failure(ProxyFailure::BadRequest, head),
+    }
+}
+
+async fn public_failure(
+    error: PublicConnectError,
+    public: &AuthorizedPublic,
+    context: &RequestContext,
+) -> ProxyFailure {
+    if error.is_policy_denial() {
+        if !public.already_audited {
+            record_best_effort(context, &public.target, public.effective_mode).await;
+        }
+        ProxyFailure::PublicDenied(public.target.host().to_string())
+    } else {
+        report(&error);
+        match error {
+            PublicConnectError::DeadlineExceeded => ProxyFailure::GatewayTimeout,
+            PublicConnectError::Cancelled => ProxyFailure::ServiceUnavailable,
+            PublicConnectError::Unavailable | PublicConnectError::OriginFailure => {
+                ProxyFailure::BadGateway
+            }
+            PublicConnectError::PolicyDenied => unreachable!("handled above"),
+        }
     }
 }
 async fn direct(
@@ -688,18 +729,20 @@ async fn record_best_effort<T: Into<DenialDestination>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connect::public::{DialFuture, NumericDialer, ResolveFuture, Resolver};
+    use crate::connect::public::{
+        DialFuture, NumericDialer, PublicStream, ResolveFuture, ResolvedAddress, Resolver,
+    };
     use std::{
         convert::Infallible,
         net::SocketAddr,
         pin::Pin,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll},
     };
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct PanicOnPoll(Arc<AtomicUsize>);
 
@@ -723,7 +766,36 @@ mod tests {
     impl Resolver for CountingResolver {
         fn resolve(&self, _: String, _: u16) -> ResolveFuture {
             self.0.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(vec!["8.8.8.8".parse().unwrap()]) })
+            Box::pin(async { Ok(vec![ResolvedAddress::unscoped("8.8.8.8".parse().unwrap())]) })
+        }
+    }
+
+    struct StaticResolver {
+        calls: Arc<AtomicUsize>,
+        answers: Vec<ResolvedAddress>,
+    }
+
+    impl Resolver for StaticResolver {
+        fn resolve(&self, _: String, _: u16) -> ResolveFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let answers = self.answers.clone();
+            Box::pin(async move { Ok(answers) })
+        }
+    }
+
+    struct FailedResolver;
+
+    impl Resolver for FailedResolver {
+        fn resolve(&self, _: String, _: u16) -> ResolveFuture {
+            Box::pin(async { Err(anyhow::anyhow!("test resolution failure")) })
+        }
+    }
+
+    struct PendingResolver;
+
+    impl Resolver for PendingResolver {
+        fn resolve(&self, _: String, _: u16) -> ResolveFuture {
+            Box::pin(std::future::pending())
         }
     }
 
@@ -732,6 +804,28 @@ mod tests {
     impl NumericDialer for UnusedDialer {
         fn dial(&self, _: SocketAddr) -> DialFuture {
             Box::pin(async { panic!("report-mode audit failure must not dial") })
+        }
+    }
+
+    struct FailedDialer(Arc<AtomicUsize>);
+
+    impl NumericDialer for FailedDialer {
+        fn dial(&self, _: SocketAddr) -> DialFuture {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(anyhow::anyhow!("test refusal")) })
+        }
+    }
+
+    struct OneStreamDialer {
+        calls: Arc<AtomicUsize>,
+        stream: Mutex<Option<PublicStream>>,
+    }
+
+    impl NumericDialer for OneStreamDialer {
+        fn dial(&self, _: SocketAddr) -> DialFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let stream = self.stream.lock().unwrap().take();
+            Box::pin(async move { stream.ok_or_else(|| anyhow::anyhow!("unexpected second dial")) })
         }
     }
 
@@ -756,6 +850,15 @@ mod tests {
         mode: &std::path::Path,
         deny_log: Option<&std::path::Path>,
     ) -> Arc<RequestContext> {
+        context_with_public(allowlist, mode, deny_log, PublicConnector::system())
+    }
+
+    fn context_with_public(
+        allowlist: &std::path::Path,
+        mode: &std::path::Path,
+        deny_log: Option<&std::path::Path>,
+        public: PublicConnector,
+    ) -> Arc<RequestContext> {
         let config = Config::resolve(|name| match name {
             "VHRN_ALLOWLIST" => Some(allowlist.display().to_string()),
             "VHRN_MODE_FILE" => Some(mode.display().to_string()),
@@ -766,7 +869,7 @@ mod tests {
         .unwrap();
         Arc::new(RequestContext::new(
             config,
-            PublicConnector::system(),
+            public,
             None,
             &crate::Shutdown::new(),
         ))
@@ -794,6 +897,385 @@ mod tests {
             response.into_body().collect().await.unwrap().to_bytes(),
             Bytes::from_static(b"blocked by vhrn egress policy: denied.example\n")
         );
+    }
+
+    #[tokio::test]
+    async fn unsafe_dns_answer_audits_once_and_never_dials() {
+        let directory = tempfile::tempdir().unwrap();
+        let allowlist = directory.path().join("allowlist");
+        let mode = directory.path().join("mode");
+        let deny_log = directory.path().join("denied");
+        std::fs::write(&allowlist, "allowed.example\n").unwrap();
+        std::fs::write(&mode, "enforce\n").unwrap();
+        std::fs::write(&deny_log, "").unwrap();
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let context = context_with_public(
+            &allowlist,
+            &mode,
+            Some(&deny_log),
+            PublicConnector::new(
+                Arc::new(StaticResolver {
+                    calls: resolves.clone(),
+                    answers: vec![
+                        ResolvedAddress::unscoped("8.8.8.8".parse().unwrap()),
+                        ResolvedAddress::unscoped("127.0.0.1".parse().unwrap()),
+                    ],
+                }),
+                Arc::new(UnusedDialer),
+            ),
+        );
+        let request = Request::builder()
+            .uri("http://ALLOWED.Example./")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let response = handle_http(request, context).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resolves.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"blocked by vhrn egress policy: allowed.example\n")
+        );
+        let records = std::fs::read_to_string(&deny_log).unwrap();
+        assert_eq!(records.lines().count(), 1);
+        assert!(records.ends_with("\tallowed.example\n"));
+    }
+
+    #[tokio::test]
+    async fn unsafe_literal_audits_once_without_resolution_or_dial() {
+        let directory = tempfile::tempdir().unwrap();
+        let allowlist = directory.path().join("allowlist");
+        let mode = directory.path().join("mode");
+        let deny_log = directory.path().join("denied");
+        std::fs::write(&allowlist, "10.0.0.1\n").unwrap();
+        std::fs::write(&mode, "open\n").unwrap();
+        std::fs::write(&deny_log, "").unwrap();
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let context = context_with_public(
+            &allowlist,
+            &mode,
+            Some(&deny_log),
+            PublicConnector::new(
+                Arc::new(StaticResolver {
+                    calls: resolves.clone(),
+                    answers: Vec::new(),
+                }),
+                Arc::new(UnusedDialer),
+            ),
+        );
+        let request = Request::builder()
+            .uri("http://10.0.0.1/")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let response = handle_http(request, context).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resolves.load(Ordering::SeqCst), 0);
+        let records = std::fs::read_to_string(&deny_log).unwrap();
+        assert_eq!(records.lines().count(), 1);
+        assert!(records.ends_with("\t10.0.0.1\n"));
+    }
+
+    #[tokio::test]
+    async fn mapped_and_scoped_http_literals_are_audited_403_without_network_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let allowlist = directory.path().join("allowlist");
+        let mode = directory.path().join("mode");
+        let deny_log = directory.path().join("denied");
+        std::fs::write(&allowlist, "").unwrap();
+        std::fs::write(&mode, "open\n").unwrap();
+
+        for (uri, expected_host) in [
+            ("http://[::ffff:8.8.8.8]/", "::ffff:8.8.8.8"),
+            ("http://[fe80::1%25eth0]/", "fe80::1"),
+        ] {
+            std::fs::write(&deny_log, "").unwrap();
+            let resolves = Arc::new(AtomicUsize::new(0));
+            let context = context_with_public(
+                &allowlist,
+                &mode,
+                Some(&deny_log),
+                PublicConnector::new(
+                    Arc::new(StaticResolver {
+                        calls: resolves.clone(),
+                        answers: Vec::new(),
+                    }),
+                    Arc::new(UnusedDialer),
+                ),
+            );
+            let request = Request::builder()
+                .uri(uri)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+
+            let response = handle_http(request, context).await;
+
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+            assert_eq!(resolves.load(Ordering::SeqCst), 0, "{uri}");
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                format!("blocked by vhrn egress policy: {expected_host}\n"),
+                "{uri}"
+            );
+            let records = std::fs::read_to_string(&deny_log).unwrap();
+            assert_eq!(records.lines().count(), 1, "{uri}");
+            assert!(records.ends_with(&format!("\t{expected_host}\n")), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_literal_cannot_reuse_an_unscoped_pooled_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let allowlist = directory.path().join("allowlist");
+        let mode = directory.path().join("mode");
+        let deny_log = directory.path().join("denied");
+        std::fs::write(&allowlist, "").unwrap();
+        std::fs::write(&mode, "open\n").unwrap();
+        std::fs::write(&deny_log, "").unwrap();
+
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let dials = Arc::new(AtomicUsize::new(0));
+        let (upstream, mut peer) = tokio::io::duplex(4096);
+        let context = context_with_public(
+            &allowlist,
+            &mode,
+            Some(&deny_log),
+            PublicConnector::new(
+                Arc::new(StaticResolver {
+                    calls: resolves.clone(),
+                    answers: Vec::new(),
+                }),
+                Arc::new(OneStreamDialer {
+                    calls: dials.clone(),
+                    stream: Mutex::new(Some(PublicStream::Test(upstream))),
+                }),
+            ),
+        );
+        let peer_task = tokio::spawn(async move {
+            let mut request = [0_u8; 1024];
+            let read = tokio::time::timeout(Duration::from_secs(1), peer.read(&mut request))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(read > 0);
+            peer.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+
+            tokio::time::timeout(Duration::from_millis(100), peer.read(&mut request))
+                .await
+                .is_err()
+        });
+
+        let first = handle_http(
+            Request::builder()
+                .uri("http://[2606:4700:4700::1111]/")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+            context.clone(),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::NO_CONTENT);
+        assert!(
+            first
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty()
+        );
+
+        let second = handle_http(
+            Request::builder()
+                .uri("http://[2606:4700:4700::1111%25eth0]/")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+            context.clone(),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resolves.load(Ordering::SeqCst), 0);
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+        assert!(peer_task.await.unwrap());
+        drop(context);
+        let records = std::fs::read_to_string(&deny_log).unwrap();
+        assert_eq!(records.lines().count(), 1);
+        assert!(records.ends_with("\t2606:4700:4700::1111\n"));
+    }
+
+    #[tokio::test]
+    async fn mapped_and_scoped_connect_literals_are_audited_403_without_network_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let allowlist = directory.path().join("allowlist");
+        let mode = directory.path().join("mode");
+        let deny_log = directory.path().join("denied");
+        std::fs::write(&allowlist, "").unwrap();
+        std::fs::write(&mode, "open\n").unwrap();
+
+        for (authority, expected_host) in [
+            ("[::ffff:8.8.8.8]:443", "::ffff:8.8.8.8"),
+            ("[fe80::1%25eth0]:443", "fe80::1"),
+        ] {
+            std::fs::write(&deny_log, "").unwrap();
+            let resolves = Arc::new(AtomicUsize::new(0));
+            let context = context_with_public(
+                &allowlist,
+                &mode,
+                Some(&deny_log),
+                PublicConnector::new(
+                    Arc::new(StaticResolver {
+                        calls: resolves.clone(),
+                        answers: Vec::new(),
+                    }),
+                    Arc::new(UnusedDialer),
+                ),
+            );
+            let mut request = Request::builder()
+                .method(Method::CONNECT)
+                .uri(authority)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let tunnels = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
+
+            let response = handle_connect(&mut request, context, tunnels.clone()).await;
+
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{authority}");
+            assert_eq!(resolves.load(Ordering::SeqCst), 0, "{authority}");
+            assert!(tunnels.lock().await.is_empty(), "{authority}");
+            let records = std::fs::read_to_string(&deny_log).unwrap();
+            assert_eq!(records.lines().count(), 1, "{authority}");
+            assert!(
+                records.ends_with(&format!("\t{expected_host}\n")),
+                "{authority}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn report_mode_address_denial_does_not_duplicate_its_prior_audit() {
+        let directory = tempfile::tempdir().unwrap();
+        let allowlist = directory.path().join("allowlist");
+        let mode = directory.path().join("mode");
+        let deny_log = directory.path().join("denied");
+        std::fs::write(&allowlist, "other.example\n").unwrap();
+        std::fs::write(&mode, "report\n").unwrap();
+        std::fs::write(&deny_log, "").unwrap();
+        let config = Config::resolve(|name| match name {
+            "VHRN_ALLOWLIST" => Some(allowlist.display().to_string()),
+            "VHRN_MODE_FILE" => Some(mode.display().to_string()),
+            "VHRN_PROXY_LISTEN" => Some("127.0.0.1:8080".to_owned()),
+            "VHRN_DENY_LOG" => Some(deny_log.display().to_string()),
+            _ => None,
+        })
+        .unwrap();
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let authorization = Arc::new(AuthorizationSpy::default());
+        let context = Arc::new(
+            RequestContext::new(
+                config,
+                PublicConnector::new(
+                    Arc::new(StaticResolver {
+                        calls: resolves.clone(),
+                        answers: vec![
+                            ResolvedAddress::unscoped("8.8.8.8".parse().unwrap()),
+                            ResolvedAddress::unscoped("127.0.0.1".parse().unwrap()),
+                        ],
+                    }),
+                    Arc::new(UnusedDialer),
+                ),
+                None,
+                &crate::Shutdown::new(),
+            )
+            .with_authorization_spy(authorization.clone()),
+        );
+        let request = Request::builder()
+            .uri("http://allowed.example/")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let response = handle_http(request, context).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resolves.load(Ordering::SeqCst), 1);
+        assert_eq!(authorization.audit_writes.load(Ordering::SeqCst), 1);
+        let records = std::fs::read_to_string(&deny_log).unwrap();
+        assert_eq!(records.lines().count(), 1);
+        assert!(records.ends_with("\tallowed.example\n"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transport_failures_map_without_denial_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let allowlist = directory.path().join("allowlist");
+        let mode = directory.path().join("mode");
+        let deny_log = directory.path().join("denied");
+        std::fs::write(&allowlist, "allowed.example\n").unwrap();
+        std::fs::write(&mode, "enforce\n").unwrap();
+
+        std::fs::write(&deny_log, "").unwrap();
+        let response = handle_http(
+            Request::builder()
+                .uri("http://allowed.example/")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+            context_with_public(
+                &allowlist,
+                &mode,
+                Some(&deny_log),
+                PublicConnector::new(Arc::new(FailedResolver), Arc::new(UnusedDialer)),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(std::fs::read_to_string(&deny_log).unwrap().is_empty());
+
+        std::fs::write(&deny_log, "").unwrap();
+        let dials = Arc::new(AtomicUsize::new(0));
+        let response = handle_http(
+            Request::builder()
+                .uri("http://allowed.example/")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+            context_with_public(
+                &allowlist,
+                &mode,
+                Some(&deny_log),
+                PublicConnector::new(
+                    Arc::new(StaticResolver {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        answers: vec![
+                            ResolvedAddress::unscoped("8.8.8.8".parse().unwrap()),
+                            ResolvedAddress::unscoped("1.1.1.1".parse().unwrap()),
+                        ],
+                    }),
+                    Arc::new(FailedDialer(dials.clone())),
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(dials.load(Ordering::SeqCst), 2);
+        assert!(std::fs::read_to_string(&deny_log).unwrap().is_empty());
+
+        std::fs::write(&deny_log, "").unwrap();
+        let response = handle_http(
+            Request::builder()
+                .uri("http://allowed.example/")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+            context_with_public(
+                &allowlist,
+                &mode,
+                Some(&deny_log),
+                PublicConnector::new(Arc::new(PendingResolver), Arc::new(UnusedDialer)),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(std::fs::read_to_string(&deny_log).unwrap().is_empty());
     }
 
     #[tokio::test]
