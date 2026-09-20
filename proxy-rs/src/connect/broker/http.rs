@@ -4,6 +4,7 @@ use super::protocol::{BrokerProtocol, BrokerStream, BrokerToken};
 #[cfg(test)]
 use super::protocol::{short_test_deadlines, test_connect_authority, test_connect_frame};
 
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,10 +22,8 @@ use hyper::StatusCode;
 use hyper::client::conn::http1;
 use hyper::{Request, Uri};
 use hyper_util::rt::TokioIo;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tokio_rustls::TlsConnector;
 
 use crate::connect::pool::IdlePool;
 #[cfg(test)]
@@ -40,7 +39,6 @@ pub(crate) struct BrokerConnector {
     pool: IdlePool<BrokerKey, BrokerConnection>,
     http_timeout: Duration,
     response_limit: usize,
-    tls_config: Arc<rustls::ClientConfig>,
     #[cfg(test)]
     active_drivers: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -49,7 +47,6 @@ pub(crate) struct BrokerConnector {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct BrokerKey {
-    secure: bool,
     authority: LoopbackAuthority,
 }
 
@@ -78,17 +75,12 @@ impl Drop for BrokerConnection {
 }
 
 impl BrokerConnector {
-    pub(crate) fn with_tls_config(
-        endpoint: impl Into<BrokerEndpoint>,
-        token: BrokerToken,
-        tls_config: Arc<rustls::ClientConfig>,
-    ) -> Self {
+    pub(crate) fn new(endpoint: impl Into<BrokerEndpoint>, token: BrokerToken) -> Self {
         Self {
             protocol: BrokerProtocol::new(endpoint, token),
             pool: IdlePool::new(),
             http_timeout: HTTP_TIMEOUT,
             response_limit: MAX_HTTP_RESPONSE_BYTES,
-            tls_config,
             #[cfg(test)]
             active_drivers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -127,8 +119,6 @@ impl BrokerConnector {
             ),
             http_timeout: HTTP_TIMEOUT,
             response_limit: MAX_HTTP_RESPONSE_BYTES,
-            tls_config: crate::connect::tls::production_client_config()
-                .expect("test TLS configuration"),
             active_drivers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             test_connect_stream: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -186,17 +176,15 @@ impl BrokerConnector {
     pub(crate) async fn http(
         &self,
         authority: &LoopbackAuthority,
-        secure: bool,
         request: Request<Full<Bytes>>,
     ) -> Result<BrokerResponse> {
         let key = BrokerKey {
-            secure,
             authority: authority.clone(),
         };
         let connection = self.pool.take_if_reusable(&key, broker_connection_reusable);
         let mut connection = match connection {
             Some(connection) => connection,
-            None => self.open_http(authority, secure).await?,
+            None => self.open_http(authority).await?,
         };
         let (mut parts, body) = request.into_parts();
         sanitize_hop_by_hop(&mut parts.headers);
@@ -231,26 +219,8 @@ impl BrokerConnector {
         })
     }
 
-    async fn open_http(
-        &self,
-        authority: &LoopbackAuthority,
-        secure: bool,
-    ) -> Result<BrokerConnection> {
+    async fn open_http(&self, authority: &LoopbackAuthority) -> Result<BrokerConnection> {
         let stream = self.connect(authority).await?;
-        let stream: Box<dyn AsyncReadWrite> = if secure {
-            let name = crate::connect::tls::local_server_name(authority)?;
-            Box::new(
-                timeout(
-                    HTTP_TIMEOUT,
-                    TlsConnector::from(self.tls_config.clone()).connect(name, stream),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("local TLS handshake timeout"))
-                .context("TLS handshake")??,
-            )
-        } else {
-            Box::new(stream)
-        };
         let (sender, connection) =
             timeout(self.http_timeout, http1::handshake(TokioIo::new(stream)))
                 .await
@@ -270,9 +240,6 @@ impl BrokerConnector {
         Ok(BrokerConnection { sender, driver })
     }
 }
-
-trait AsyncReadWrite: AsyncRead + AsyncWrite + Send + Unpin {}
-impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 
 #[cfg(test)]
 mod tests {
@@ -408,7 +375,6 @@ mod tests {
             let response = connector
                 .http(
                     authority,
-                    false,
                     authority_request(authority, &format!("/churn/{port}/0")),
                 )
                 .await
@@ -419,7 +385,6 @@ mod tests {
         let response = connector
             .http(
                 &authorities[1],
-                false,
                 authority_request(&authorities[1], "/churn/81/1"),
             )
             .await
@@ -429,7 +394,6 @@ mod tests {
         let response = connector
             .http(
                 &authorities[3],
-                false,
                 authority_request(&authorities[3], "/churn/83/0"),
             )
             .await
@@ -439,7 +403,6 @@ mod tests {
         let response = connector
             .http(
                 &authorities[4],
-                false,
                 authority_request(&authorities[4], "/churn/84/0"),
             )
             .await
@@ -481,10 +444,7 @@ mod tests {
             Duration::from_millis(20),
         );
         let authority = LoopbackAuthority::parse("localhost:80").unwrap();
-        let response = connector
-            .http(&authority, false, local_request())
-            .await
-            .unwrap();
+        let response = connector.http(&authority, local_request()).await.unwrap();
         response.body.collect().await.unwrap();
         wait_for_no_drivers(&connector).await;
         assert_eq!(connector.pool_len(), 0);
@@ -551,7 +511,7 @@ mod tests {
             .header("proxy-authorization", "ignored")
             .body(Full::new(Bytes::from_static(b"exact body")))
             .unwrap();
-        let mut response = connector.http(&authority, false, request).await.unwrap();
+        let mut response = connector.http(&authority, request).await.unwrap();
         let first = timeout(Duration::from_millis(100), response.body.frame())
             .await
             .unwrap()
@@ -568,7 +528,7 @@ mod tests {
             .uri("http://localhost:80/again")
             .body(Full::new(Bytes::new()))
             .unwrap();
-        let second = connector.http(&authority, false, second).await.unwrap();
+        let second = connector.http(&authority, second).await.unwrap();
         assert_eq!(second.status, StatusCode::NO_CONTENT);
         assert!(second.body.collect().await.unwrap().to_bytes().is_empty());
         assert_eq!(connector.pool_len(), 1);
@@ -611,10 +571,7 @@ mod tests {
         let connector =
             BrokerConnector::with_http_limits(address, token(), Duration::from_millis(100), 16);
         let authority = LoopbackAuthority::parse("localhost:80").unwrap();
-        let response = connector
-            .http(&authority, false, local_request())
-            .await
-            .unwrap();
+        let response = connector.http(&authority, local_request()).await.unwrap();
         drop(response);
         assert_eq!(connector.pool_len(), 0);
         server.await.unwrap();
@@ -644,10 +601,7 @@ mod tests {
         let connector =
             BrokerConnector::with_http_limits(address, token(), Duration::from_millis(100), 16);
         let authority = LoopbackAuthority::parse("localhost:80").unwrap();
-        let mut response = connector
-            .http(&authority, false, local_request())
-            .await
-            .unwrap();
+        let mut response = connector.http(&authority, local_request()).await.unwrap();
         assert!(
             response
                 .body
@@ -687,10 +641,7 @@ mod tests {
         let connector =
             BrokerConnector::with_http_limits(address, token(), Duration::from_millis(20), 16);
         let authority = LoopbackAuthority::parse("localhost:80").unwrap();
-        let mut response = connector
-            .http(&authority, false, local_request())
-            .await
-            .unwrap();
+        let mut response = connector.http(&authority, local_request()).await.unwrap();
         assert!(response.body.frame().await.unwrap().is_err());
         assert!(response.body.frame().await.is_none());
         assert_eq!(connector.pool_len(), 0);
@@ -720,10 +671,7 @@ mod tests {
         let connector =
             BrokerConnector::with_http_limits(address, token(), Duration::from_millis(100), 2);
         let authority = LoopbackAuthority::parse("localhost:80").unwrap();
-        let mut response = connector
-            .http(&authority, false, local_request())
-            .await
-            .unwrap();
+        let mut response = connector.http(&authority, local_request()).await.unwrap();
         assert!(response.body.frame().await.unwrap().is_err());
         assert!(response.body.frame().await.is_none());
         assert_eq!(connector.pool_len(), 0);

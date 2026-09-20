@@ -270,15 +270,14 @@ fn civil_time(seconds: u64) -> (i64, i64, i64, u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use hyper::{Method, Uri};
+    use hyper::Method;
     use tempfile::tempdir;
 
     use super::*;
     use crate::domain::target::{Target, classify};
 
     fn public_destination() -> DenialDestination {
-        let uri: Uri = "http://denied.example/".parse().unwrap();
-        let Target::PublicHttp(target) = classify(&Method::GET, &uri) else {
+        let Target::PublicHttp(target) = classify(&Method::GET, b"http://denied.example/") else {
             panic!("public target");
         };
         DenialDestination::public(&target)
@@ -482,14 +481,13 @@ mod tests {
 
     #[test]
     fn destinations_use_normalized_host_or_canonical_local_authority() {
-        let public_uri: Uri = "http://DENIED.EXAMPLE.:8080/".parse().unwrap();
-        let Target::PublicHttp(public) = classify(&Method::GET, &public_uri) else {
+        let Target::PublicHttp(public) = classify(&Method::GET, b"http://DENIED.EXAMPLE.:8080/")
+        else {
             panic!("public target");
         };
         assert_eq!(DenialDestination::public(&public).value, "denied.example");
 
-        let local_uri: Uri = "http://LOCALHOST:080/".parse().unwrap();
-        let Target::LocalHttp(local) = classify(&Method::GET, &local_uri) else {
+        let Target::LocalHttp(local) = classify(&Method::GET, b"http://LOCALHOST:080/") else {
             panic!("local target");
         };
         assert_eq!(DenialDestination::local(&local).value, "localhost:80");

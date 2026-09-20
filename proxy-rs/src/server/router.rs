@@ -16,9 +16,9 @@ use crate::{
     diagnostics::{AuditResult, AuditService, DenialDestination, Health, HealthService, report},
     domain::{
         policy::{Mode, decide_local, decide_public},
-        target::{LocalTarget, PublicTarget, Target, classify},
+        target::{DirectTarget, LocalTarget, PublicTarget, Target, classify_parsed},
     },
-    server::response::{ProxyBody, fixed, origin},
+    server::response::{ProxyBody, ProxyFailure, failure, fixed, origin, represented},
 };
 
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -30,7 +30,17 @@ pub(crate) struct RequestContext {
     pub(crate) shutdown: crate::Shutdown,
     audit: AuditService,
     health: Arc<HealthService>,
+    #[cfg(test)]
+    authorization_spy: Option<Arc<AuthorizationSpy>>,
 }
+
+#[cfg(test)]
+#[derive(Default)]
+struct AuthorizationSpy {
+    policy_reads: std::sync::atomic::AtomicUsize,
+    audit_writes: std::sync::atomic::AtomicUsize,
+}
+
 impl RequestContext {
     #[cfg(test)]
     pub(crate) fn new(
@@ -68,28 +78,24 @@ impl RequestContext {
             shutdown,
             audit,
             health,
+            #[cfg(test)]
+            authorization_spy: None,
         }
     }
-}
-enum HttpRoute {
-    Direct(String),
-    Public(PublicTarget),
-    Local(LocalTarget),
-    Malformed,
-}
-enum HeadDecision {
-    Forward(HttpRoute),
-    Respond(Response<ProxyBody>),
-}
-fn classify_http(method: &Method, uri: &hyper::Uri) -> HttpRoute {
-    match classify(method, uri) {
-        Target::Direct(v) => HttpRoute::Direct(v),
-        Target::PublicHttp(v) => HttpRoute::Public(v),
-        Target::LocalHttp(v) => HttpRoute::Local(v),
-        Target::Malformed | Target::PublicConnect(_) | Target::LocalConnect(_) => {
-            HttpRoute::Malformed
-        }
+
+    #[cfg(test)]
+    fn with_authorization_spy(mut self, spy: Arc<AuthorizationSpy>) -> Self {
+        self.authorization_spy = Some(spy);
+        self
     }
+}
+enum AuthorizedRoute {
+    Direct(DirectTarget),
+    Asterisk,
+    PublicHttp(PublicTarget),
+    LocalHttp(LocalTarget),
+    PublicConnect(PublicTarget),
+    LocalConnect(LocalTarget),
 }
 pub(crate) async fn handle(
     mut request: Request<Incoming>,
@@ -107,19 +113,28 @@ where
     B: Body<Data = Bytes> + Unpin,
 {
     let (parts, body) = request.into_parts();
-    match authorize(&parts, &context).await {
-        HeadDecision::Respond(response) => response,
-        HeadDecision::Forward(HttpRoute::Direct(path)) => direct(&path, &context).await,
-        HeadDecision::Forward(HttpRoute::Malformed) => {
-            fixed(StatusCode::BAD_REQUEST, None, "bad request\n")
-        }
-        HeadDecision::Forward(route) => {
+    let head = parts.method == Method::HEAD;
+    let target = classify_parsed(&parts.method, &parts.uri);
+    match authorize(target, &context).await {
+        Err(error) => failure(error, head),
+        Ok(AuthorizedRoute::Direct(target)) => direct(&parts.method, &target, &context).await,
+        Ok(AuthorizedRoute::Asterisk) => asterisk(&parts.method),
+        Ok(route @ (AuthorizedRoute::PublicHttp(_) | AuthorizedRoute::LocalHttp(_))) => {
             match collect_with_limits(body, BODY_TIMEOUT, MAX_BODY_BYTES).await {
                 Ok(body) => {
-                    dispatch(Request::from_parts(parts, Full::new(body)), route, context).await
+                    dispatch(
+                        Request::from_parts(parts, Full::new(body)),
+                        route,
+                        context,
+                        head,
+                    )
+                    .await
                 }
-                _ => fixed(StatusCode::BAD_REQUEST, None, "bad request\n"),
+                _ => failure(ProxyFailure::BadRequest, head),
             }
+        }
+        Ok(AuthorizedRoute::PublicConnect(_) | AuthorizedRoute::LocalConnect(_)) => {
+            failure(ProxyFailure::BadRequest, head)
         }
     }
 }
@@ -128,40 +143,15 @@ async fn handle_connect<B>(
     context: Arc<RequestContext>,
     tunnels: Arc<tokio::sync::Mutex<tokio::task::JoinSet<anyhow::Result<()>>>>,
 ) -> Response<ProxyBody> {
-    match classify(request.method(), request.uri()) {
-        Target::PublicConnect(target) => {
-            let decision = match decide_public(
-                context.config.allowlists.as_slice(),
-                &context.config.mode_file,
-                target.host(),
-            )
-            .await
-            {
-                Ok((value, warning)) => {
-                    if let Some(warning) = warning {
-                        report(&warning);
-                    }
-                    value
-                }
-                Err(error) => {
-                    report(&error);
-                    record_best_effort(&context, &target, Mode::Enforce).await;
-                    return fixed(StatusCode::FORBIDDEN, None, "forbidden\n");
-                }
-            };
-            if !decision.allowed {
-                record_best_effort(&context, &target, decision.effective_mode).await;
-                return fixed(StatusCode::FORBIDDEN, None, "forbidden\n");
-            }
-            if decision.record_denial {
-                match record(&context, &target, decision.effective_mode).await {
-                    AuditResult::AppendFailed => {
-                        report(&"denial_log_append_failed");
-                        return report_log_unavailable();
-                    }
-                    AuditResult::Recorded | AuditResult::Disabled => {}
-                }
-            }
+    if request.headers().contains_key(header::TRANSFER_ENCODING)
+        || request.headers().contains_key(header::EXPECT)
+        || request.headers().contains_key(header::CONTENT_LENGTH)
+    {
+        return failure(ProxyFailure::BadRequest, false);
+    }
+    let target = classify_parsed(request.method(), request.uri());
+    match authorize(target, &context).await {
+        Ok(AuthorizedRoute::PublicConnect(target)) => {
             match context.public.connect_target(target).await {
                 Ok(value) => {
                     spawn_tunnel(request, value, context.shutdown.clone(), tunnels.clone()).await;
@@ -169,40 +159,28 @@ async fn handle_connect<B>(
                 }
                 Err(error) => {
                     report(&error);
-                    fixed(StatusCode::BAD_GATEWAY, None, "bad gateway\n")
+                    failure(ProxyFailure::BadGateway, false)
                 }
             }
         }
-        Target::LocalConnect(target) => {
-            let allowed = match &context.config.local {
-                Some(local) => {
-                    decide_local(local.policy_paths.as_array(), target.canonical_authority()).await
+        Ok(AuthorizedRoute::LocalConnect(target)) => match &context.local {
+            Some(connector) => match connector.connect(target.canonical_authority()).await {
+                Ok(value) => {
+                    spawn_tunnel(request, value, context.shutdown.clone(), tunnels.clone()).await;
+                    fixed(StatusCode::OK, None, "")
                 }
-                None => Ok(false),
-            };
-            if !allowed.unwrap_or_else(|error| {
-                report(&error);
-                false
-            }) {
-                record_best_effort(&context, &target, Mode::Enforce).await;
-                return fixed(StatusCode::FORBIDDEN, None, "forbidden\n");
-            }
-            match &context.local {
-                Some(connector) => match connector.connect(target.canonical_authority()).await {
-                    Ok(value) => {
-                        spawn_tunnel(request, value, context.shutdown.clone(), tunnels.clone())
-                            .await;
-                        fixed(StatusCode::OK, None, "")
-                    }
-                    Err(error) => {
-                        report(&error);
-                        fixed(StatusCode::BAD_GATEWAY, None, "bad gateway\n")
-                    }
-                },
-                None => fixed(StatusCode::FORBIDDEN, None, "forbidden\n"),
-            }
-        }
-        _ => fixed(StatusCode::BAD_REQUEST, None, "bad request\n"),
+                Err(error) => {
+                    report(&error);
+                    failure(ProxyFailure::BadGateway, false)
+                }
+            },
+            None => failure(
+                ProxyFailure::LocalDenied(target.canonical_authority().to_string()),
+                false,
+            ),
+        },
+        Ok(_) => failure(ProxyFailure::BadRequest, false),
+        Err(error) => failure(error, false),
     }
 }
 async fn spawn_tunnel<B, S>(
@@ -227,113 +205,171 @@ async fn spawn_tunnel<B, S>(
         }
     });
 }
-async fn authorize(parts: &hyper::http::request::Parts, context: &RequestContext) -> HeadDecision {
-    let route = classify_http(&parts.method, &parts.uri);
-    match &route {
-        HttpRoute::Direct(_) if parts.method == Method::GET => HeadDecision::Forward(route),
-        HttpRoute::Direct(_) => {
-            HeadDecision::Respond(fixed(StatusCode::NOT_FOUND, None, "404 page not found\n"))
+async fn authorize(
+    target: Target,
+    context: &RequestContext,
+) -> Result<AuthorizedRoute, ProxyFailure> {
+    match target {
+        Target::Direct(target) => Ok(AuthorizedRoute::Direct(target)),
+        Target::Asterisk => Ok(AuthorizedRoute::Asterisk),
+        Target::HttpsAbsoluteRejected => Err(ProxyFailure::HttpsRequiresConnect),
+        Target::Malformed => Err(ProxyFailure::BadRequest),
+        Target::PublicHttp(target) => authorize_public(target, false, context).await,
+        Target::PublicConnect(target) => authorize_public(target, true, context).await,
+        Target::LocalHttp(target) => authorize_local(target, false, context).await,
+        Target::LocalConnect(target) => authorize_local(target, true, context).await,
+    }
+}
+
+async fn authorize_public(
+    target: PublicTarget,
+    connect: bool,
+    context: &RequestContext,
+) -> Result<AuthorizedRoute, ProxyFailure> {
+    #[cfg(test)]
+    if let Some(spy) = &context.authorization_spy {
+        spy.policy_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    let decision = decide_public(
+        context.config.allowlists.as_slice(),
+        &context.config.mode_file,
+        target.host(),
+    )
+    .await;
+    let (decision, warning) = match decision {
+        Ok(value) => value,
+        Err(error) => {
+            report(&error);
+            record_best_effort(context, &target, Mode::Enforce).await;
+            return Err(ProxyFailure::PublicDenied(target.host().to_string()));
         }
-        HttpRoute::Malformed => HeadDecision::Forward(route),
-        HttpRoute::Public(target) => {
-            let decision = match decide_public(
-                context.config.allowlists.as_slice(),
-                &context.config.mode_file,
-                target.host(),
-            )
-            .await
-            {
-                Ok((value, warning)) => {
-                    if let Some(warning) = warning {
-                        report(&warning);
-                    }
-                    value
-                }
+    };
+    if let Some(warning) = warning {
+        report(&warning);
+    }
+    if !decision.allowed {
+        record_best_effort(context, &target, decision.effective_mode).await;
+        return Err(ProxyFailure::PublicDenied(target.host().to_string()));
+    }
+    if decision.record_denial {
+        match record(context, &target, decision.effective_mode).await {
+            AuditResult::AppendFailed => {
+                report(&"denial_log_append_failed");
+                return Err(ProxyFailure::ReportLogUnavailable);
+            }
+            AuditResult::Recorded | AuditResult::Disabled => {}
+        }
+    }
+    if connect {
+        Ok(AuthorizedRoute::PublicConnect(target))
+    } else {
+        Ok(AuthorizedRoute::PublicHttp(target))
+    }
+}
+
+async fn authorize_local(
+    target: LocalTarget,
+    connect: bool,
+    context: &RequestContext,
+) -> Result<AuthorizedRoute, ProxyFailure> {
+    #[cfg(test)]
+    if let Some(spy) = &context.authorization_spy {
+        spy.policy_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    let allowed = match &context.config.local {
+        Some(local) => {
+            match decide_local(local.policy_paths.as_array(), target.canonical_authority()).await {
+                Ok(allowed) => allowed,
                 Err(error) => {
                     report(&error);
-                    record_best_effort(context, target, Mode::Enforce).await;
-                    return HeadDecision::Respond(fixed(
-                        StatusCode::FORBIDDEN,
-                        None,
-                        "forbidden\n",
-                    ));
-                }
-            };
-            if !decision.allowed {
-                record_best_effort(context, target, decision.effective_mode).await;
-                return HeadDecision::Respond(fixed(StatusCode::FORBIDDEN, None, "forbidden\n"));
-            }
-            if decision.record_denial {
-                match record(context, target, decision.effective_mode).await {
-                    AuditResult::AppendFailed => {
-                        report(&"denial_log_append_failed");
-                        return HeadDecision::Respond(report_log_unavailable());
-                    }
-                    AuditResult::Recorded | AuditResult::Disabled => {}
+                    false
                 }
             }
-            HeadDecision::Forward(route)
         }
-        HttpRoute::Local(target) => {
-            let result = match &context.config.local {
-                Some(local) => {
-                    decide_local(local.policy_paths.as_array(), target.canonical_authority()).await
-                }
-                None => Ok(false),
-            };
-            if !result.unwrap_or_else(|error| {
-                report(&error);
-                false
-            }) {
-                record_best_effort(context, target, Mode::Enforce).await;
-                return HeadDecision::Respond(fixed(StatusCode::FORBIDDEN, None, "forbidden\n"));
-            }
-            HeadDecision::Forward(route)
-        }
+        None => false,
+    };
+    if !allowed {
+        record_best_effort(context, &target, Mode::Enforce).await;
+        return Err(ProxyFailure::LocalDenied(
+            target.canonical_authority().to_string(),
+        ));
+    }
+    if connect {
+        Ok(AuthorizedRoute::LocalConnect(target))
+    } else {
+        Ok(AuthorizedRoute::LocalHttp(target))
     }
 }
 async fn dispatch(
     request: Request<Full<Bytes>>,
-    route: HttpRoute,
+    route: AuthorizedRoute,
     context: Arc<RequestContext>,
+    head: bool,
 ) -> Response<ProxyBody> {
     match route {
-        HttpRoute::Public(target) => match context.public.send(target, request).await {
-            Ok(value) => origin(value),
+        AuthorizedRoute::PublicHttp(target) => match context.public.send(target, request).await {
+            Ok(value) => origin(value, head),
             Err(error) => {
                 report(&error);
-                fixed(StatusCode::BAD_GATEWAY, None, "bad gateway\n")
+                failure(ProxyFailure::BadGateway, head)
             }
         },
-        HttpRoute::Local(target) => match &context.local {
-            Some(connector) => match connector
-                .http(target.canonical_authority(), target.secure(), request)
-                .await
-            {
-                Ok(value) => origin(value),
+        AuthorizedRoute::LocalHttp(target) => match &context.local {
+            Some(connector) => match connector.http(target.canonical_authority(), request).await {
+                Ok(value) => origin(value, head),
                 Err(error) => {
                     report(&error);
-                    fixed(StatusCode::BAD_GATEWAY, None, "bad gateway\n")
+                    failure(ProxyFailure::BadGateway, head)
                 }
             },
-            None => fixed(StatusCode::FORBIDDEN, None, "forbidden\n"),
+            None => failure(
+                ProxyFailure::LocalDenied(target.canonical_authority().to_string()),
+                head,
+            ),
         },
-        HttpRoute::Direct(_) | HttpRoute::Malformed => {
-            fixed(StatusCode::BAD_REQUEST, None, "bad request\n")
-        }
+        AuthorizedRoute::Direct(_)
+        | AuthorizedRoute::Asterisk
+        | AuthorizedRoute::PublicConnect(_)
+        | AuthorizedRoute::LocalConnect(_) => failure(ProxyFailure::BadRequest, head),
     }
 }
-async fn direct(path: &str, context: &RequestContext) -> Response<ProxyBody> {
+async fn direct(
+    method: &Method,
+    target: &DirectTarget,
+    context: &RequestContext,
+) -> Response<ProxyBody> {
+    let head = method == Method::HEAD;
+    let path = target.path_and_query();
+    if matches!(path, b"/healthz" | b"/__status") && method != Method::GET && !head {
+        let mut response = represented(
+            StatusCode::METHOD_NOT_ALLOWED,
+            Some("text/plain; charset=utf-8"),
+            "method not allowed\n",
+            false,
+        );
+        response
+            .headers_mut()
+            .insert(header::ALLOW, header::HeaderValue::from_static("GET, HEAD"));
+        return response;
+    }
     match path {
-        "/healthz" => match context.health.read().await {
-            Health::Healthy => fixed(StatusCode::OK, Some("text/plain; charset=utf-8"), "ok\n"),
-            Health::Unhealthy => fixed(
+        b"/healthz" => match context.health.read().await {
+            Health::Healthy => represented(
+                StatusCode::OK,
+                Some("text/plain; charset=utf-8"),
+                "ok\n",
+                head,
+            ),
+            Health::Unhealthy => represented(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Some("text/plain; charset=utf-8"),
                 "unhealthy\n",
+                head,
             ),
         },
-        "/__status" => {
+        b"/__status" => {
             let (mode, warning) = crate::domain::policy::effective_status_mode(
                 context.config.allowlists.as_slice(),
                 &context.config.mode_file,
@@ -342,14 +378,32 @@ async fn direct(path: &str, context: &RequestContext) -> Response<ProxyBody> {
             if let Some(warning) = warning {
                 report(&warning);
             }
-            fixed(
+            represented(
                 StatusCode::OK,
                 Some("application/json"),
                 &format!("{{\"mode\":\"{mode}\"}}\n"),
+                head,
             )
         }
-        _ => fixed(StatusCode::NOT_FOUND, None, "404 page not found\n"),
+        _ => represented(
+            StatusCode::NOT_FOUND,
+            Some("text/plain; charset=utf-8"),
+            "404 page not found\n",
+            head,
+        ),
     }
+}
+
+fn asterisk(method: &Method) -> Response<ProxyBody> {
+    if method != Method::OPTIONS {
+        return failure(ProxyFailure::BadRequest, method == Method::HEAD);
+    }
+    let mut response = fixed(StatusCode::NO_CONTENT, None, "");
+    response.headers_mut().insert(
+        header::ALLOW,
+        header::HeaderValue::from_static("GET, HEAD, OPTIONS, CONNECT"),
+    );
+    response
 }
 async fn collect_with_limits<B: Body<Data = Bytes> + Unpin>(
     body: B,
@@ -382,6 +436,11 @@ async fn record<T: Into<DenialDestination>>(
     destination: T,
     mode: Mode,
 ) -> AuditResult {
+    #[cfg(test)]
+    if let Some(spy) = &context.authorization_spy {
+        spy.audit_writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     context.audit.record(&destination.into(), mode).await
 }
 async fn record_best_effort<T: Into<DenialDestination>>(
@@ -392,19 +451,6 @@ async fn record_best_effort<T: Into<DenialDestination>>(
     if record(context, destination, mode).await == AuditResult::AppendFailed {
         report(&"denial_log_append_failed");
     }
-}
-
-fn report_log_unavailable() -> Response<ProxyBody> {
-    let mut response = fixed(
-        StatusCode::SERVICE_UNAVAILABLE,
-        Some("text/plain; charset=utf-8"),
-        "proxy temporarily unavailable\n",
-    );
-    response.headers_mut().insert(
-        header::CONNECTION,
-        header::HeaderValue::from_static("close"),
-    );
-    response
 }
 
 #[cfg(test)]
@@ -504,6 +550,7 @@ mod tests {
         let polls = Arc::new(AtomicUsize::new(0));
         let request = Request::builder()
             .uri("http://denied.example/")
+            .header(header::HOST, "allowed.example")
             .body(PanicOnPoll(polls.clone()))
             .unwrap();
 
@@ -511,6 +558,134 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"blocked by vhrn egress policy: denied.example\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_and_https_targets_have_no_authorization_or_network_side_effects() {
+        let directory = tempfile::tempdir().unwrap();
+        let allowlist = directory.path().join("missing-allowlist");
+        let mode = directory.path().join("missing-mode");
+        let config = Config::resolve(|name| match name {
+            "VHRN_ALLOWLIST" => Some(allowlist.display().to_string()),
+            "VHRN_MODE_FILE" => Some(mode.display().to_string()),
+            "VHRN_PROXY_LISTEN" => Some("127.0.0.1:8080".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let authorization = Arc::new(AuthorizationSpy::default());
+        let (broker_stream, mut broker_peer) = tokio::io::duplex(1024);
+        let context = Arc::new(
+            RequestContext::new(
+                config,
+                PublicConnector::new(
+                    Arc::new(CountingResolver(resolves.clone())),
+                    Arc::new(UnusedDialer),
+                ),
+                Some(BrokerConnector::test_with_connect_stream(broker_stream)),
+                crate::Shutdown::new(),
+            )
+            .with_authorization_spy(authorization.clone()),
+        );
+
+        for (uri, status, expected) in [
+            (
+                "https://allowed.example/path",
+                StatusCode::BAD_REQUEST,
+                Bytes::from_static(b"HTTPS requires CONNECT\n"),
+            ),
+            (
+                "ftp://allowed.example/path",
+                StatusCode::BAD_REQUEST,
+                Bytes::from_static(b"bad request\n"),
+            ),
+        ] {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let request = Request::builder()
+                .uri(uri)
+                .body(PanicOnPoll(polls.clone()))
+                .unwrap();
+            let response = handle_http(request, context.clone()).await;
+            assert_eq!(response.status(), status, "{uri}");
+            assert_eq!(response.headers()[header::CONNECTION], "close");
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                expected,
+                "{uri}"
+            );
+            assert_eq!(polls.load(Ordering::SeqCst), 0, "{uri}");
+        }
+
+        let mut framed_connect = Request::builder()
+            .method(Method::CONNECT)
+            .uri("allowed.example:443")
+            .header(header::CONTENT_LENGTH, "0")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let tunnels = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
+        let response = handle_connect(&mut framed_connect, context.clone(), tunnels).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        assert_eq!(authorization.policy_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(authorization.audit_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(resolves.load(Ordering::SeqCst), 0);
+        assert_eq!(context.public.public_calls(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), broker_peer.read_u8())
+                .await
+                .is_err(),
+            "broker spy must observe no frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_public_policy_is_an_exact_enforced_denial_before_body_polling() {
+        let directory = tempfile::tempdir().unwrap();
+        let allowlist = directory.path().join("allowlist");
+        let mode = directory.path().join("mode");
+        std::fs::write(&allowlist, "bad!policy\n").unwrap();
+        std::fs::write(&mode, "open\n").unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let request = Request::builder()
+            .uri("http://allowed.example/")
+            .body(PanicOnPoll(polls.clone()))
+            .unwrap();
+
+        let response = handle_http(request, context(&allowlist, &mode)).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"blocked by vhrn egress policy: allowed.example\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn local_denial_is_exact_and_does_not_poll_the_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let allowlist = directory.path().join("allowlist");
+        let mode = directory.path().join("mode");
+        std::fs::write(&allowlist, "").unwrap();
+        std::fs::write(&mode, "open\n").unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let request = Request::builder()
+            .uri("http://LOCALHOST:0080/")
+            .body(PanicOnPoll(polls.clone()))
+            .unwrap();
+
+        let response = handle_http(request, context(&allowlist, &mode)).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"blocked by vhrn local policy: localhost:80\n")
+        );
     }
 
     #[tokio::test]
@@ -700,14 +875,14 @@ mod tests {
     }
 
     #[test]
-    fn non_connect_classification_never_returns_a_connect_route() {
+    fn parsed_component_bridge_keeps_http_and_connect_disjoint() {
         assert!(matches!(
-            classify_http(&Method::GET, &"http://example.com/".parse().unwrap()),
-            HttpRoute::Public(_)
+            classify_parsed(&Method::GET, &"http://example.com/".parse().unwrap()),
+            Target::PublicHttp(_)
         ));
         assert!(matches!(
-            classify_http(&Method::CONNECT, &"example.com:443".parse().unwrap()),
-            HttpRoute::Malformed
+            classify_parsed(&Method::CONNECT, &"example.com:443".parse().unwrap()),
+            Target::PublicConnect(_)
         ));
     }
 }
