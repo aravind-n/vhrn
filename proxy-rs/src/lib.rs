@@ -77,14 +77,8 @@ async fn bootstrap(config: Config, shutdown: Shutdown) -> anyhow::Result<Option<
     } else {
         None
     };
-    let tls = connect::tls::production_client_config()
-        .map_err(|_| anyhow::anyhow!("startup_tls_configuration_failed"))?;
     let local = if let (Some(value), Some(token)) = (&config.local, token) {
-        let connector = connect::broker::BrokerConnector::with_tls_config(
-            value.broker_addr.clone(),
-            token,
-            tls.clone(),
-        );
+        let connector = connect::broker::BrokerConnector::new(value.broker_addr.clone(), token);
         tokio::select! {
             biased;
             () = shutdown.cancelled() => return Ok(None),
@@ -111,7 +105,7 @@ async fn bootstrap(config: Config, shutdown: Shutdown) -> anyhow::Result<Option<
         config,
         audit,
         health,
-        public: connect::public::PublicConnector::system_with_tls(tls),
+        public: connect::public::PublicConnector::system(),
         local,
         shutdown,
     }))
