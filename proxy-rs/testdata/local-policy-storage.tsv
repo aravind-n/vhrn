@@ -1,0 +1,17 @@
+# canonical persisted authority<TAB>outcome
+localhost:1	accept
+localhost:65535	accept
+127.0.0.1:80	accept
+127.255.255.255:65535	accept
+[::1]:443	accept
+LOCALHOST:80	reject
+localhost:080	reject
+127.0.0.1:00080	reject
+[0:0:0:0:0:0:0:1]:443	reject
+[::0001]:443	reject
+127.00.0.1:80	reject
+126.255.255.255:80	reject
+[::ffff:127.0.0.1]:80	reject
+localhost:0	reject
+ localhost:80	reject
+localhost:80 	reject

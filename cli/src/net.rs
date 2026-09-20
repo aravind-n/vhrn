@@ -2008,7 +2008,7 @@ mod tests {
 
     #[test]
     fn domain_policy_fixture_remains_proxy_compatible() {
-        for row in include_str!("../../proxy-rs/testdata/domain-policy.tsv")
+        for row in include_str!("../../shared/testdata/domain-normalization.tsv")
             .lines()
             .filter(|row| !row.starts_with('#'))
         {
