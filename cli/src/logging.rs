@@ -1,7 +1,7 @@
 //! Logging setup: a thin tracing-subscriber wrapper. vhrn is an interactive CLI, not
 //! a daemon, so the default is a terse, timestamp-less, target-less stderr line, with
 //! `RUST_LOG` tuning levels. Config is resolved from the environment at a thin edge, like
-//! env.rs, so the pure part stays testable. Modelled on ~/projects/prep/src/logging.rs.
+//! env.rs, so the pure part stays testable. Modeled on ~/projects/prep/src/logging.rs.
 
 use std::io::IsTerminal;
 

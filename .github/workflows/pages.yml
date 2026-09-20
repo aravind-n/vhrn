@@ -1,7 +1,7 @@
 name: Pages
 
 # Publishes pages/ (the installer + landing page) to GitHub Pages on master.
-# Never from a PR or branch; the job-level `if` is defence-in-depth so a future
+# Never from a PR or branch; the job-level `if` is defense-in-depth so a future
 # trigger addition can't accidentally publish from somewhere else.
 on:
   push:
