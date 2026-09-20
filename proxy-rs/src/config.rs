@@ -3,20 +3,23 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use crate::connect::broker::BrokerToken;
 use anyhow::{Context, Result, bail};
+use tokio::io::AsyncReadExt;
+
+use crate::connect::broker::BrokerToken;
+use crate::diagnostics::AuditService;
 
 pub const DEFAULT_ALLOWLIST: &str = "/etc/vhrn/allowlist";
 pub const DEFAULT_MODE_FILE: &str = "/etc/vhrn/mode";
 pub const DEFAULT_LISTEN: &str = ":8080";
 
 /// Values required to make decisions after startup.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Config {
     pub(crate) allowlists: PolicyPaths,
     pub(crate) mode_file: PathBuf,
     pub(crate) listen: SocketAddr,
-    pub(crate) deny_log: Option<PathBuf>,
+    pub(crate) deny_log: AuditService,
     pub(crate) local: Option<LocalConfig>,
 }
 impl Config {
@@ -146,18 +149,18 @@ pub(crate) fn resolve_config<F>(lookup: F) -> Result<Config>
 where
     F: Fn(&str) -> Option<String>,
 {
-    let plural = lookup("VHRN_ALLOWLISTS");
+    let plural = value(&lookup, "VHRN_ALLOWLISTS");
     let allowlists = match plural {
         Some(value) => PolicyPaths::new(value.split(',').map(PathBuf::from).collect())
             .context("parse VHRN_ALLOWLISTS")?,
         None => PolicyPaths::new(vec![PathBuf::from(
-            lookup("VHRN_ALLOWLIST").unwrap_or_else(|| DEFAULT_ALLOWLIST.to_owned()),
+            value(&lookup, "VHRN_ALLOWLIST").unwrap_or_else(|| DEFAULT_ALLOWLIST.to_owned()),
         )])
         .context("parse VHRN_ALLOWLIST")?,
     };
-    let local_paths = lookup("VHRN_LOOPBACK_ALLOWLISTS");
-    let broker_addr = lookup("VHRN_BROKER_ADDR");
-    let token_file = lookup("VHRN_BROKER_TOKEN_FILE");
+    let local_paths = value(&lookup, "VHRN_LOOPBACK_ALLOWLISTS");
+    let broker_addr = value(&lookup, "VHRN_BROKER_ADDR");
+    let token_file = value(&lookup, "VHRN_BROKER_TOKEN_FILE");
     let local = match (local_paths, broker_addr, token_file) {
         (None, None, None) => None,
         (Some(paths), Some(addr), Some(token)) => Some(LocalConfig {
@@ -169,22 +172,28 @@ where
             "VHRN_LOOPBACK_ALLOWLISTS, VHRN_BROKER_ADDR, and VHRN_BROKER_TOKEN_FILE must be set together"
         ),
     };
+    let mode_file = PathBuf::from(
+        value(&lookup, "VHRN_MODE_FILE").unwrap_or_else(|| DEFAULT_MODE_FILE.to_owned()),
+    );
+    let deny_log = value(&lookup, "VHRN_DENY_LOG").map(PathBuf::from);
+    let audit = AuditService::new(deny_log);
     Ok(Config {
         allowlists,
-        mode_file: nonempty_path(
-            lookup("VHRN_MODE_FILE").unwrap_or_else(|| DEFAULT_MODE_FILE.to_owned()),
-            "VHRN_MODE_FILE",
-        )?,
+        mode_file,
         listen: parse_listener(
-            &lookup("VHRN_PROXY_LISTEN").unwrap_or_else(|| DEFAULT_LISTEN.to_owned()),
+            &value(&lookup, "VHRN_PROXY_LISTEN").unwrap_or_else(|| DEFAULT_LISTEN.to_owned()),
         )
         .context("parse VHRN_PROXY_LISTEN")?,
-        deny_log: lookup("VHRN_DENY_LOG")
-            .filter(|value| !value.is_empty())
-            .map(|value| nonempty_path(value, "VHRN_DENY_LOG"))
-            .transpose()?,
+        deny_log: audit,
         local,
     })
+}
+
+fn value<F>(lookup: &F, name: &str) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    lookup(name).filter(|value| !value.is_empty())
 }
 
 /// Loads the local credential only when local routing is configured.
@@ -192,13 +201,34 @@ where
 /// # Errors
 ///
 /// Returns an error when the credential file cannot be read or is invalid.
-pub(crate) fn load_broker_token(config: &LocalConfig) -> Result<BrokerToken> {
-    let bytes = std::fs::read(&config.token_file)
-        .with_context(|| format!("read broker token from {}", config.token_file.display()))?;
-    let value = String::from_utf8(bytes).context("decode broker token as UTF-8")?;
+pub(crate) async fn load_broker_token(config: &LocalConfig) -> Result<BrokerToken> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    options.custom_flags(0x800);
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    options.custom_flags(0x4);
+    let file = options
+        .open(&config.token_file)
+        .await
+        .map_err(|_| anyhow::anyhow!("VHRN_BROKER_TOKEN_FILE is unreadable"))?;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|_| anyhow::anyhow!("VHRN_BROKER_TOKEN_FILE is unreadable"))?;
+    if !metadata.is_file() || metadata.len() != 64 {
+        bail!("VHRN_BROKER_TOKEN_FILE contains an invalid token");
+    }
+    let mut bytes = Vec::with_capacity(64);
+    file.take(65)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| anyhow::anyhow!("VHRN_BROKER_TOKEN_FILE is unreadable"))?;
+    let value = String::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("VHRN_BROKER_TOKEN_FILE contains an invalid token"))?;
     value
         .parse::<BrokerToken>()
-        .map_err(|_| anyhow::anyhow!("validate broker token format"))
+        .map_err(|_| anyhow::anyhow!("VHRN_BROKER_TOKEN_FILE contains an invalid token"))
 }
 
 fn parse_local_paths(value: &str) -> Result<LocalPolicyPaths> {
@@ -297,16 +327,25 @@ mod tests {
             .as_slice(),
             [PathBuf::from("one"), PathBuf::from("two")]
         );
-        assert!(
+        assert_eq!(
             resolve(BTreeMap::from([
                 ("VHRN_ALLOWLISTS", ""),
                 ("VHRN_ALLOWLIST", "single")
             ]))
-            .is_err()
+            .unwrap()
+            .allowlists
+            .as_slice(),
+            [PathBuf::from("single")]
         );
-        assert!(resolve(BTreeMap::from([("VHRN_ALLOWLIST", "")])).is_err());
+        assert_eq!(
+            resolve(BTreeMap::from([("VHRN_ALLOWLIST", "")]))
+                .unwrap()
+                .allowlists
+                .as_slice(),
+            [PathBuf::from(DEFAULT_ALLOWLIST)]
+        );
         let config = resolve(BTreeMap::from([("VHRN_DENY_LOG", "")])).unwrap();
-        assert_eq!(config.deny_log, None);
+        assert!(!config.deny_log.has_path());
         assert!(
             resolve(BTreeMap::from([
                 ("VHRN_LOOPBACK_ALLOWLISTS", "a,b,c"),
@@ -326,8 +365,71 @@ mod tests {
             );
         }
     }
+
     #[test]
-    fn token_file_is_literal_and_redacted() {
+    fn empty_values_are_unset_for_every_default_and_optional_variable() {
+        let values = BTreeMap::from([
+            ("VHRN_ALLOWLISTS", ""),
+            ("VHRN_ALLOWLIST", ""),
+            ("VHRN_MODE_FILE", ""),
+            ("VHRN_PROXY_LISTEN", ""),
+            ("VHRN_DENY_LOG", ""),
+            ("VHRN_LOOPBACK_ALLOWLISTS", ""),
+            ("VHRN_BROKER_ADDR", ""),
+            ("VHRN_BROKER_TOKEN_FILE", ""),
+        ]);
+        let config = resolve_config(|key| values.get(key).map(ToString::to_string)).unwrap();
+        assert_eq!(
+            config.allowlists.as_slice(),
+            [PathBuf::from(DEFAULT_ALLOWLIST)]
+        );
+        assert_eq!(config.mode_file, PathBuf::from(DEFAULT_MODE_FILE));
+        assert_eq!(config.listen, "0.0.0.0:8080".parse().unwrap());
+        assert!(!config.deny_log.has_path());
+        assert!(config.local.is_none());
+    }
+
+    #[test]
+    fn every_partial_nonempty_local_group_is_rejected() {
+        const NAMES: [&str; 3] = [
+            "VHRN_LOOPBACK_ALLOWLISTS",
+            "VHRN_BROKER_ADDR",
+            "VHRN_BROKER_TOKEN_FILE",
+        ];
+        const VALUES: [&str; 3] = ["one,two,three", "127.0.0.1:1234", "token"];
+        for mask in 0_u8..8 {
+            let result = resolve_config(|name| {
+                NAMES
+                    .iter()
+                    .position(|candidate| *candidate == name)
+                    .map(|index| {
+                        if mask & (1 << index) == 0 {
+                            String::new()
+                        } else {
+                            VALUES[index].to_owned()
+                        }
+                    })
+            });
+            assert_eq!(result.is_ok(), mask == 0 || mask == 7, "mask {mask:03b}");
+            if mask == 0 {
+                assert!(result.unwrap().local.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_listener_values_are_rejected_without_echoing_values() {
+        for listener in ["host.invalid:8080", "127.0.0.1:0", ":0", "not a listener"] {
+            let error =
+                resolve_config(|name| (name == "VHRN_PROXY_LISTEN").then(|| listener.to_owned()))
+                    .err()
+                    .unwrap();
+            assert!(error.to_string().contains("VHRN_PROXY_LISTEN"));
+            assert!(!error.to_string().contains(listener));
+        }
+    }
+    #[tokio::test]
+    async fn token_file_is_literal_and_redacted() {
         let directory = tempdir().unwrap();
         let file = directory.path().join("token");
         let config = LocalConfig {
@@ -341,17 +443,17 @@ mod tests {
         };
         let valid = "a".repeat(64);
         fs::write(&file, &valid).unwrap();
-        let token = load_broker_token(&config).unwrap();
+        let token = load_broker_token(&config).await.unwrap();
         assert!(!format!("{token:?}").contains(&valid));
         for contents in [format!("{valid}\n"), "A".repeat(64)] {
             fs::write(&file, contents).unwrap();
-            let error = load_broker_token(&config).unwrap_err();
+            let error = load_broker_token(&config).await.unwrap_err();
             assert!(!error.to_string().contains(&valid));
         }
         fs::write(&file, [0xff]).unwrap();
-        assert!(load_broker_token(&config).is_err());
+        assert!(load_broker_token(&config).await.is_err());
         fs::remove_file(&file).unwrap();
-        assert!(load_broker_token(&config).is_err());
+        assert!(load_broker_token(&config).await.is_err());
     }
 
     #[test]

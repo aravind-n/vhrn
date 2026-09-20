@@ -51,6 +51,62 @@ struct LocalFixture {
     granted_layer: usize,
 }
 
+struct StartupFixture {
+    _temp: TempDir,
+    public: [PathBuf; 5],
+    mode: PathBuf,
+    log: PathBuf,
+    local: [PathBuf; 3],
+    token: PathBuf,
+}
+
+impl StartupFixture {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().expect("startup fixture directory");
+        let public =
+            ["base", "harness", "global", "project", "run"].map(|name| temp.path().join(name));
+        for path in &public {
+            std::fs::write(path, "").expect("public policy");
+        }
+        let mode = temp.path().join("mode");
+        std::fs::write(&mode, "enforce\n").expect("mode");
+        let log = temp.path().join("denials.log");
+        let local =
+            ["local-global", "local-project", "local-run"].map(|name| temp.path().join(name));
+        for path in &local {
+            std::fs::write(path, "").expect("local policy");
+        }
+        let token = temp.path().join("token");
+        std::fs::write(&token, TOKEN).expect("broker token");
+        Self {
+            _temp: temp,
+            public,
+            mode,
+            log,
+            local,
+            token,
+        }
+    }
+
+    fn command(&self, address: SocketAddr) -> Command {
+        let mut command = proxy_command();
+        command
+            .env("VHRN_ALLOWLISTS", join_paths(&self.public))
+            .env("VHRN_MODE_FILE", &self.mode)
+            .env("VHRN_PROXY_LISTEN", address.to_string())
+            .env("VHRN_DENY_LOG", &self.log)
+            .stdout(Stdio::null());
+        command
+    }
+
+    fn configure_local(&self, command: &mut Command, broker: SocketAddr) {
+        command
+            .env("VHRN_LOOPBACK_ALLOWLISTS", join_paths(&self.local))
+            .env("VHRN_BROKER_ADDR", broker.to_string())
+            .env("VHRN_BROKER_TOKEN_FILE", &self.token);
+    }
+}
+
 impl LocalFixture {
     fn new(policies: [PathBuf; 3], granted_layer: usize) -> Self {
         assert!(
@@ -122,10 +178,14 @@ impl ManagedChild {
     }
 
     fn diagnostics(&self) -> String {
+        self.raw_diagnostics().replace(TOKEN, "[REDACTED]")
+    }
+
+    fn raw_diagnostics(&self) -> String {
         self.stderr
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .replace(TOKEN, "[REDACTED]")
+            .clone()
     }
 
     async fn wait_for_exit(&mut self, deadline: Duration, operation: &str) -> ExitStatus {
@@ -454,13 +514,18 @@ async fn health_probe(address: SocketAddr) -> Result<(), ()> {
 }
 
 fn address_in_use(diagnostic: &str) -> bool {
-    diagnostic.contains("AddrInUse") || diagnostic.contains("Address already in use")
+    diagnostic.contains("AddrInUse")
+        || diagnostic.contains("Address already in use")
+        || diagnostic.contains("startup_listener_bind_failed:address_in_use")
 }
 
 #[test]
 fn address_in_use_recognizes_rust_and_os_diagnostics() {
     assert!(address_in_use("bind failed: AddrInUse"));
     assert!(address_in_use("bind failed: Address already in use"));
+    assert!(address_in_use(
+        "Error: startup_listener_bind_failed:address_in_use"
+    ));
     assert!(!address_in_use("bind failed: Permission denied"));
 }
 
@@ -587,6 +652,15 @@ async fn accept(listener: &TcpListener) -> (TcpStream, SocketAddr) {
         .expect("broker connection")
 }
 
+async fn unused_address() -> SocketAddr {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("reserve listener address");
+    let address = listener.local_addr().expect("reserved listener address");
+    drop(listener);
+    address
+}
+
 async fn read_through(stream: &mut TcpStream, marker: &[u8]) -> Vec<u8> {
     timeout(DEADLINE, async {
         let mut bytes = Vec::new();
@@ -625,7 +699,7 @@ async fn read_line(stream: &mut TcpStream) -> Vec<u8> {
 #[tokio::test]
 async fn direct_endpoints_and_denial_log_follow_corpus() {
     scenario(async {
-    let proxy = Proxy::start(None).await;
+    let mut proxy = Proxy::start(None).await;
     for (path, expected) in [("/healthz", 200), ("/__status", 200), ("/not-found", 404)] {
         let response = proxy
             .request(&format!(
@@ -642,12 +716,376 @@ async fn direct_endpoints_and_denial_log_follow_corpus() {
         .request("GET /__status HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
         .await;
     assert!(status_response.contains("application/json") && status_response.ends_with('\n'));
-    let denied = proxy.request("GET http://blocked.example/path HTTP/1.1\r\nHost: blocked.example\r\nConnection: close\r\n\r\n").await;
+    std::fs::write(&proxy.log, "preexisting\n").expect("preexisting denial log");
+    let request_secret = "request-secret-must-not-escape";
+    let denied = proxy.request(&format!("GET http://blocked.example/path HTTP/1.1\r\nHost: blocked.example\r\nAuthorization: {request_secret}\r\nConnection: close\r\n\r\n")).await;
     assert_eq!(status(&denied), 403);
     let log = std::fs::read_to_string(&proxy.log).expect("denial log");
-    assert_eq!(log.lines().count(), 1);
+    assert_eq!(log.lines().count(), 2);
+    assert!(log.starts_with("preexisting\n"));
     assert!(log.ends_with("\tblocked.example\n"));
     assert!(!log.contains(TOKEN));
+    assert!(!log.contains(request_secret));
+    let _ = proxy
+        .child
+        .terminate_and_wait("denial diagnostic capture")
+        .await;
+    let diagnostics = proxy.child.raw_diagnostics();
+    assert!(diagnostics.contains("vhrn-proxy: denial target=blocked.example mode=enforce"));
+    assert!(!diagnostics.contains(TOKEN));
+    assert!(!diagnostics.contains(request_secret));
+    assert!(!diagnostics.contains(&proxy.policy.display().to_string()));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn health_tracks_live_policy_and_sticky_audit_failure() {
+    scenario(async {
+        let mut proxy = Proxy::start(None).await;
+        std::fs::write(&proxy.policy, "bad!policy\n").expect("invalidate public policy");
+        let unhealthy = proxy
+            .request("GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await;
+        assert_eq!(status(&unhealthy), 503);
+        assert!(unhealthy.ends_with("unhealthy\n"));
+
+        std::fs::write(&proxy.policy, "allowed.example\n").expect("repair public policy");
+        assert_eq!(
+            status(
+                &proxy
+                    .request(
+                        "GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
+                    )
+                    .await
+            ),
+            200
+        );
+
+        std::fs::remove_file(&proxy.log).expect("remove denial log");
+        std::fs::create_dir(&proxy.log).expect("replace denial log with directory");
+        let enforced = proxy
+            .request("GET http://blocked.example/ HTTP/1.1\r\nHost: blocked.example\r\nConnection: close\r\n\r\n")
+            .await;
+        assert_eq!(status(&enforced), 403, "audit failure cannot alter denial");
+        assert_eq!(
+            status(
+                &proxy
+                    .request(
+                        "GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
+                    )
+                    .await
+            ),
+            503
+        );
+
+        std::fs::write(&proxy.mode, "report\n").expect("report mode");
+        for _ in 0..2 {
+            let unavailable = proxy
+                .request("GET http://blocked.example/ HTTP/1.1\r\nHost: blocked.example\r\nConnection: close\r\n\r\n")
+                .await;
+            assert_eq!(status(&unavailable), 503);
+            assert!(unavailable.ends_with("proxy temporarily unavailable\n"));
+        }
+
+        std::fs::remove_dir(&proxy.log).expect("remove broken denial log");
+        std::fs::write(&proxy.log, "repaired\n").expect("repair denial log");
+        assert_eq!(
+            status(
+                &proxy
+                    .request(
+                        "GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
+                    )
+                    .await
+            ),
+            503,
+            "an open probe cannot clear sticky append failure"
+        );
+        let recovered = proxy
+            .request("GET http://blocked.example/ HTTP/1.1\r\nHost: blocked.example\r\nConnection: close\r\n\r\n")
+            .await;
+        assert_eq!(status(&recovered), 502, "successful record permits report mode");
+        assert_eq!(
+            status(
+                &proxy
+                    .request(
+                        "GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
+                    )
+                    .await
+            ),
+            200
+        );
+        let log = std::fs::read_to_string(&proxy.log).expect("repaired log");
+        assert!(log.starts_with("repaired\n"));
+        assert!(log.ends_with("\tblocked.example\n"));
+        let _ = proxy
+            .child
+            .terminate_and_wait("report diagnostic capture")
+            .await;
+        let diagnostics = proxy.child.raw_diagnostics();
+        assert!(diagnostics.contains("denial target=blocked.example mode=enforce"));
+        assert!(diagnostics.contains("denial target=blocked.example mode=report"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn invalid_startup_policy_log_and_token_exit_redacted() {
+    scenario(async {
+        let fixture = StartupFixture::new();
+
+        std::fs::write(&fixture.public[0], "bad!policy\n").expect("invalid policy");
+        let address = unused_address().await;
+        let mut child = ManagedChild::spawn(&mut fixture.command(address));
+        let exit = child
+            .wait_for_exit(DEADLINE, "invalid startup policy")
+            .await;
+        assert!(!exit.success());
+        assert!(
+            child
+                .diagnostics()
+                .contains("startup_public_policy_invalid")
+        );
+        assert!(
+            !child
+                .raw_diagnostics()
+                .contains(&fixture.public[0].display().to_string())
+        );
+        assert!(
+            !fixture.log.exists(),
+            "policy validation precedes denial-log open"
+        );
+
+        std::fs::write(&fixture.public[0], "").expect("repair policy");
+        std::fs::create_dir(&fixture.log).expect("invalid log destination");
+        let address = unused_address().await;
+        let mut child = ManagedChild::spawn(&mut fixture.command(address));
+        let exit = child.wait_for_exit(DEADLINE, "invalid startup log").await;
+        assert!(!exit.success());
+        assert!(
+            child
+                .diagnostics()
+                .contains("startup_denial_log_unavailable")
+        );
+        assert!(
+            !child
+                .raw_diagnostics()
+                .contains(&fixture.log.display().to_string())
+        );
+        assert!(TcpStream::connect(address).await.is_err());
+
+        std::fs::remove_dir(&fixture.log).expect("remove invalid log destination");
+        std::fs::write(&fixture.local[1], "bad authority\n").expect("invalid local policy");
+        let address = unused_address().await;
+        let broker = Broker::bind().await;
+        let mut command = fixture.command(address);
+        fixture.configure_local(&mut command, broker.address());
+        let mut child = ManagedChild::spawn(&mut command);
+        let exit = child
+            .wait_for_exit(DEADLINE, "invalid startup local policy")
+            .await;
+        assert!(!exit.success());
+        assert!(child.diagnostics().contains("startup_local_policy_invalid"));
+        assert!(
+            !child
+                .raw_diagnostics()
+                .contains(&fixture.local[1].display().to_string())
+        );
+        assert!(
+            !fixture.log.exists(),
+            "local validation precedes denial-log open"
+        );
+
+        std::fs::write(&fixture.local[1], "").expect("repair local policy");
+        let invalid_token = "invalid-token-secret";
+        std::fs::write(&fixture.token, invalid_token).expect("invalid token");
+        let address = unused_address().await;
+        let mut command = fixture.command(address);
+        fixture.configure_local(&mut command, broker.address());
+        let mut child = ManagedChild::spawn(&mut command);
+        let exit = child.wait_for_exit(DEADLINE, "invalid startup token").await;
+        assert!(!exit.success());
+        let diagnostics = child.raw_diagnostics();
+        assert!(diagnostics.contains("startup_broker_token_invalid"));
+        assert!(!diagnostics.contains(invalid_token));
+        assert!(!diagnostics.contains(&fixture.token.display().to_string()));
+        assert!(!diagnostics.contains(&broker.address().to_string()));
+        assert!(TcpStream::connect(address).await.is_err());
+    })
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nonregular_token_fails_promptly_without_serving() {
+    scenario(async {
+        let broker = Broker::bind().await;
+        let fixture = StartupFixture::new();
+        std::fs::remove_file(&fixture.token).expect("remove regular token");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fixture.token)
+                .status()
+                .expect("create token FIFO")
+                .success()
+        );
+        let address = unused_address().await;
+        let mut command = fixture.command(address);
+        fixture.configure_local(&mut command, broker.address());
+        let mut child = ManagedChild::spawn(&mut command);
+        let exit = child
+            .wait_for_exit(DEADLINE, "nonregular startup token")
+            .await;
+        assert!(!exit.success());
+        let diagnostics = child.raw_diagnostics();
+        assert!(diagnostics.contains("startup_broker_token_invalid"));
+        assert!(!diagnostics.contains(TOKEN));
+        assert!(!diagnostics.contains(&fixture.token.display().to_string()));
+        assert!(TcpStream::connect(address).await.is_err());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn listener_does_not_serve_until_broker_readiness_and_refusal_is_fatal() {
+    scenario(async {
+        let broker = Broker::bind().await;
+        let fixture = StartupFixture::new();
+        let address = unused_address().await;
+        let mut command = fixture.command(address);
+        fixture.configure_local(&mut command, broker.address());
+        let mut child = ManagedChild::spawn(&mut command);
+        let (mut readiness, _) = accept(&broker.listener).await;
+        assert_eq!(
+            String::from_utf8(read_line(&mut readiness).await).expect("READY frame"),
+            format!("VHRN-BROKER/1 READY {TOKEN}\n")
+        );
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("connect bound pre-ready listener");
+        client
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("queue pre-ready request");
+        let mut byte = [0_u8; 1];
+        assert!(
+            timeout(Duration::from_millis(150), client.read(&mut byte))
+                .await
+                .is_err(),
+            "bound listener must not serve before READY"
+        );
+        readiness
+            .write_all(b"OK\n")
+            .await
+            .expect("approve readiness");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("health response");
+        assert_eq!(
+            status(&String::from_utf8(response).expect("response text")),
+            200
+        );
+        let _ = child.terminate_and_wait("approved readiness cleanup").await;
+
+        let fixture = StartupFixture::new();
+        let address = unused_address().await;
+        let mut command = fixture.command(address);
+        fixture.configure_local(&mut command, broker.address());
+        let mut child = ManagedChild::spawn(&mut command);
+        let (mut readiness, _) = accept(&broker.listener).await;
+        let _ = read_line(&mut readiness).await;
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("connect listener before refusal");
+        client
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("queue request before refusal");
+        readiness
+            .write_all(b"ERR\n")
+            .await
+            .expect("refuse readiness");
+        readiness
+            .shutdown()
+            .await
+            .expect("close readiness response");
+        let exit = child
+            .wait_for_exit(DEADLINE, "broker readiness refusal")
+            .await;
+        assert!(!exit.success());
+        assert!(
+            child
+                .diagnostics()
+                .contains("startup_broker_readiness_failed")
+        );
+        let mut received = Vec::new();
+        let _ = client.read_to_end(&mut received).await;
+        assert!(
+            received.is_empty(),
+            "startup failure cannot serve queued HTTP"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn broker_readiness_timeout_is_fatal_and_redacted() {
+    scenario(async {
+        let broker = Broker::bind().await;
+        let fixture = StartupFixture::new();
+        let address = unused_address().await;
+        let mut command = fixture.command(address);
+        fixture.configure_local(&mut command, broker.address());
+        let mut child = ManagedChild::spawn(&mut command);
+        let (mut readiness, _) = accept(&broker.listener).await;
+        let _ = read_line(&mut readiness).await;
+        let exit = child
+            .wait_for_exit(Duration::from_secs(5), "broker readiness timeout")
+            .await;
+        assert!(!exit.success());
+        let diagnostics = child.raw_diagnostics();
+        assert!(diagnostics.contains("startup_broker_readiness_failed"));
+        assert!(!diagnostics.contains(TOKEN));
+        assert!(!diagnostics.contains(&broker.address().to_string()));
+        let mut byte = [0_u8; 1];
+        assert_eq!(readiness.read(&mut byte).await.expect("readiness close"), 0);
+    })
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_after_bind_closes_listener_and_pending_broker_exchange() {
+    scenario(async {
+        let broker = Broker::bind().await;
+        let fixture = StartupFixture::new();
+        let address = unused_address().await;
+        let mut command = fixture.command(address);
+        fixture.configure_local(&mut command, broker.address());
+        let mut child = ManagedChild::spawn(&mut command);
+        let (mut readiness, _) = accept(&broker.listener).await;
+        let _ = read_line(&mut readiness).await;
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("connect bound startup listener");
+        client
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("queue startup request");
+        send_sigterm(&child);
+        let exit = child.wait_for_exit(DEADLINE, "startup cancellation").await;
+        assert!(
+            exit.success(),
+            "startup cancellation should be graceful: {}",
+            child.diagnostics()
+        );
+        let mut byte = [0_u8; 1];
+        assert_eq!(readiness.read(&mut byte).await.expect("broker close"), 0);
+        let mut received = Vec::new();
+        let _ = client.read_to_end(&mut received).await;
+        assert!(received.is_empty(), "cancelled startup cannot serve HTTP");
     })
     .await;
 }
@@ -782,7 +1220,7 @@ async fn local_startup_exchange_and_partial_configuration_are_process_checked() 
             "partial configuration stderr must name the invalid configuration: {}",
             child.diagnostics()
         );
-        assert!(!child.diagnostics().contains(TOKEN));
+        assert!(!child.raw_diagnostics().contains(TOKEN));
     })
     .await;
 }
@@ -1153,11 +1591,13 @@ async fn listener_occupation_and_sigterm_have_bounded_lifecycle() {
             occupied.diagnostics()
         );
         assert!(
-            occupied.diagnostics().contains("bind proxy listener"),
-            "occupied listener stderr must include bind context: {}",
+            occupied
+                .diagnostics()
+                .contains("startup_listener_bind_failed:address_in_use"),
+            "occupied listener stderr must include a stable category: {}",
             occupied.diagnostics()
         );
-        assert!(!occupied.diagnostics().contains(TOKEN));
+        assert!(!occupied.raw_diagnostics().contains(TOKEN));
         drop(listener);
 
         let mut proxy = Proxy::start(None).await;

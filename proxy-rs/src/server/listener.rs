@@ -1,35 +1,57 @@
 //! Listener startup and HTTP connection serving.
-use crate::{
-    Shutdown,
-    server::router::{RequestContext, handle},
-};
-use anyhow::{Context, Result};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+
+use crate::{
+    Bootstrap, Shutdown,
+    server::router::{RequestContext, handle},
+};
 
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_millis(800);
 const MAX_CONNECTIONS: usize = 64;
 pub(crate) async fn bind(address: std::net::SocketAddr) -> Result<TcpListener> {
-    TcpListener::bind(address)
-        .await
-        .with_context(|| format!("bind proxy listener at {address}"))
+    TcpListener::bind(address).await.map_err(|error| {
+        let category = match error.kind() {
+            std::io::ErrorKind::AddrInUse => "address_in_use",
+            std::io::ErrorKind::AddrNotAvailable => "address_unavailable",
+            std::io::ErrorKind::PermissionDenied => "permission_denied",
+            _ => "io_error",
+        };
+        anyhow!("startup_listener_bind_failed:{category}")
+    })
 }
 
 /// Serves accepted connections until shutdown or an accept failure drains them.
-pub(crate) async fn serve(
-    listener: TcpListener,
-    context: Arc<RequestContext>,
-    shutdown: Shutdown,
-) -> Result<()> {
+pub(crate) async fn serve(bootstrap: Bootstrap) -> Result<()> {
+    let Bootstrap {
+        listener,
+        config,
+        audit,
+        health,
+        public,
+        local,
+        shutdown,
+    } = bootstrap;
+    let context = Arc::new(RequestContext::with_services(
+        config,
+        public,
+        local,
+        shutdown.clone(),
+        audit,
+        health,
+    ));
     let admission = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut connections = tokio::task::JoinSet::new();
     let outcome = loop {
         tokio::select! {
+            biased;
             () = shutdown.cancelled() => break Ok(()),
             joined = connections.join_next(), if !connections.is_empty() => {
                 if let Some(joined) = joined {
@@ -45,10 +67,10 @@ pub(crate) async fn serve(
                     let shutdown = shutdown.clone();
                     connections.spawn(async move {
                         let _permit = permit;
-                        serve_connection(stream, context, shutdown).await
+                        serve_connection_io(stream, context, shutdown).await
                     });
                 }
-                Err(error) => break Err(anyhow::Error::new(error).context("accept proxy connection")),
+                Err(_) => break Err(anyhow!("listener_accept_failed")),
             },
         }
     };
@@ -61,14 +83,6 @@ fn acquire_connection_permit(
 ) -> Option<tokio::sync::OwnedSemaphorePermit> {
     admission.clone().try_acquire_owned().ok()
 }
-pub(crate) async fn serve_connection(
-    stream: TcpStream,
-    context: Arc<RequestContext>,
-    shutdown: Shutdown,
-) -> Result<()> {
-    serve_connection_io(stream, context, shutdown).await
-}
-
 #[cfg(test)]
 pub(crate) async fn serve_test_connection(
     stream: tokio::io::DuplexStream,

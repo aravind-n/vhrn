@@ -1,22 +1,26 @@
 //! Request-head authorization and origin dispatch.
-use crate::{
-    config::Config,
-    connect::{broker::BrokerConnector, public::PublicConnector},
-    diagnostics::{DenialDestination, DenialRecorder, report},
-    domain::{
-        policy::{decide_local, decide_public},
-        target::{LocalTarget, PublicTarget, Target, classify},
-    },
-    server::response::{ProxyBody, fixed, origin},
-};
+use std::{sync::Arc, time::Duration};
+
 use anyhow::Context;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{
     Method, Request, Response, StatusCode,
     body::{Body, Incoming},
+    header,
 };
-use std::{sync::Arc, time::Duration};
+
+use crate::{
+    config::Config,
+    connect::{broker::BrokerConnector, public::PublicConnector},
+    diagnostics::{AuditResult, AuditService, DenialDestination, Health, HealthService, report},
+    domain::{
+        policy::{Mode, decide_local, decide_public},
+        target::{LocalTarget, PublicTarget, Target, classify},
+    },
+    server::response::{ProxyBody, fixed, origin},
+};
+
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) struct RequestContext {
@@ -24,19 +28,46 @@ pub(crate) struct RequestContext {
     pub(crate) public: PublicConnector,
     pub(crate) local: Option<BrokerConnector>,
     pub(crate) shutdown: crate::Shutdown,
+    audit: AuditService,
+    health: Arc<HealthService>,
 }
 impl RequestContext {
+    #[cfg(test)]
     pub(crate) fn new(
         config: Config,
         public: PublicConnector,
         local: Option<BrokerConnector>,
         shutdown: crate::Shutdown,
     ) -> Self {
+        let audit = config.deny_log.clone();
+        let health = Arc::new(HealthService::new(
+            config.allowlists.as_slice().to_vec(),
+            config.mode_file.clone(),
+            config
+                .local
+                .as_ref()
+                .map(|value| value.policy_paths.as_array().clone()),
+            audit.clone(),
+            shutdown.clone(),
+        ));
+        Self::with_services(config, public, local, shutdown, audit, health)
+    }
+
+    pub(crate) fn with_services(
+        config: Config,
+        public: PublicConnector,
+        local: Option<BrokerConnector>,
+        shutdown: crate::Shutdown,
+        audit: AuditService,
+        health: Arc<HealthService>,
+    ) -> Self {
         Self {
             config,
             public,
             local,
             shutdown,
+            audit,
+            health,
         }
     }
 }
@@ -92,8 +123,8 @@ where
         }
     }
 }
-async fn handle_connect(
-    request: &mut Request<Incoming>,
+async fn handle_connect<B>(
+    request: &mut Request<B>,
     context: Arc<RequestContext>,
     tunnels: Arc<tokio::sync::Mutex<tokio::task::JoinSet<anyhow::Result<()>>>>,
 ) -> Response<ProxyBody> {
@@ -114,23 +145,22 @@ async fn handle_connect(
                 }
                 Err(error) => {
                     report(&error);
-                    record_best_effort(&context, &target).await;
+                    record_best_effort(&context, &target, Mode::Enforce).await;
                     return fixed(StatusCode::FORBIDDEN, None, "forbidden\n");
                 }
             };
             if !decision.allowed {
-                record_best_effort(&context, &target).await;
+                record_best_effort(&context, &target, decision.effective_mode).await;
                 return fixed(StatusCode::FORBIDDEN, None, "forbidden\n");
             }
-            if decision.record_denial
-                && let Err(error) = record(&context, &target).await
-            {
-                report(&error);
-                return fixed(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    None,
-                    "internal server error\n",
-                );
+            if decision.record_denial {
+                match record(&context, &target, decision.effective_mode).await {
+                    AuditResult::AppendFailed => {
+                        report(&"denial_log_append_failed");
+                        return report_log_unavailable();
+                    }
+                    AuditResult::Recorded | AuditResult::Disabled => {}
+                }
             }
             match context.public.connect_target(target).await {
                 Ok(value) => {
@@ -154,7 +184,7 @@ async fn handle_connect(
                 report(&error);
                 false
             }) {
-                record_best_effort(&context, &target).await;
+                record_best_effort(&context, &target, Mode::Enforce).await;
                 return fixed(StatusCode::FORBIDDEN, None, "forbidden\n");
             }
             match &context.local {
@@ -175,8 +205,8 @@ async fn handle_connect(
         _ => fixed(StatusCode::BAD_REQUEST, None, "bad request\n"),
     }
 }
-async fn spawn_tunnel<S>(
-    request: &mut Request<Incoming>,
+async fn spawn_tunnel<B, S>(
+    request: &mut Request<B>,
     upstream: S,
     shutdown: crate::Shutdown,
     tunnels: Arc<tokio::sync::Mutex<tokio::task::JoinSet<anyhow::Result<()>>>>,
@@ -221,7 +251,7 @@ async fn authorize(parts: &hyper::http::request::Parts, context: &RequestContext
                 }
                 Err(error) => {
                     report(&error);
-                    record_best_effort(context, target).await;
+                    record_best_effort(context, target, Mode::Enforce).await;
                     return HeadDecision::Respond(fixed(
                         StatusCode::FORBIDDEN,
                         None,
@@ -230,18 +260,17 @@ async fn authorize(parts: &hyper::http::request::Parts, context: &RequestContext
                 }
             };
             if !decision.allowed {
-                record_best_effort(context, target).await;
+                record_best_effort(context, target, decision.effective_mode).await;
                 return HeadDecision::Respond(fixed(StatusCode::FORBIDDEN, None, "forbidden\n"));
             }
-            if decision.record_denial
-                && let Err(error) = record(context, target).await
-            {
-                report(&error);
-                return HeadDecision::Respond(fixed(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    None,
-                    "internal server error\n",
-                ));
+            if decision.record_denial {
+                match record(context, target, decision.effective_mode).await {
+                    AuditResult::AppendFailed => {
+                        report(&"denial_log_append_failed");
+                        return HeadDecision::Respond(report_log_unavailable());
+                    }
+                    AuditResult::Recorded | AuditResult::Disabled => {}
+                }
             }
             HeadDecision::Forward(route)
         }
@@ -256,7 +285,7 @@ async fn authorize(parts: &hyper::http::request::Parts, context: &RequestContext
                 report(&error);
                 false
             }) {
-                record_best_effort(context, target).await;
+                record_best_effort(context, target, Mode::Enforce).await;
                 return HeadDecision::Respond(fixed(StatusCode::FORBIDDEN, None, "forbidden\n"));
             }
             HeadDecision::Forward(route)
@@ -296,7 +325,14 @@ async fn dispatch(
 }
 async fn direct(path: &str, context: &RequestContext) -> Response<ProxyBody> {
     match path {
-        "/healthz" => fixed(StatusCode::OK, None, "ok\n"),
+        "/healthz" => match context.health.read().await {
+            Health::Healthy => fixed(StatusCode::OK, Some("text/plain; charset=utf-8"), "ok\n"),
+            Health::Unhealthy => fixed(
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("text/plain; charset=utf-8"),
+                "unhealthy\n",
+            ),
+        },
         "/__status" => {
             let (mode, warning) = crate::domain::policy::effective_status_mode(
                 context.config.allowlists.as_slice(),
@@ -344,22 +380,40 @@ async fn collect_limited<B: Body<Data = Bytes> + Unpin>(
 async fn record<T: Into<DenialDestination>>(
     context: &RequestContext,
     destination: T,
-) -> anyhow::Result<()> {
-    DenialRecorder::new(context.config.deny_log.clone())
-        .record(&destination.into())
-        .await
+    mode: Mode,
+) -> AuditResult {
+    context.audit.record(&destination.into(), mode).await
 }
-async fn record_best_effort<T: Into<DenialDestination>>(context: &RequestContext, destination: T) {
-    if let Err(error) = record(context, destination).await {
-        report(&error);
+async fn record_best_effort<T: Into<DenialDestination>>(
+    context: &RequestContext,
+    destination: T,
+    mode: Mode,
+) {
+    if record(context, destination, mode).await == AuditResult::AppendFailed {
+        report(&"denial_log_append_failed");
     }
+}
+
+fn report_log_unavailable() -> Response<ProxyBody> {
+    let mut response = fixed(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Some("text/plain; charset=utf-8"),
+        "proxy temporarily unavailable\n",
+    );
+    response.headers_mut().insert(
+        header::CONNECTION,
+        header::HeaderValue::from_static("close"),
+    );
+    response
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connect::public::{DialFuture, NumericDialer, ResolveFuture, Resolver};
     use std::{
         convert::Infallible,
+        net::SocketAddr,
         pin::Pin,
         sync::{
             Arc,
@@ -367,6 +421,7 @@ mod tests {
         },
         task::{Context, Poll},
     };
+    use tokio::io::AsyncReadExt;
 
     struct PanicOnPoll(Arc<AtomicUsize>);
 
@@ -384,6 +439,23 @@ mod tests {
     }
 
     struct PendingBody;
+
+    struct CountingResolver(Arc<AtomicUsize>);
+
+    impl Resolver for CountingResolver {
+        fn resolve(&self, _: String, _: u16) -> ResolveFuture {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(vec!["8.8.8.8".parse().unwrap()]) })
+        }
+    }
+
+    struct UnusedDialer;
+
+    impl NumericDialer for UnusedDialer {
+        fn dial(&self, _: SocketAddr) -> DialFuture {
+            Box::pin(async { panic!("report-mode audit failure must not dial") })
+        }
+    }
 
     impl Body for PendingBody {
         type Data = Bytes;
@@ -444,20 +516,17 @@ mod tests {
     #[tokio::test]
     async fn healthz_does_not_poll_its_body() {
         let directory = tempfile::tempdir().unwrap();
+        let allowlist = directory.path().join("allowlist");
+        let mode = directory.path().join("mode");
+        std::fs::write(&allowlist, "").unwrap();
+        std::fs::write(&mode, "enforce\n").unwrap();
         let polls = Arc::new(AtomicUsize::new(0));
         let request = Request::builder()
             .uri("/healthz")
             .body(PanicOnPoll(polls.clone()))
             .unwrap();
 
-        let response = handle_http(
-            request,
-            context(
-                &directory.path().join("allowlist"),
-                &directory.path().join("mode"),
-            ),
-        )
-        .await;
+        let response = handle_http(request, context(&allowlist, &mode)).await;
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(polls.load(Ordering::SeqCst), 0);
@@ -540,7 +609,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn report_mode_audit_write_failure_is_internal_error() {
+    async fn report_mode_audit_write_failure_is_503_and_never_dials() {
         let directory = tempfile::tempdir().unwrap();
         let allowlist = directory.path().join("allowlist");
         let mode = directory.path().join("mode");
@@ -552,14 +621,82 @@ mod tests {
             .uri("http://denied.example/")
             .body(Full::new(Bytes::new()))
             .unwrap();
+        let config = Config::resolve(|name| match name {
+            "VHRN_ALLOWLIST" => Some(allowlist.display().to_string()),
+            "VHRN_MODE_FILE" => Some(mode.display().to_string()),
+            "VHRN_PROXY_LISTEN" => Some("127.0.0.1:8080".to_owned()),
+            "VHRN_DENY_LOG" => Some(deny_log.display().to_string()),
+            _ => None,
+        })
+        .unwrap();
+        let (upstream, mut peer) = tokio::io::duplex(1024);
+        let context = Arc::new(RequestContext::new(
+            config,
+            PublicConnector::test_with_stream(upstream),
+            None,
+            crate::Shutdown::new(),
+        ));
 
-        let response = handle_http(
-            request,
-            context_with_log(&allowlist, &mode, Some(&deny_log)),
-        )
-        .await;
+        let response = handle_http(request, context).await;
 
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::CONNECTION], "close");
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"proxy temporarily unavailable\n")
+        );
+        let mut dial_bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut dial_bytes))
+            .await
+            .expect("connector closes without a dial")
+            .expect("read connector peer");
+        assert!(dial_bytes.is_empty(), "report append failure must not dial");
+    }
+
+    #[tokio::test]
+    async fn report_mode_connect_audit_write_failure_is_503_and_never_resolves() {
+        let directory = tempfile::tempdir().unwrap();
+        let allowlist = directory.path().join("allowlist");
+        let mode = directory.path().join("mode");
+        let deny_log = directory.path().join("deny-log-directory");
+        std::fs::write(&allowlist, "allowed.example\n").unwrap();
+        std::fs::write(&mode, "report\n").unwrap();
+        std::fs::create_dir(&deny_log).unwrap();
+        let config = Config::resolve(|name| match name {
+            "VHRN_ALLOWLIST" => Some(allowlist.display().to_string()),
+            "VHRN_MODE_FILE" => Some(mode.display().to_string()),
+            "VHRN_PROXY_LISTEN" => Some("127.0.0.1:8080".to_owned()),
+            "VHRN_DENY_LOG" => Some(deny_log.display().to_string()),
+            _ => None,
+        })
+        .unwrap();
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let context = Arc::new(RequestContext::new(
+            config,
+            PublicConnector::new(
+                Arc::new(CountingResolver(resolves.clone())),
+                Arc::new(UnusedDialer),
+            ),
+            None,
+            crate::Shutdown::new(),
+        ));
+        let mut request = Request::builder()
+            .method(Method::CONNECT)
+            .uri("denied.example:443")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let tunnels = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
+
+        let response = handle_connect(&mut request, context, tunnels.clone()).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::CONNECTION], "close");
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"proxy temporarily unavailable\n")
+        );
+        assert_eq!(resolves.load(Ordering::SeqCst), 0);
+        assert!(tunnels.lock().await.is_empty());
     }
 
     #[test]
