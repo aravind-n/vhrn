@@ -1,6 +1,6 @@
-# Pull-request gate. Only changed CLI, proxy candidate, shipping proxy, image, and script
-# components are exercised; ci-gate is the single required status check, so a skipped
-# component never blocks the merge. master runs the full suite unfiltered (see nightly.yml).
+# Pull-request gate. Tests and deliverable builds have separate path selectors; ci-gate
+# is the single required status check, so an unselected build may skip without blocking
+# the merge. master runs the full suite unfiltered (see nightly.yml).
 name: ci
 
 on:
@@ -20,8 +20,12 @@ jobs:
       cli: ${{ steps.filter.outputs.cli }}
       proxy_rs: ${{ steps.filter.outputs.proxy_rs }}
       proxy_go: ${{ steps.filter.outputs.proxy_go }}
-      images: ${{ steps.filter.outputs.images }}
       scripts: ${{ steps.filter.outputs.scripts }}
+      test_selected: ${{ steps.filter.outputs.cli == 'true' || steps.filter.outputs.proxy_rs == 'true' || steps.filter.outputs.proxy_go == 'true' || steps.filter.outputs.scripts == 'true' }}
+      build_cli: ${{ steps.filter.outputs.build_cli }}
+      build_proxy_go: ${{ steps.filter.outputs.build_proxy_go }}
+      build_proxy_rs: ${{ steps.filter.outputs.build_proxy_rs }}
+      build_harness_images: ${{ steps.filter.outputs.build_harness_images }}
       workflows: ${{ steps.filter.outputs.workflows }}
     steps:
       - uses: actions/checkout@v7
@@ -43,11 +47,37 @@ jobs:
             proxy_go:
               - 'proxy/**'
               - 'shared/testdata/**'
-            images:
-              - 'image/**'
             scripts:
               - 'pages/**'
               - 'image/base/entrypoint.sh'
+            build_cli:
+              - 'cli/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'Cross.toml'
+              - 'proxy-rs/Cargo.toml'
+              - '.github/workflows/_build-binaries.yml'
+            build_proxy_go:
+              - 'proxy/Dockerfile'
+              - 'proxy/go.mod'
+              - 'proxy/main.go'
+              - 'proxy/egress/**'
+              - '.github/workflows/_build-proxy-go.yml'
+            build_proxy_rs:
+              - 'proxy-rs/Dockerfile'
+              - 'proxy-rs/Cargo.toml'
+              - 'proxy-rs/src/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'cli/Cargo.toml'
+              - '.github/workflows/_build-proxy-rs.yml'
+            build_harness_images:
+              - 'image/base/Dockerfile'
+              - 'image/base/entrypoint.sh'
+              - 'image/claude/Dockerfile'
+              - 'image/codex/Dockerfile'
+              - 'image/pi/Dockerfile'
+              - '.github/workflows/_build-harness-images.yml'
             workflows:
               - '.github/workflows/**'
 
@@ -60,13 +90,73 @@ jobs:
       run_proxy_go: ${{ needs.changes.outputs.proxy_go == 'true' }}
       run_scripts: ${{ needs.changes.outputs.scripts == 'true' }}
 
-  images:
-    needs: changes
-    if: ${{ needs.changes.outputs.images == 'true' || needs.changes.outputs.proxy_go == 'true' }}
+  build-cli:
+    needs: [changes, test]
+    if: >-
+      ${{
+        always() &&
+        (
+          needs.test.result == 'success' ||
+          (needs.test.result == 'skipped' && needs.changes.outputs.test_selected != 'true')
+        ) &&
+        needs.changes.outputs.build_cli == 'true'
+      }}
+    uses: ./.github/workflows/_build-binaries.yml
+    with:
+      version: pr-${{ github.event.number }}
+
+  build-proxy-go:
+    needs: [changes, test, build-cli]
+    if: >-
+      ${{
+        always() &&
+        (
+          needs.test.result == 'success' ||
+          (needs.test.result == 'skipped' && needs.changes.outputs.test_selected != 'true')
+        ) &&
+        (needs['build-cli'].result == 'success' || needs['build-cli'].result == 'skipped') &&
+        needs.changes.outputs.build_proxy_go == 'true'
+      }}
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/_build-images.yml
+    uses: ./.github/workflows/_build-proxy-go.yml
+    with:
+      flavor: pr
+      push: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+
+  build-proxy-rs:
+    needs: [changes, test, build-cli]
+    if: >-
+      ${{
+        always() &&
+        (
+          needs.test.result == 'success' ||
+          (needs.test.result == 'skipped' && needs.changes.outputs.test_selected != 'true')
+        ) &&
+        (needs['build-cli'].result == 'success' || needs['build-cli'].result == 'skipped') &&
+        needs.changes.outputs.build_proxy_rs == 'true'
+      }}
+    uses: ./.github/workflows/_build-proxy-rs.yml
+
+  build-harness-images:
+    needs: [changes, test, build-cli, build-proxy-go, build-proxy-rs]
+    if: >-
+      ${{
+        always() &&
+        (
+          needs.test.result == 'success' ||
+          (needs.test.result == 'skipped' && needs.changes.outputs.test_selected != 'true')
+        ) &&
+        (needs['build-cli'].result == 'success' || needs['build-cli'].result == 'skipped') &&
+        (needs['build-proxy-go'].result == 'success' || needs['build-proxy-go'].result == 'skipped') &&
+        (needs['build-proxy-rs'].result == 'success' || needs['build-proxy-rs'].result == 'skipped') &&
+        needs.changes.outputs.build_harness_images == 'true'
+      }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/_build-harness-images.yml
     with:
       flavor: pr
       push: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
@@ -85,17 +175,64 @@ jobs:
       - run: ${{ steps.get.outputs.executable }} -color
         shell: bash
 
-  # The one required status check: green iff every job above passed or was skipped.
+  # The one required status check: selected work must succeed; only unselected optional
+  # jobs may be skipped.
   ci-gate:
-    needs: [changes, test, images, actionlint]
+    needs:
+      - changes
+      - test
+      - build-cli
+      - build-proxy-go
+      - build-proxy-rs
+      - build-harness-images
+      - actionlint
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Require green or skipped
+      - name: Require selected jobs to pass
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          TEST_SELECTED: ${{ needs.changes.outputs.test_selected }}
+          TEST_RESULT: ${{ needs.test.result }}
+          BUILD_CLI_SELECTED: ${{ needs.changes.outputs.build_cli }}
+          BUILD_CLI_RESULT: ${{ needs['build-cli'].result }}
+          BUILD_PROXY_GO_SELECTED: ${{ needs.changes.outputs.build_proxy_go }}
+          BUILD_PROXY_GO_RESULT: ${{ needs['build-proxy-go'].result }}
+          BUILD_PROXY_RS_SELECTED: ${{ needs.changes.outputs.build_proxy_rs }}
+          BUILD_PROXY_RS_RESULT: ${{ needs['build-proxy-rs'].result }}
+          BUILD_HARNESS_IMAGES_SELECTED: ${{ needs.changes.outputs.build_harness_images }}
+          BUILD_HARNESS_IMAGES_RESULT: ${{ needs['build-harness-images'].result }}
+          ACTIONLINT_SELECTED: ${{ needs.changes.outputs.workflows }}
+          ACTIONLINT_RESULT: ${{ needs.actionlint.result }}
         run: |
-          for r in "${{ needs.changes.result }}" "${{ needs.test.result }}" "${{ needs.images.result }}" "${{ needs.actionlint.result }}"; do
-            case "$r" in
+          require_success() {
+            name=$1
+            result=$2
+            if [ "$result" != success ]; then
+              echo "$name was required but did not pass: $result"
+              exit 1
+            fi
+          }
+
+          require_optional() {
+            name=$1
+            selected=$2
+            result=$3
+            if [ "$selected" = true ]; then
+              require_success "$name" "$result"
+              return
+            fi
+            case "$result" in
               success | skipped) ;;
-              *) echo "a required job did not pass: $r"; exit 1 ;;
+              *) echo "$name was not selected but did not skip cleanly: $result"; exit 1 ;;
             esac
-          done
+          }
+
+          require_success changes "$CHANGES_RESULT"
+          require_optional test "$TEST_SELECTED" "$TEST_RESULT"
+          require_optional build-cli "$BUILD_CLI_SELECTED" "$BUILD_CLI_RESULT"
+          require_optional build-proxy-go "$BUILD_PROXY_GO_SELECTED" "$BUILD_PROXY_GO_RESULT"
+          require_optional build-proxy-rs "$BUILD_PROXY_RS_SELECTED" "$BUILD_PROXY_RS_RESULT"
+          require_optional build-harness-images \
+            "$BUILD_HARNESS_IMAGES_SELECTED" "$BUILD_HARNESS_IMAGES_RESULT"
+          require_optional actionlint "$ACTIONLINT_SELECTED" "$ACTIONLINT_RESULT"

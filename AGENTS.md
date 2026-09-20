@@ -38,7 +38,7 @@ Core behavioral invariants — keep these intact:
   carries the image name, in-container command, default egress domains, and the
   persistence descriptors. Dispatch, install, run, and persistence all read from it. Adding
   a harness = a spec + a `FROM vhrn-base` Dockerfile under `image/<harness>/` + a matrix
-  entry in `_build-images.yml`. No CLI fork. See `docs/adding-a-harness.md`.
+  entry in `_build-harness-images.yml`. No CLI fork. See `docs/adding-a-harness.md`.
 - **Both Apple `container` and Docker must work, for build and run.** `image/Makefile`,
   `proxy/Makefile`, and `cli/src/run.rs` (`detect_engine`) select the engine (explicit
   `ENGINE`/`VHRN_ENGINE`, else auto-detect `container` then `docker`) — keep them in sync.
@@ -182,8 +182,9 @@ For a local-image dev loop: `cargo install --path cli && make -C image && make -
 **CI/CD** (`.github/workflows/`): `ci.yml` is the PR gate (path-filtered per component behind
 a single `ci-gate`); `nightly.yml` publishes `nightly` images + a rolling `nightly` binary
 prerelease on master; `release.yml` publishes `vX.Y.Z`+`latest` images + a GitHub Release on
-a `v*` tag. Three reusable workflows (`_test`, `_build-images`, `_build-binaries`) plus
-`pages.yml`. See `docs/runbooks/release.md`.
+a `v*` tag. Reusable workflows separately own tests, CLI binaries, the shipping Go proxy, the
+Rust proxy candidate, and base/harness images (`_test`, `_build-binaries`, `_build-proxy-go`,
+`_build-proxy-rs`, `_build-harness-images`), plus `pages.yml`. See `docs/runbooks/release.md`.
 
 ## Code style guidelines
 

@@ -37,8 +37,9 @@ Edit only:
   coverage (behavioral fixes must go back to their owning phase instead of landing here);
 - `proxy-rs/Dockerfile` and `proxy-rs/Makefile` for qualification-only correctness;
 - candidate-only test scripts under `proxy-rs/tests/`;
-- `.github/workflows/_test.yml` and `.github/workflows/ci.yml` only to build/scan the isolated
-  candidate without selecting or publishing it;
+- `.github/workflows/_build-proxy-rs.yml`, `_test.yml`, and `ci.yml` only to qualify and extend
+  the already-existing isolated candidate build with image smoke, dependency-audit, and
+  qualification integration without selecting it for production or publishing it;
 - dependency-audit configuration at the workspace root if required;
 - [`coverage.md`](coverage.md) only to record qualification evidence;
 - detailed implementation, validation, and review evidence in this file;
@@ -60,9 +61,12 @@ runtime defaults, versions, or immutable tags.
    Prove `/vhrn-proxy`, entrypoint, port 8080, `65532:65532`, scratch/no shell, static linkage, and
    behavioral equivalence. Run with a read-only root filesystem and all capabilities dropped using
    only the three documented mounts; it must not require any other writable path.
-4. Add a nonpublishing CI candidate-image build/smoke and a Rust dependency vulnerability audit.
-   Pin tool invocation sufficiently for reproducible review and fail on reachable/advisory findings
-   according to the repository's security posture. Do not push an image from this phase.
+4. Qualify and extend the already-existing nonpublishing `build-proxy-rs` branch in
+   `_build-proxy-rs.yml` with the required candidate-image smoke checks and a Rust dependency
+   vulnerability audit. Pin tool invocation sufficiently for reproducible review and fail on
+   reachable/advisory findings according to the repository's security posture. Keep production
+   image selection and Go proxy publication untouched. Do not push the candidate or assign it any
+   production, nightly, release, SHA, dated-nightly, or PR publication tag.
 5. Exercise the candidate under Apple `container` and Docker through a local Colima Unix socket,
    using only a disposable `vhrn-proxy:rust-candidate` tag or `VHRN_PROXY_IMAGE` override. Verify
    build, sidecar IP/readiness, exact mounts/env, agent proxy variables, firewall pinning, public
@@ -78,8 +82,10 @@ runtime defaults, versions, or immutable tags.
 - The process harness remains executable-agnostic through `VHRN_PROXY_TEST_BIN`.
 - Image smoke uses the contract's exact container paths and environment. Engine E2E selects the
   candidate only through the documented local tag/override and leaves production selection intact.
-- CI may cache/build candidate artifacts but must never call a registry push or assign production,
-  nightly, release, SHA, or PR publication tags to the candidate.
+- The existing `_build-proxy-rs.yml` branch may cache/build candidate artifacts and gain smoke and
+  audit steps, but it must never call a registry push or assign production, nightly, release, SHA,
+  dated-nightly, or PR publication tags to the candidate. `_build-proxy-go.yml` remains the sole
+  production `vhrn-proxy` publisher.
 
 ## Validation
 
@@ -91,7 +97,8 @@ Run and record:
 4. `cargo build --release --locked -p vhrn-proxy`
 5. The reviewed Rust dependency audit command added by this phase.
 6. `make -C proxy-rs ENGINE=docker TAG=rust-candidate`
-7. The candidate scratch/read-only-root Docker smoke and multi-platform build command.
+7. The candidate scratch/read-only-root Docker smoke and multi-platform build command matching
+   `_build-proxy-rs.yml`'s repository-root context, `proxy-rs/Dockerfile`, platforms, and settings.
 8. `make -C proxy-rs ENGINE=container TAG=rust-candidate`
 9. The documented Apple `container` E2E script/steps.
 10. The documented Docker/Colima E2E script/steps.
@@ -104,7 +111,8 @@ Run and record:
 - Image metadata, static-link, read-only-root, mount, no-capability, amd64, and arm64 results.
 - Exact engine/tool versions and successful Apple/Colima run transcripts with secrets and host
   paths redacted; explicit confirmation that nothing was published.
-- Dependency-audit result and final independent review/rereview approval.
+- `_build-proxy-rs.yml` candidate build/smoke result, dependency-audit result, and final independent
+  review/rereview approval.
 
 ## Completion criterion
 

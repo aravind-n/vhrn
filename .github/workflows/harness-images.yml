@@ -22,14 +22,14 @@ permissions:
   packages: write
 
 jobs:
-  images:
+  build-harness-images:
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/_build-images.yml
+    uses: ./.github/workflows/_build-harness-images.yml
     with:
       flavor: release          # publish the user-facing set: latest + version + version-date
-      components: harness       # base/proxy ride the CLI's release; only the harness here
+      build_base: false         # base and proxies ride the CLI release; only harnesses run here
       push: true
       # Skip when the agent version is already published, unless a dispatch forces it.
       skip_if_exists: ${{ !(github.event_name == 'workflow_dispatch' && inputs.force) }}

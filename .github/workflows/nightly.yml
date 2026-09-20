@@ -35,25 +35,45 @@ jobs:
           echo "version=${base}-nightly.${d}.${sha}" >> "$GITHUB_OUTPUT"
           echo "image_tag=nightly-${d}-${sha}" >> "$GITHUB_OUTPUT"
 
-  images:
-    needs: [test, version]
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/_build-images.yml
-    with:
-      flavor: nightly
-      push: true
-      extra_tag: ${{ needs.version.outputs.image_tag }}
-
-  binaries:
+  build-cli:
     needs: [test, version]
     uses: ./.github/workflows/_build-binaries.yml
     with:
       version: ${{ needs.version.outputs.version }}
 
+  build-proxy-go:
+    needs: [test, version, build-cli]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/_build-proxy-go.yml
+    with:
+      flavor: nightly
+      push: true
+      extra_tag: ${{ needs.version.outputs.image_tag }}
+
+  build-proxy-rs:
+    needs: [test, build-cli]
+    uses: ./.github/workflows/_build-proxy-rs.yml
+
+  build-harness-images:
+    needs: [test, version, build-cli, build-proxy-go, build-proxy-rs]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/_build-harness-images.yml
+    with:
+      flavor: nightly
+      push: true
+      extra_tag: ${{ needs.version.outputs.image_tag }}
+
   publish:
-    needs: [version, binaries]
+    needs:
+      - version
+      - build-cli
+      - build-proxy-go
+      - build-proxy-rs
+      - build-harness-images
     runs-on: ubuntu-latest
     permissions:
       contents: write
