@@ -58,8 +58,8 @@ does not open predecessor or pre-flight documents to reconstruct readiness.
 | Phase 3 | Complete | Phase 2 | [Strict live policy](phase-03-policy.md) |
 | Phase 4 | Complete | Phase 3 | [Startup and audit health](phase-04-startup-audit.md) |
 | Phase 5 | Complete | Phase 4 | [Targets and safe outcomes](phase-05-targets-outcomes.md) |
-| Phase 6 | Ready | Phase 5 | [HTTP/1 ingress](phase-06-http-ingress.md) |
-| Phase 7 | Blocked | Phase 6 | [Public dialing](phase-07-public-dialing.md) |
+| Phase 6 | Complete | Phase 5 | [HTTP/1 ingress](phase-06-http-ingress.md) |
+| Phase 7 | Ready | Phase 6 | [Public dialing](phase-07-public-dialing.md) |
 | Phase 8 | Blocked | Phase 7 | [Loopback broker](phase-08-broker.md) |
 | Phase 9 | Blocked | Phase 8 | [HTTP forwarding](phase-09-forwarding.md) |
 | Phase 10 | Blocked | Phase 9 | [CONNECT tunnels](phase-10-connect.md) |

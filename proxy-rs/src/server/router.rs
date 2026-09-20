@@ -1,14 +1,19 @@
 //! Request-head authorization and origin dispatch.
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
+#[cfg(test)]
+use std::time::Duration;
+
+#[cfg(test)]
 use anyhow::Context;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::{
-    Method, Request, Response, StatusCode,
-    body::{Body, Incoming},
-    header,
-};
+#[cfg(test)]
+use http_body_util::BodyExt;
+use http_body_util::Full;
+#[cfg(test)]
+use hyper::body::Body;
+use hyper::{Method, Request, Response, StatusCode, header};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
 
 use crate::{
     config::Config,
@@ -16,17 +21,32 @@ use crate::{
     diagnostics::{AuditResult, AuditService, DenialDestination, Health, HealthService, report},
     domain::{
         policy::{Mode, decide_local, decide_public},
-        target::{DirectTarget, LocalTarget, PublicTarget, Target, classify_parsed},
+        target::{DirectTarget, LocalTarget, PublicTarget, Target, classify},
     },
-    server::response::{ProxyBody, ProxyFailure, failure, fixed, origin, represented},
+    server::{
+        http1::{BodyFrame, Http1Connection, RequestHead},
+        response::{ProxyBody, ProxyFailure, failure, fixed, origin, represented},
+    },
 };
 
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MODE_BYTES: u64 = 8;
+const _: () = {
+    // Phase 6 supersedes the whole-policy status bridge without changing its owning module.
+    let _ = crate::domain::policy::effective_status_mode;
+    let _ = crate::domain::target::classify_parsed;
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const O_NONBLOCK: i32 = 0x800;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const O_NONBLOCK: i32 = 0x4;
+#[cfg(test)]
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) struct RequestContext {
     pub(crate) config: Config,
     pub(crate) public: PublicConnector,
     pub(crate) local: Option<BrokerConnector>,
+    #[cfg(test)]
     pub(crate) shutdown: crate::Shutdown,
     audit: AuditService,
     health: Arc<HealthService>,
@@ -47,7 +67,7 @@ impl RequestContext {
         config: Config,
         public: PublicConnector,
         local: Option<BrokerConnector>,
-        shutdown: crate::Shutdown,
+        shutdown: &crate::Shutdown,
     ) -> Self {
         let audit = config.deny_log.clone();
         let health = Arc::new(HealthService::new(
@@ -67,15 +87,18 @@ impl RequestContext {
         config: Config,
         public: PublicConnector,
         local: Option<BrokerConnector>,
-        shutdown: crate::Shutdown,
+        shutdown: &crate::Shutdown,
         audit: AuditService,
         health: Arc<HealthService>,
     ) -> Self {
+        #[cfg(not(test))]
+        let _ = shutdown;
         Self {
             config,
             public,
             local,
-            shutdown,
+            #[cfg(test)]
+            shutdown: shutdown.clone(),
             audit,
             health,
             #[cfg(test)]
@@ -89,6 +112,9 @@ impl RequestContext {
         self
     }
 }
+
+#[cfg(test)]
+use crate::domain::target::classify_parsed;
 enum AuthorizedRoute {
     Direct(DirectTarget),
     Asterisk,
@@ -97,17 +123,200 @@ enum AuthorizedRoute {
     PublicConnect(PublicTarget),
     LocalConnect(LocalTarget),
 }
-pub(crate) async fn handle(
-    mut request: Request<Incoming>,
-    context: Arc<RequestContext>,
-    tunnels: Arc<tokio::sync::Mutex<tokio::task::JoinSet<anyhow::Result<()>>>>,
-) -> Response<ProxyBody> {
-    if request.method() == Method::CONNECT {
-        return handle_connect(&mut request, context, tunnels).await;
-    }
-    handle_http(request, context).await
+
+pub(crate) struct Http1Outcome {
+    pub(crate) response: Response<ProxyBody>,
+    pub(crate) body_consumed: bool,
+    pub(crate) reusable: bool,
 }
 
+pub(crate) trait TunnelIo: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> TunnelIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+pub(crate) type BoxTunnel = Box<dyn TunnelIo>;
+
+pub(crate) async fn handle_http1<S>(
+    head: RequestHead,
+    connection: &mut Http1Connection<S>,
+    context: Arc<RequestContext>,
+) -> Http1Outcome
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let is_head = head.method == Method::HEAD;
+    let target = classify(&head.method, &head.raw_target);
+    let route = match authorize(target, &context).await {
+        Ok(route) => route,
+        Err(error) => {
+            let reusable = matches!(
+                error,
+                ProxyFailure::PublicDenied(_) | ProxyFailure::LocalDenied(_)
+            );
+            return Http1Outcome {
+                response: failure(error, is_head),
+                body_consumed: false,
+                reusable,
+            };
+        }
+    };
+    match route {
+        AuthorizedRoute::Direct(target) => Http1Outcome {
+            response: direct(&head.method, &target, &context).await,
+            body_consumed: false,
+            reusable: true,
+        },
+        AuthorizedRoute::Asterisk => Http1Outcome {
+            response: asterisk(&head.method),
+            body_consumed: false,
+            reusable: head.method == Method::OPTIONS,
+        },
+        route @ (AuthorizedRoute::PublicHttp(_) | AuthorizedRoute::LocalHttp(_)) => {
+            if expects_continue(&head.headers)
+                && (connection
+                    .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                    .await
+                    .is_err()
+                    || connection.flush().await.is_err())
+            {
+                return Http1Outcome {
+                    response: failure(ProxyFailure::BadRequest, is_head),
+                    body_consumed: false,
+                    reusable: false,
+                };
+            }
+            let Ok(body) = collect_http1_body(connection, head.framing).await else {
+                return Http1Outcome {
+                    response: failure(ProxyFailure::BadRequest, is_head),
+                    body_consumed: false,
+                    reusable: false,
+                };
+            };
+            let Ok(raw_target) = std::str::from_utf8(&head.raw_target) else {
+                return Http1Outcome {
+                    response: failure(ProxyFailure::BadRequest, is_head),
+                    body_consumed: true,
+                    reusable: false,
+                };
+            };
+            let Ok(uri) = raw_target.parse() else {
+                return Http1Outcome {
+                    response: failure(ProxyFailure::BadRequest, is_head),
+                    body_consumed: true,
+                    reusable: false,
+                };
+            };
+            let mut request = Request::new(Full::new(body));
+            *request.method_mut() = head.method;
+            *request.uri_mut() = uri;
+            *request.version_mut() = head.version;
+            *request.headers_mut() = head.headers;
+            Http1Outcome {
+                response: dispatch(request, route, context, is_head).await,
+                body_consumed: true,
+                reusable: true,
+            }
+        }
+        AuthorizedRoute::PublicConnect(_) | AuthorizedRoute::LocalConnect(_) => Http1Outcome {
+            response: failure(ProxyFailure::BadRequest, is_head),
+            body_consumed: false,
+            reusable: false,
+        },
+    }
+}
+
+fn expects_continue(headers: &hyper::HeaderMap) -> bool {
+    let mut found = false;
+    for value in headers.get_all(header::EXPECT) {
+        for member in value.as_bytes().split(|byte| *byte == b',') {
+            let member = trim_ows(member);
+            if member.is_empty() || !member.eq_ignore_ascii_case(b"100-continue") {
+                return false;
+            }
+            found = true;
+        }
+    }
+    found
+}
+
+fn trim_ows(mut value: &[u8]) -> &[u8] {
+    while value
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[1..];
+    }
+    while value
+        .last()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+pub(crate) async fn connect_http1(
+    head: &RequestHead,
+    context: &RequestContext,
+) -> Result<BoxTunnel, ProxyFailure> {
+    let target = classify(&head.method, &head.raw_target);
+    match authorize(target, context).await? {
+        AuthorizedRoute::PublicConnect(target) => match context.public.connect_target(target).await
+        {
+            Ok(stream) => Ok(Box::new(stream)),
+            Err(error) => {
+                report(&error);
+                Err(ProxyFailure::BadGateway)
+            }
+        },
+        AuthorizedRoute::LocalConnect(target) => match &context.local {
+            Some(connector) => match connector.connect(target.canonical_authority()).await {
+                Ok(stream) => Ok(Box::new(stream)),
+                Err(error) => {
+                    report(&error);
+                    Err(ProxyFailure::BadGateway)
+                }
+            },
+            None => Err(ProxyFailure::LocalDenied(
+                target.canonical_authority().to_string(),
+            )),
+        },
+        _ => Err(ProxyFailure::BadRequest),
+    }
+}
+
+pub(crate) async fn drain_http1_body<S>(
+    connection: &mut Http1Connection<S>,
+    framing: crate::server::http1::BodyFraming,
+) -> Result<(), ()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut body = connection.incoming_body(framing);
+    while body.next_frame().await.map_err(|_| ())?.is_some() {}
+    Ok(())
+}
+
+async fn collect_http1_body<S>(
+    connection: &mut Http1Connection<S>,
+    framing: crate::server::http1::BodyFraming,
+) -> Result<Bytes, ()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut body = connection.incoming_body(framing);
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.next_frame().await.map_err(|_| ())? {
+        if let BodyFrame::Data(data) = frame {
+            if data.len() > MAX_BODY_BYTES.saturating_sub(bytes.len()) {
+                return Err(());
+            }
+            bytes.extend_from_slice(&data);
+        }
+    }
+    Ok(Bytes::from(bytes))
+}
+#[cfg(test)]
 async fn handle_http<B>(request: Request<B>, context: Arc<RequestContext>) -> Response<ProxyBody>
 where
     B: Body<Data = Bytes> + Unpin,
@@ -138,6 +347,7 @@ where
         }
     }
 }
+#[cfg(test)]
 async fn handle_connect<B>(
     request: &mut Request<B>,
     context: Arc<RequestContext>,
@@ -183,6 +393,7 @@ async fn handle_connect<B>(
         Err(error) => failure(error, false),
     }
 }
+#[cfg(test)]
 async fn spawn_tunnel<B, S>(
     request: &mut Request<B>,
     upstream: S,
@@ -370,16 +581,11 @@ async fn direct(
             ),
         },
         b"/__status" => {
-            let (mode, warning) = crate::domain::policy::effective_status_mode(
-                context.config.allowlists.as_slice(),
-                &context.config.mode_file,
-            )
-            .await;
-            if let Some(warning) = warning {
-                report(&warning);
-            }
+            let mode = read_status_mode(&context.config.mode_file).await;
+            let status = mode.map_or(StatusCode::SERVICE_UNAVAILABLE, |_| StatusCode::OK);
+            let mode = mode.unwrap_or(Mode::Enforce);
             represented(
-                StatusCode::OK,
+                status,
                 Some("application/json"),
                 &format!("{{\"mode\":\"{mode}\"}}\n"),
                 head,
@@ -394,6 +600,30 @@ async fn direct(
     }
 }
 
+async fn read_status_mode(path: &std::path::Path) -> Option<Mode> {
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(path)
+        .await
+        .ok()?;
+    let metadata = file.metadata().await.ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_MODE_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
+    file.take(MAX_MODE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .ok()?;
+    match bytes.as_slice() {
+        b"enforce" | b"enforce\n" => Some(Mode::Enforce),
+        b"report" | b"report\n" => Some(Mode::Report),
+        b"open" | b"open\n" => Some(Mode::Open),
+        _ => None,
+    }
+}
+
 fn asterisk(method: &Method) -> Response<ProxyBody> {
     if method != Method::OPTIONS {
         return failure(ProxyFailure::BadRequest, method == Method::HEAD);
@@ -405,6 +635,7 @@ fn asterisk(method: &Method) -> Response<ProxyBody> {
     );
     response
 }
+#[cfg(test)]
 async fn collect_with_limits<B: Body<Data = Bytes> + Unpin>(
     body: B,
     timeout: Duration,
@@ -415,6 +646,7 @@ async fn collect_with_limits<B: Body<Data = Bytes> + Unpin>(
         .map_err(|_| ())?
 }
 
+#[cfg(test)]
 async fn collect_limited<B: Body<Data = Bytes> + Unpin>(
     mut body: B,
     limit: usize,
@@ -536,7 +768,7 @@ mod tests {
             config,
             PublicConnector::system(),
             None,
-            crate::Shutdown::new(),
+            &crate::Shutdown::new(),
         ))
     }
 
@@ -587,7 +819,7 @@ mod tests {
                     Arc::new(UnusedDialer),
                 ),
                 Some(BrokerConnector::test_with_connect_stream(broker_stream)),
-                crate::Shutdown::new(),
+                &crate::Shutdown::new(),
             )
             .with_authorization_spy(authorization.clone()),
         );
@@ -620,15 +852,22 @@ mod tests {
             assert_eq!(polls.load(Ordering::SeqCst), 0, "{uri}");
         }
 
-        let mut framed_connect = Request::builder()
-            .method(Method::CONNECT)
-            .uri("allowed.example:443")
-            .header(header::CONTENT_LENGTH, "0")
-            .body(Full::new(Bytes::new()))
-            .unwrap();
         let tunnels = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
-        let response = handle_connect(&mut framed_connect, context.clone(), tunnels).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        for (name, value) in [
+            (header::CONTENT_LENGTH, "0"),
+            (header::TRANSFER_ENCODING, "chunked"),
+            (header::EXPECT, "100-continue"),
+        ] {
+            let mut framed_connect = Request::builder()
+                .method(Method::CONNECT)
+                .uri("allowed.example:443")
+                .header(name, value)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let response =
+                handle_connect(&mut framed_connect, context.clone(), tunnels.clone()).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
 
         assert_eq!(authorization.policy_reads.load(Ordering::SeqCst), 0);
         assert_eq!(authorization.audit_writes.load(Ordering::SeqCst), 0);
@@ -708,18 +947,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_is_available_and_enforces_when_policy_is_unreadable_or_malformed() {
+    async fn status_rereads_only_mode_and_fails_closed_when_mode_is_invalid() {
         let directory = tempfile::tempdir().unwrap();
         let allowlist = directory.path().join("allowlist");
         let mode = directory.path().join("mode");
         let cases = [
-            (None, Some("allowed.example\n")),
-            (Some("open\n"), None),
-            (Some("open\n"), Some("bad!entry\n")),
-            (Some("unknown\n"), Some("allowed.example\n")),
-            (Some("open\nreport\n"), Some("allowed.example\n")),
+            (
+                None,
+                Some("allowed.example\n"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "enforce",
+            ),
+            (Some("open\n"), None, StatusCode::OK, "open"),
+            (Some("open\n"), Some("bad!entry\n"), StatusCode::OK, "open"),
+            (
+                Some("unknown\n"),
+                Some("allowed.example\n"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "enforce",
+            ),
+            (
+                Some("open\nreport\n"),
+                Some("allowed.example\n"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "enforce",
+            ),
         ];
-        for (mode_contents, layer_contents) in cases {
+        for (mode_contents, layer_contents, status, expected_mode) in cases {
             let _ = std::fs::remove_file(&mode);
             let _ = std::fs::remove_file(&allowlist);
             if let Some(contents) = mode_contents {
@@ -733,10 +987,10 @@ mod tests {
                 .body(Full::new(Bytes::new()))
                 .unwrap();
             let response = handle_http(request, context(&allowlist, &mode)).await;
-            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.status(), status);
             assert_eq!(
                 response.into_body().collect().await.unwrap().to_bytes(),
-                Bytes::from_static(b"{\"mode\":\"enforce\"}\n")
+                format!("{{\"mode\":\"{expected_mode}\"}}\n")
             );
         }
     }
@@ -809,7 +1063,7 @@ mod tests {
             config,
             PublicConnector::test_with_stream(upstream),
             None,
-            crate::Shutdown::new(),
+            &crate::Shutdown::new(),
         ));
 
         let response = handle_http(request, context).await;
@@ -853,7 +1107,7 @@ mod tests {
                 Arc::new(UnusedDialer),
             ),
             None,
-            crate::Shutdown::new(),
+            &crate::Shutdown::new(),
         ));
         let mut request = Request::builder()
             .method(Method::CONNECT)

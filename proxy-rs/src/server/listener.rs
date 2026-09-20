@@ -3,18 +3,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper::{Method, Version, header};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
 use crate::{
     Bootstrap, Shutdown,
-    server::router::{RequestContext, handle},
+    server::{
+        http1::{Http1Connection, IngressError, RequestHead},
+        response::{ProxyFailure, failure, write_connect_established, write_response},
+        router::{RequestContext, connect_http1, drain_http1_body, handle_http1},
+    },
 };
 
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_millis(800);
+const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONNECTIONS: usize = 64;
 pub(crate) async fn bind(address: std::net::SocketAddr) -> Result<TcpListener> {
     TcpListener::bind(address).await.map_err(|error| {
@@ -40,12 +43,7 @@ pub(crate) async fn serve(bootstrap: Bootstrap) -> Result<()> {
         shutdown,
     } = bootstrap;
     let context = Arc::new(RequestContext::with_services(
-        config,
-        public,
-        local,
-        shutdown.clone(),
-        audit,
-        health,
+        config, public, local, &shutdown, audit, health,
     ));
     let admission = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut connections = tokio::task::JoinSet::new();
@@ -103,70 +101,117 @@ where
     if shutdown.is_requested() {
         return Ok(());
     }
-    let tunnels = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
-    let service_tunnels = tunnels.clone();
-    let service = service_fn(move |request| {
-        let context = context.clone();
-        let tunnels = service_tunnels.clone();
-        async move { Ok::<_, hyper::Error>(handle(request, context, tunnels).await) }
-    });
-    let mut connection = Box::pin(
-        http1::Builder::new()
-            .max_headers(64)
-            .max_buf_size(16 * 1024)
-            .serve_connection(TokioIo::new(stream), service)
-            .with_upgrades(),
-    );
-    let (result, terminating) = tokio::select! {
-        result = &mut connection => {
-            let result = result.context("serve proxy connection");
-            let terminating = result.is_err();
-            (result, terminating)
-        }
-        () = shutdown.cancelled() => {
-            connection.as_mut().graceful_shutdown();
-            match tokio::time::timeout(CONNECTION_DRAIN_TIMEOUT, &mut connection).await {
-                Ok(Ok(())) | Err(_) => {}
-                Ok(Err(error)) => crate::diagnostics::report(
-                    &anyhow::Error::new(error).context("drain proxy connection during shutdown"),
-                ),
+    let mut connection = Http1Connection::new(stream);
+    loop {
+        let Some(head) = read_request_head(&mut connection, &shutdown).await else {
+            return Ok(());
+        };
+
+        if head.method == Method::CONNECT {
+            let framed = head.headers.contains_key(header::TRANSFER_ENCODING)
+                || head.headers.contains_key(header::CONTENT_LENGTH)
+                || head.expect;
+            if framed {
+                let response = failure(ProxyFailure::BadRequest, false);
+                let _ = write_response(&mut connection, response, head.version, &head.method, true)
+                    .await;
+                return Ok(());
             }
-            (Ok(()), true)
+            let upstream = match connect_http1(&head, &context).await {
+                Ok(upstream) => upstream,
+                Err(error) => {
+                    let response = failure(error, false);
+                    let close = head.close;
+                    let closed = write_response(
+                        &mut connection,
+                        response,
+                        head.version,
+                        &head.method,
+                        close,
+                    )
+                    .await?;
+                    if closed {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            };
+            write_connect_established(&mut connection).await?;
+            return crate::server::relay::relay(connection.into_buffered_io(), upstream, shutdown)
+                .await
+                .context("relay CONNECT tunnel");
         }
-    };
-    let mut tunnels = tunnels.lock().await;
-    if terminating {
-        drain_tunnels(&mut tunnels, CONNECTION_DRAIN_TIMEOUT).await;
-    } else {
-        observe_tunnels_until_shutdown(&mut tunnels, &shutdown).await;
-        if shutdown.is_requested() {
-            drain_tunnels(&mut tunnels, CONNECTION_DRAIN_TIMEOUT).await;
+
+        if head.upgrade {
+            let response = failure(ProxyFailure::NotImplemented, head.method == Method::HEAD);
+            let _ =
+                write_response(&mut connection, response, head.version, &head.method, true).await;
+            return Ok(());
+        }
+
+        let framing = head.framing;
+        let request_expect = head.expect;
+        let request_close = head.close;
+        let version = head.version;
+        let method = head.method.clone();
+        let outcome = handle_http1(head, &mut connection, context.clone()).await;
+        let close = request_close
+            || !outcome.reusable
+            || (!outcome.body_consumed && request_expect && framing.has_body());
+        let closed =
+            write_response(&mut connection, outcome.response, version, &method, close).await?;
+        if closed {
+            return Ok(());
+        }
+        if !outcome.body_consumed
+            && framing.has_body()
+            && drain_http1_body(&mut connection, framing).await.is_err()
+        {
+            return Ok(());
         }
     }
-    result
 }
 
-/// Keeps completed CONNECT relays observed while their HTTP connection has ended.
-///
-/// An HTTP/1 CONNECT response completes before the upgraded stream does.  A normal
-/// connection completion is therefore not a lifecycle boundary for its tunnels.
-async fn observe_tunnels_until_shutdown(
-    tunnels: &mut tokio::task::JoinSet<anyhow::Result<()>>,
+async fn read_request_head<S>(
+    connection: &mut Http1Connection<S>,
     shutdown: &Shutdown,
-) {
-    while !tunnels.is_empty() {
-        tokio::select! {
-            () = shutdown.cancelled() => break,
-            joined = tunnels.join_next() => {
-                if let Some(joined) = joined {
-                    report_task_result(joined, false, "join CONNECT tunnel");
-                }
-            }
+) -> Option<RequestHead>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let started = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return None,
+        result = connection.wait_for_head_start() => result,
+    };
+    if !matches!(started, Ok(true)) {
+        return None;
+    }
+    let result = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return None,
+        result = tokio::time::timeout(REQUEST_HEAD_TIMEOUT, connection.read_head()) => result,
+    };
+    match result {
+        Ok(Ok(Some(head))) => Some(head),
+        Err(_) | Ok(Ok(None)) => None,
+        Ok(Err(error)) => {
+            let is_head = connection.request_is_head();
+            let failure_kind = match error {
+                IngressError::HeadersTooLarge => ProxyFailure::HeadersTooLarge,
+                IngressError::UnsupportedVersion => ProxyFailure::UnsupportedVersion,
+                IngressError::BadRequest | IngressError::Incomplete => ProxyFailure::BadRequest,
+            };
+            let response = failure(failure_kind, is_head);
+            let method = if is_head { Method::HEAD } else { Method::GET };
+            let _ = write_response(connection, response, Version::HTTP_11, &method, true).await;
+            None
         }
     }
 }
 
 /// Wait briefly for CONNECT relays, then cancel and observe every remaining task.
+#[cfg(test)]
 async fn drain_tunnels(
     tunnels: &mut tokio::task::JoinSet<anyhow::Result<()>>,
     deadline: Duration,
@@ -325,6 +370,78 @@ mod tests {
         assert!(acquire_connection_permit(&admission).is_none());
     }
 
+    fn direct_context(directory: &std::path::Path, shutdown: &Shutdown) -> Arc<RequestContext> {
+        let allowlist = directory.join("allowlist");
+        let mode = directory.join("mode");
+        std::fs::write(&allowlist, "allowed.example\n").expect("allowlist");
+        std::fs::write(&mode, "enforce\n").expect("mode");
+        let config = crate::Config::resolve(|name| match name {
+            "VHRN_ALLOWLIST" => Some(allowlist.display().to_string()),
+            "VHRN_MODE_FILE" => Some(mode.display().to_string()),
+            "VHRN_PROXY_LISTEN" => Some("127.0.0.1:8080".to_owned()),
+            _ => None,
+        })
+        .expect("test config");
+        Arc::new(RequestContext::new(
+            config,
+            crate::connect::public::PublicConnector::system(),
+            None,
+            shutdown,
+        ))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn incomplete_head_closes_thirty_seconds_after_its_first_octet() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let shutdown = Shutdown::new();
+        let context = direct_context(directory.path(), &shutdown);
+        let (mut client, server_stream) = tokio::io::duplex(1024);
+        let server = tokio::spawn(serve_test_connection(server_stream, context, shutdown));
+
+        client.write_all(b"G").await.expect("partial head");
+        tokio::task::yield_now().await;
+        tokio::time::advance(REQUEST_HEAD_TIMEOUT + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+
+        let mut received = Vec::new();
+        client
+            .read_to_end(&mut received)
+            .await
+            .expect("closed client");
+        assert!(received.is_empty());
+        server.await.expect("server task").expect("server result");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_connection_has_no_request_head_deadline_before_its_first_octet() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let shutdown = Shutdown::new();
+        let context = direct_context(directory.path(), &shutdown);
+        let (mut client, server_stream) = tokio::io::duplex(2048);
+        let server_shutdown = shutdown.clone();
+        let server = tokio::spawn(serve_test_connection(
+            server_stream,
+            context,
+            server_shutdown,
+        ));
+
+        tokio::time::advance(REQUEST_HEAD_TIMEOUT + Duration::from_secs(1)).await;
+        client
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .expect("health request");
+        let mut response = Vec::new();
+        loop {
+            response.push(client.read_u8().await.expect("health response"));
+            if response.ends_with(b"ok\n") {
+                break;
+            }
+        }
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        shutdown.request();
+        server.await.expect("server task").expect("server result");
+    }
+
     async fn read_connect_response(client: &mut tokio::io::DuplexStream) {
         let mut response = Vec::new();
         loop {
@@ -365,7 +482,7 @@ mod tests {
             config,
             crate::connect::public::PublicConnector::test_with_stream(upstream),
             None,
-            shutdown.clone(),
+            &shutdown,
         ));
         let (mut client, server_stream) = tokio::io::duplex(1024);
         let server =
@@ -446,7 +563,7 @@ mod tests {
             config,
             crate::connect::public::PublicConnector::system(),
             Some(crate::connect::broker::BrokerConnector::test_with_connect_stream(upstream)),
-            shutdown.clone(),
+            &shutdown,
         ));
         let (mut client, server_stream) = tokio::io::duplex(1024);
         let server =
