@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Result, anyhow};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,14 +20,16 @@ async fn wait_for_shutdown_signal() -> Result<()> {
     {
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .context("register SIGTERM handler")?;
+                .map_err(|_| anyhow!("signal_handler_registration_failed"))?;
         tokio::select! {
-            result = tokio::signal::ctrl_c() => result.context("wait for Ctrl-C"),
+            result = tokio::signal::ctrl_c() => result.map_err(|_| anyhow!("signal_wait_failed")),
             _ = terminate.recv() => Ok(()),
         }
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await.context("wait for Ctrl-C")
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|_| anyhow!("signal_wait_failed"))
     }
 }

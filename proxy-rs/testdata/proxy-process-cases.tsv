@@ -4,8 +4,17 @@ direct	/__status	200	application/json mode JSON line-feed
 direct	/not-found	404	404 page not found line-feed
 diagnostic	denied.example	403	one RFC3339 tab destination line without broker token
 startup	no public path variables	start	one default public path
+startup	all empty default and optional values	start	empty values resolve as unset
 startup	partial local variables	fail	no listener
 startup	invalid local token	fail	no listener
 startup	listener address already bound	fail	no listener
 startup	broker readiness refused	fail	no accepting listener
+startup-runtime	invalid public policy	fail	stable redacted diagnostic and no listener
+startup-runtime	denial log open failure	fail	stable redacted diagnostic and no listener
+startup-runtime	broker readiness timeout	fail	bound listener never serves
+startup-runtime	cancellation after bind	terminate	listener and pending broker exchange close
+audit	concurrent denials	append	complete timestamped records preserve prior bytes
+audit	report append failure	503	no dial and sticky unhealthy state
+audit	enforced append failure	403	decision unchanged and sticky unhealthy state
+health	live invalid policy	503	repair restores health without restart
 lifecycle	SIGTERM	terminate	successful exit within one second after active connections and tunnels close

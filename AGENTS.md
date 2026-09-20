@@ -200,8 +200,17 @@ Rust proxy candidate, and base/harness images (`_test`, `_build-binaries`, `_bui
   path is absent. Kept shellcheck-clean.
 - **Go** (`proxy/`): standard library only — no third-party modules, no `go.sum`. Keep it
   `gofmt`- and `go vet`-clean.
-- **Commits:** Linux-kernel style (`cli: …`, `image: …`, `docs: …`), concise and
-  imperative — a short subject plus at most a line or two, not verbose.
+- **Commits:** Use Linux kernel style (`scope: imperative command`). Write the subject as an
+  instruction to edit the repository. A complete subject names both the codebase artifact and the
+  edit applied to it, using a repository-edit verb such as `add`, `move`, `split`, `extract`,
+  `replace`, `remove`, or `rename`. Keep the message concise: a short subject plus at most one or
+  two body lines.
+  - **Examples of good commit messages:**
+    - `api: add pagination middleware to collection endpoints`
+    - `database: split customer addresses into normalized tables`
+    - `web: extract checkout form into reusable component`
+  - **Reasoning:** States the repository mutation directly, so the commit history reads as a
+    sequence of concrete operations that transformed the project.
 
 ## Testing instructions
 
