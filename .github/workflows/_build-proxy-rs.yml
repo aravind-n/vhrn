@@ -1,0 +1,24 @@
+# Reusable: build the isolated Rust proxy candidate for both production platforms.
+# Qualification owns smoke checks later; this migration workflow deliberately has no
+# registry login, push input, metadata action, or publication tags.
+name: build-proxy-rs
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  proxy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: proxy-rs/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false

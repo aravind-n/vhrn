@@ -2,7 +2,7 @@
 
 A harness is a spec (`cli/src/harness.rs`) plus a thin `FROM vhrn-base` Dockerfile under
 `image/<harness>/`, and an entry in the CI publish matrix
-(`.github/workflows/_build-images.yml`) so its image lands on ghcr. The spec carries the
+(`.github/workflows/_build-harness-images.yml`) so its image lands on ghcr. The spec carries the
 image name, in-container command, immutable selected-harness egress minimum, and the persistence
 descriptors. No fork of the CLI is required.
 

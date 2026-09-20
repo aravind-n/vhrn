@@ -40,8 +40,9 @@ Edit only:
 - move all qualified `proxy-rs/**` content to `proxy/**`, then remove the old `proxy-rs/` path and
   every remaining legacy implementation/toolchain file under `proxy/`;
 - root `Cargo.toml`, `Cargo.lock`, and dependency-audit configuration;
-- `.github/workflows/_test.yml`, `_build-images.yml`, `ci.yml`, `nightly.yml`, `release.yml`, and
-  PR cleanup workflow only where path/build selection requires it;
+- `.github/workflows/_test.yml`, `_build-proxy-go.yml`, `_build-proxy-rs.yml`, `ci.yml`,
+  `nightly.yml`, `release.yml`, and the PR cleanup workflow only where test/build selection,
+  ownership, publication, or cleanup requires it;
 - `AGENTS.md`, `README.md`, `docs/sandbox-design.md`, `docs/runbooks/release.md`, and directly
   relevant proxy/operator docs;
 - detailed implementation, validation, and review evidence in this file;
@@ -63,17 +64,26 @@ of this phase.
 3. Change the local Makefile default from the qualification tag to the unqualified/latest local
    `vhrn-proxy` reference expected by `vhrn install --local`. Preserve engine selection order and
    the distinct Apple/Docker image-delete commands.
-4. Update image CI to build the Rust Dockerfile with repository root as context and
-   `proxy/Dockerfile` as file. Preserve all PR, nightly, SHA, dated-nightly, `vX.Y.Z`, and `latest`
-   metadata rules and the CLI release clock. Do not publish during the cutover PR.
-5. Complete the Phase 2 CI transition mechanically: remove the `proxy_go` filter,
+4. Complete the build-lane cutover mechanically: remove the `build_proxy_go` filter,
+   `build-proxy-go` caller jobs, and `_build-proxy-go.yml`; rename or promote the
+   `build_proxy_rs` filter, `build-proxy-rs` caller jobs, and `_build-proxy-rs.yml` to
+   `build_proxy`, `build-proxy`, and `_build-proxy.yml`. Update PR, nightly, and release callers.
+   The promoted Rust workflow begins publishing the unchanged production `vhrn-proxy` image and
+   inherits the Go workflow's image name, `linux/amd64` and `linux/arm64` platforms, tags, OCI
+   metadata, cache behavior, permissions, registry paths, and CLI release-clock semantics. It uses
+   repository root as context and `proxy/Dockerfile` as file. Leave `build-cli`/
+   `_build-binaries.yml` and `build-harness-images`/`_build-harness-images.yml` ownership unchanged.
+   The cutover PR itself performs no push, image publication, release creation, version change, or
+   replacement of an existing tag.
+5. Complete the Phase 2 test-lane transition mechanically: remove the `proxy_go` filter,
    `run_proxy_go` input, and `proxy-go` job; rename the `proxy_rs` filter, `run_proxy_rs` input, and
    `proxy-rs` job to `proxy`; and change its path from `proxy-rs/**` to `proxy/**`. Keep the `cli`
    filter/input/job independently named. Root Cargo files and shared proxy fixtures continue to
    select the component lanes they affect. The resulting proxy job runs Rust format, strict
-   Clippy, tests, dependency audit, and release build, while `proxy/**` also selects the production
-   image build. Remove Go setup, formatting, vet, test, and vulnerability steps; do not introduce a
-   generic `rust` lane. Keep `ci-gate` skip/success behavior and workflow validation.
+   Clippy, tests, dependency audit, and release build, while `proxy/**` also selects the promoted
+   production image build. Remove Go setup, formatting, vet, test, and vulnerability steps; do not
+   introduce a generic `rust` lane. Keep `ci-gate` selected-job, skip, failure, and cancellation
+   behavior and workflow validation.
 6. Preserve host/runtime integration byte-for-byte: CLI mount paths, five public layers, three
    local layers, token mount, environment values, sidecar networking, proxy image overrides,
    local-image behavior, cleanup ordering, and supported-engine rejection remain unchanged. Use
@@ -93,9 +103,10 @@ of this phase.
 
 - The source location and build context change; no consumer-side file, wire, process, engine, or
   tag interface changes.
-- `_build-images.yml` keeps the same metadata/output surface but uses `context: .` and the Rust
-  `proxy/Dockerfile`. Nightly and release callers remain unchanged unless a path reference must be
-  corrected.
+- The promoted Rust proxy workflow inherits the production Go proxy workflow's image name,
+  platforms, tag and OCI metadata surface, cache behavior, permissions, registry paths, and
+  release-clock semantics. PR, nightly, and release callers select that promoted workflow;
+  `build-cli` and `build-harness-images` remain separate and unchanged.
 - The root workspace builds independent `vhrn` and `vhrn-proxy` packages; no compiled policy,
   target, or broker type crosses the crate boundary.
 
@@ -113,10 +124,13 @@ Run and record, in order:
 8. The final Docker scratch/read-only-root and Docker/Colima E2E checks.
 9. `make -C proxy ENGINE=container`
 10. The final Apple `container` scratch/read-only-root and E2E checks.
-11. A multi-platform, no-push build using the exact `_build-images.yml` context/file settings.
+11. A multi-platform, no-push build using the exact repository-root context,
+    `proxy/Dockerfile`, `linux/amd64,linux/arm64` platforms, and settings from the promoted Rust
+    proxy workflow.
 12. `actionlint` over `.github/workflows/**`.
-13. Path assertions that `proxy-rs/`, Go source/tests/module files, and Go workflow/toolchain
-    references are absent, without opening deleted contents.
+13. Path assertions that `proxy-rs/`, `_build-proxy-go.yml`, Go source/tests/module files, and Go
+    workflow/toolchain references are absent, without opening deleted contents; caller assertions
+    that only `build-proxy` remains while `build-cli` and `build-harness-images` are unchanged.
 
 ## Evidence required
 
