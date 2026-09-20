@@ -552,6 +552,25 @@ async fn request(address: SocketAddr, bytes: &[u8]) -> String {
     .expect("request deadline")
 }
 
+async fn request_with_write_shutdown(address: SocketAddr, bytes: &[u8]) -> String {
+    timeout(DEADLINE, async {
+        let mut stream = TcpStream::connect(address).await.expect("connect proxy");
+        stream.write_all(bytes).await.expect("write request");
+        stream
+            .shutdown()
+            .await
+            .expect("shutdown request write half");
+        let mut received = Vec::new();
+        stream
+            .read_to_end(&mut received)
+            .await
+            .expect("read response");
+        String::from_utf8(received).expect("HTTP response is text")
+    })
+    .await
+    .expect("request deadline")
+}
+
 async fn read_http_response(stream: &mut TcpStream) -> String {
     let mut response = read_through(stream, b"\r\n\r\n").await;
     let headers = String::from_utf8(response.clone()).expect("HTTP response headers are text");
@@ -735,6 +754,237 @@ async fn direct_endpoints_and_denial_log_follow_corpus() {
     assert!(!diagnostics.contains(TOKEN));
     assert!(!diagnostics.contains(request_secret));
     assert!(!diagnostics.contains(&proxy.policy.display().to_string()));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn http1_ingress_and_direct_endpoint_contract_is_exact() {
+    scenario(async {
+        let proxy = Proxy::start(None).await;
+
+        let health = proxy
+            .request("GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await;
+        assert_eq!(status(&health), 200);
+        assert!(health.contains("content-type: text/plain; charset=utf-8\r\n"));
+        assert!(health.ends_with("\r\n\r\nok\n"));
+
+        let health_head = proxy
+            .request("HEAD /healthz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await;
+        assert_eq!(status(&health_head), 200);
+        assert!(health_head.contains("content-length: 3\r\n"));
+        assert!(health_head.ends_with("\r\n\r\n"));
+
+        for path in ["/healthz", "/__status"] {
+            let response = proxy
+                .request(&format!(
+                    "POST {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
+                ))
+                .await;
+            assert_eq!(status(&response), 405, "{path}");
+            assert!(response.contains("allow: GET, HEAD\r\n"), "{path}");
+        }
+        assert_eq!(
+            status(
+                &proxy
+                    .request("POST /missing HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+                    .await
+            ),
+            404
+        );
+
+        let options = proxy
+            .request("OPTIONS * HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await;
+        assert_eq!(status(&options), 204);
+        assert!(options.contains("allow: GET, HEAD, OPTIONS, CONNECT\r\n"));
+        assert!(options.ends_with("\r\n\r\n"));
+        assert_eq!(
+            status(
+                &proxy
+                    .request("GET * HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+                    .await
+            ),
+            400
+        );
+
+        std::fs::write(&proxy.policy, "bad!policy\n").expect("invalid allowlist");
+        std::fs::write(&proxy.mode, "open\n").expect("valid mode");
+        let status_only_mode = proxy
+            .request("GET /__status HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await;
+        assert_eq!(status(&status_only_mode), 200);
+        assert!(status_only_mode.ends_with("{\"mode\":\"open\"}\n"));
+        std::fs::write(&proxy.mode, "invalid\n").expect("invalid mode");
+        let fail_closed = proxy
+            .request("HEAD /__status HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await;
+        assert_eq!(status(&fail_closed), 503);
+        assert!(fail_closed.contains("content-type: application/json\r\n"));
+        assert!(fail_closed.contains("content-length: 19\r\n"));
+        assert!(fail_closed.ends_with("\r\n\r\n"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn http1_malformed_hosts_versions_and_prefaces_are_rejected() {
+    scenario(async {
+        let proxy = Proxy::start(None).await;
+        assert_eq!(
+            status(
+                &proxy
+                    .request("GET /healthz HTTP/1.1\r\nConnection: close\r\n\r\n")
+                    .await
+            ),
+            400
+        );
+        let head_error = proxy
+            .request("HEAD /healthz HTTP/1.1\r\nConnection: close\r\n\r\n")
+            .await;
+        assert_eq!(status(&head_error), 400);
+        assert!(head_error.ends_with("\r\n\r\n"));
+        assert_eq!(
+            status(
+                &proxy
+                    .request(
+                        "GET /healthz HTTP/1.1\r\nHost: one\r\nHost: two\r\nConnection: close\r\n\r\n"
+                    )
+                    .await
+            ),
+            400
+        );
+        assert_eq!(
+            status(
+                &proxy
+                    .request("GET /healthz HTTP/2.0\r\nHost: test\r\n\r\n")
+                    .await
+            ),
+            505
+        );
+        for malformed in [
+            "GET /healthz HTTP/\r\nHost: test\r\n\r\n",
+            "GET /healthz HTTP/1\r\nHost: test\r\n\r\n",
+            "GET /healthz HTTP/1.x\r\nHost: test\r\n\r\n",
+            "GET /healthz HTTP/11.1\r\nHost: test\r\n\r\n",
+        ] {
+            assert_eq!(status(&proxy.request(malformed).await), 400, "{malformed:?}");
+        }
+        assert_eq!(
+            status(
+                &proxy
+                    .request("GET /healthz HTTP/1.1\rX: bad\r\n\r\n")
+                    .await
+            ),
+            400
+        );
+        let prior_knowledge = request_with_write_shutdown(
+            proxy.address,
+            b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status(&prior_knowledge), 505);
+        let tls = request_with_write_shutdown(proxy.address, b"\x16").await;
+        assert_eq!(status(&tls), 400);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn http1_persistence_connect_framing_and_upgrade_are_enforced_before_broker_work() {
+    scenario(async {
+        let broker = Broker::bind().await;
+        let authority = "localhost:8130";
+        let proxy = Proxy::start_local(&broker, authority).await;
+
+        let mut client = TcpStream::connect(proxy.address)
+            .await
+            .expect("persistent client");
+        client
+            .write_all(b"GET /healthz HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
+            .await
+            .expect("HTTP/1.0 request");
+        let first = read_http_response(&mut client).await;
+        assert!(first.starts_with("HTTP/1.0 200"));
+        client
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("HTTP/1.1 request");
+        let mut second = Vec::new();
+        client.read_to_end(&mut second).await.expect("closing response");
+        assert!(second.starts_with(b"HTTP/1.1 200"));
+
+        for request_head in [
+            format!(
+                "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 0\r\n\r\n"
+            ),
+            format!(
+                "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nTransfer-Encoding: chunked\r\n\r\n"
+            ),
+            format!(
+                "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nExpect: 100-continue\r\n\r\n"
+            ),
+            format!(
+                "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nHost: duplicate:8130\r\n\r\n"
+            ),
+        ] {
+            assert_eq!(status(&proxy.request(&request_head).await), 400);
+        }
+
+        let upgrade = proxy
+            .request(&format!(
+                "GET http://{authority}/ HTTP/1.1\r\nHost: {authority}\r\nConnection: upgrade\r\nUpgrade: h2c\r\n\r\n"
+            ))
+            .await;
+        assert_eq!(status(&upgrade), 501);
+        assert!(
+            timeout(Duration::from_millis(150), broker.listener.accept())
+                .await
+                .is_err(),
+            "rejected CONNECT framing and upgrades cannot contact the broker"
+        );
+
+        let mut expect_client = TcpStream::connect(proxy.address)
+            .await
+            .expect("Expect client");
+        expect_client
+            .write_all(
+                format!(
+                    "POST http://{authority}/expect HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 4\r\nExpect: 100-continue, 100-continue\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("Expect request head");
+        let interim = read_through(&mut expect_client, b"\r\n\r\n").await;
+        assert!(interim.starts_with(b"HTTP/1.1 100 Continue\r\n"));
+        expect_client.write_all(b"body").await.expect("Expect body");
+        let mut origin = broker.connect(authority).await;
+        let origin_head = String::from_utf8(read_through(&mut origin, b"\r\n\r\n").await)
+            .expect("origin request head");
+        assert!(
+            origin_head
+                .to_ascii_lowercase()
+                .contains("expect: 100-continue")
+        );
+        let mut origin_body = [0; 4];
+        origin
+            .read_exact(&mut origin_body)
+            .await
+            .expect("origin request body");
+        assert_eq!(&origin_body, b"body");
+        origin
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .expect("origin response");
+        let mut final_response = Vec::new();
+        expect_client
+            .read_to_end(&mut final_response)
+            .await
+            .expect("Expect final response");
+        assert!(final_response.starts_with(b"HTTP/1.1 200"));
     })
     .await;
 }
@@ -1236,7 +1486,7 @@ async fn local_http_forwards_and_streams_through_authenticated_broker() {
         .await
         .expect("client connect");
     client
-        .write_all(b"POST http://localhost:8123/path?q=one HTTP/1.1\r\nHost: localhost:8123\r\nX-Ordinary: retained\r\nConnection: X-Nominated, keep-alive\r\nX-Nominated: remove\r\nProxy-Connection: remove\r\nProxy-Authorization: remove\r\nKeep-Alive: timeout=5\r\nTE: trailers\r\nTrailer: X-Trailer\r\nUpgrade: websocket\r\nContent-Length: 4\r\n\r\nbody")
+        .write_all(b"POST http://localhost:8123/path?q=one HTTP/1.1\r\nHost: localhost:8123\r\nX-Ordinary: retained\r\nConnection: X-Nominated, keep-alive\r\nX-Nominated: remove\r\nProxy-Connection: remove\r\nProxy-Authorization: remove\r\nKeep-Alive: timeout=5\r\nTE: trailers\r\nTrailer: X-Trailer\r\nContent-Length: 4\r\n\r\nbody")
         .await
         .expect("local HTTP request");
     let mut origin = broker.connect(authority).await;
