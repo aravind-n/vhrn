@@ -46,19 +46,15 @@ jobs:
     with:
       version: ${{ github.ref_name }}
 
-  build-proxy-go:
+  build-proxy:
     needs: [approve, test]
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/_build-proxy-go.yml
+    uses: ./.github/workflows/_build-proxy.yml
     with:
       flavor: release
       push: true
-
-  build-proxy-rs:
-    needs: [approve, test]
-    uses: ./.github/workflows/_build-proxy-rs.yml
 
   build-harness-images:
     needs: [approve, test]
@@ -73,8 +69,7 @@ jobs:
   publish:
     needs:
       - build-cli
-      - build-proxy-go
-      - build-proxy-rs
+      - build-proxy
       - build-harness-images
     runs-on: ubuntu-latest
     permissions:

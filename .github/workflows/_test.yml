@@ -1,5 +1,5 @@
-# Reusable lint + test for the three code components. Callers pick which run via
-# run_*: CI filters by changed paths; nightly and release run all three.
+# Reusable lint + test. Callers pick which components run via run_*: CI filters
+# by changed paths; nightly and release run the full suite.
 name: test
 
 on:
@@ -8,10 +8,7 @@ on:
       run_cli:
         type: boolean
         default: true
-      run_proxy_rs:
-        type: boolean
-        default: true
-      run_proxy_go:
+      run_proxy:
         type: boolean
         default: true
       run_scripts:
@@ -37,8 +34,8 @@ jobs:
       - run: cargo test --package vhrn --locked
       - run: cargo build --release --locked -p vhrn
 
-  proxy-rs:
-    if: ${{ inputs.run_proxy_rs }}
+  proxy:
+    if: ${{ inputs.run_proxy }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -50,35 +47,13 @@ jobs:
       - run: cargo fmt --package vhrn-proxy -- --check
       - run: cargo clippy --package vhrn-proxy --all-targets --locked -- -D warnings
       - run: cargo test --package vhrn-proxy --locked
+      - name: Rust dependency audit
+        run: |
+          cargo install --locked cargo-audit --version 0.22.2
+          cargo audit --deny warnings
       - run: cargo build --release --locked -p vhrn-proxy
       - name: Release executable process contract
         run: VHRN_PROXY_TEST_BIN="$PWD/target/release/vhrn-proxy" cargo test --package vhrn-proxy --locked --test proxy_process
-
-  proxy-go:
-    if: ${{ inputs.run_proxy_go }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      # Latest stable, not go-version-file: go.mod states the floor, and testing on
-      # it would pin CI to a toolchain that eventually goes end-of-life.
-      - uses: actions/setup-go@v7
-        with:
-          go-version: stable
-      - name: Vet and test
-        working-directory: proxy
-        run: |
-          test -z "$(gofmt -l .)" || { echo 'gofmt needed:'; gofmt -l .; exit 1; }
-          go vet ./...
-          go test ./...
-      # The stdlib is this binary's only dependency, so a toolchain CVE is the only kind
-      # it can have. govulncheck reports the ones actually reachable from our call graph,
-      # which beats the toolchain version as a signal. `go install pkg@version` resolves
-      # outside the module, so it adds nothing to go.mod.
-      - name: Vulnerability scan
-        working-directory: proxy
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          "$(go env GOPATH)/bin/govulncheck" ./...
 
   scripts:
     if: ${{ inputs.run_scripts }}

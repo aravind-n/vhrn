@@ -41,20 +41,16 @@ jobs:
     with:
       version: ${{ needs.version.outputs.version }}
 
-  build-proxy-go:
+  build-proxy:
     needs: [test, version]
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/_build-proxy-go.yml
+    uses: ./.github/workflows/_build-proxy.yml
     with:
       flavor: nightly
       push: true
       extra_tag: ${{ needs.version.outputs.image_tag }}
-
-  build-proxy-rs:
-    needs: test
-    uses: ./.github/workflows/_build-proxy-rs.yml
 
   build-harness-images:
     needs: [test, version]
@@ -71,8 +67,7 @@ jobs:
     needs:
       - version
       - build-cli
-      - build-proxy-go
-      - build-proxy-rs
+      - build-proxy
       - build-harness-images
     runs-on: ubuntu-latest
     permissions:

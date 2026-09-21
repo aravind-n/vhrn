@@ -25,6 +25,7 @@ const SCENARIO_DEADLINE: Duration = Duration::from_secs(20);
 const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const START_ATTEMPTS: usize = 5;
 const POLICY_LIMIT: usize = 1024 * 1024;
+static RELEASED_PORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const PROXY_ENV_VARS: &[&str] = &[
     "VHRN_ALLOWLISTS",
     "VHRN_ALLOWLIST",
@@ -242,6 +243,8 @@ impl ManagedChild {
 
 impl Proxy {
     async fn start(local: Option<(String, &str, usize)>) -> Self {
+        // Serialize the test-only release-and-rebind handoff within this process.
+        let _released_port = RELEASED_PORT_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("temporary test directory");
         let public_policies =
             ["base", "harness", "global", "project", "run"].map(|name| temp.path().join(name));
@@ -1114,6 +1117,7 @@ async fn health_tracks_live_policy_and_sticky_audit_failure() {
 #[tokio::test]
 async fn invalid_startup_policy_log_and_token_exit_redacted() {
     scenario(async {
+        let _released_port = RELEASED_PORT_LOCK.lock().await;
         let fixture = StartupFixture::new();
 
         std::fs::write(&fixture.public[0], "bad!policy\n").expect("invalid policy");
@@ -1201,6 +1205,7 @@ async fn invalid_startup_policy_log_and_token_exit_redacted() {
 #[tokio::test]
 async fn nonregular_token_fails_promptly_without_serving() {
     scenario(async {
+        let _released_port = RELEASED_PORT_LOCK.lock().await;
         let broker = Broker::bind().await;
         let fixture = StartupFixture::new();
         std::fs::remove_file(&fixture.token).expect("remove regular token");
@@ -1231,6 +1236,7 @@ async fn nonregular_token_fails_promptly_without_serving() {
 #[tokio::test]
 async fn listener_does_not_serve_until_broker_readiness_and_refusal_is_fatal() {
     scenario(async {
+        let _released_port = RELEASED_PORT_LOCK.lock().await;
         let broker = Broker::bind().await;
         let fixture = StartupFixture::new();
         let address = unused_address().await;
@@ -1317,6 +1323,7 @@ async fn listener_does_not_serve_until_broker_readiness_and_refusal_is_fatal() {
 #[tokio::test]
 async fn broker_readiness_timeout_is_fatal_and_redacted() {
     scenario(async {
+        let _released_port = RELEASED_PORT_LOCK.lock().await;
         let broker = Broker::bind().await;
         let fixture = StartupFixture::new();
         let address = unused_address().await;
@@ -1344,6 +1351,7 @@ async fn broker_readiness_timeout_is_fatal_and_redacted() {
 #[tokio::test]
 async fn cancellation_after_bind_closes_listener_and_pending_broker_exchange() {
     scenario(async {
+        let _released_port = RELEASED_PORT_LOCK.lock().await;
         let broker = Broker::bind().await;
         let fixture = StartupFixture::new();
         let address = unused_address().await;

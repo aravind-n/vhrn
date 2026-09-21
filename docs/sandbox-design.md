@@ -11,6 +11,8 @@ Every run starts a small proxy sidecar. The container's firewall routes every ou
 connection through that proxy, and the proxy allows permitted public domains or explicitly
 granted host-loopback endpoints. Everything else, including direct DNS, is refused. A blocked
 request fails with the domain named, like `blocked by vhrn egress policy: example.com`.
+The proxy is a statically linked Rust executable in a `scratch` image, runs as `65532:65532`, and
+supports a read-only root filesystem with every capability dropped.
 
 The public-domain policy lives on the host at `${XDG_STATE_HOME:-~/.local/state}/vhrn/net`, with a store lock,
 atomic same-directory writes, and active-run leases. It is mounted

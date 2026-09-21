@@ -7,7 +7,7 @@ This file is the authoritative implementation specification for Phase 2. Start h
 1. Read the shared [master plan](plan.md).
 2. Confirm the Phase 2 row in the master plan is exactly `Ready`. If it is not, stop; the
    table is the sole readiness source.
-3. Read repository [`AGENTS.md`](../../../AGENTS.md).
+3. Read repository [`AGENTS.md`](../../../../AGENTS.md).
 4. Implement only this phase and stay within its editable paths and responsibility boundary.
 5. Record detailed implementation, validation, and review evidence in this file.
 6. After every completion requirement, independent review, and rereview are satisfied, apply

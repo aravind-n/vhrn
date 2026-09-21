@@ -180,7 +180,7 @@ Its default session store is per project; Pi's own `--session-dir` still overrid
 | --- | --- | --- | --- |
 | CLI (`vhrn`) | `cli/` (Rust) | `cargo build --release -p vhrn` | `cargo fmt --check`, `cargo clippy -p vhrn --all-targets -- -D warnings`, `cargo test -p vhrn` |
 | Container images | `image/` (base + harnesses) | `make -C image` | — |
-| Egress proxy | `proxy/` (Go) | `make -C proxy` | `cd proxy && go test ./...` |
+| Egress proxy | `proxy/` (Rust) | `make -C proxy` | `cargo fmt --package vhrn-proxy -- --check`, `cargo clippy -p vhrn-proxy --all-targets --locked -- -D warnings`, `cargo test -p vhrn-proxy --locked`, `cargo audit --deny warnings` |
 
 `cargo install --path cli` installs the CLI to `~/.cargo/bin`. To iterate on images
 locally, build them and register with `--local` instead of pulling from ghcr:
