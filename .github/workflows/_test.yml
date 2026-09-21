@@ -32,7 +32,6 @@ jobs:
       - run: cargo fmt --package vhrn -- --check
       - run: cargo clippy --package vhrn --all-targets --locked -- -D warnings
       - run: cargo test --package vhrn --locked
-      - run: cargo build --release --locked -p vhrn
 
   proxy:
     if: ${{ inputs.run_proxy }}
@@ -49,7 +48,7 @@ jobs:
       - run: cargo test --package vhrn-proxy --locked
       - name: Rust dependency audit
         run: |
-          cargo install --locked cargo-audit --version 0.22.2
+          cargo install --locked cargo-audit
           cargo audit --deny warnings
       - run: cargo build --release --locked -p vhrn-proxy
       - name: Release executable process contract

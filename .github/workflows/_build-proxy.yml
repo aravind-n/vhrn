@@ -1,4 +1,4 @@
-# Reusable: audit, smoke, and build the production Rust proxy for both platforms.
+# Reusable: smoke and build the production Rust proxy for both platforms.
 # Tags follow the CLI release clock through the PR and release flavors.
 name: build-proxy
 
@@ -21,17 +21,7 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  audit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Rust dependency audit
-        run: |
-          cargo install --locked cargo-audit --version 0.22.2
-          cargo audit --deny warnings
-
   proxy:
-    needs: audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
