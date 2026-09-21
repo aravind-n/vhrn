@@ -1,21 +1,17 @@
 # Reusable: audit, smoke, and build the production Rust proxy for both platforms.
-# Tags follow the CLI release clock through flavor and extra_tag.
+# Tags follow the CLI release clock through the PR and release flavors.
 name: build-proxy
 
 on:
   workflow_call:
     inputs:
       flavor:
-        description: pr | nightly | release
+        description: ci | pr | release
         type: string
         required: true
       push:
         type: boolean
         default: false
-      extra_tag:
-        description: an extra raw tag, e.g. the immutable nightly version
-        type: string
-        default: ''
 
 permissions:
   contents: read
@@ -100,13 +96,11 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/vhrn-proxy
           tags: |
+            type=raw,value=ci,enable=${{ inputs.flavor == 'ci' }}
             type=ref,event=pr,enable=${{ inputs.flavor == 'pr' }}
             type=sha,prefix=pr-${{ github.event.number }}-,format=short,enable=${{ inputs.flavor == 'pr' }}
-            type=raw,value=nightly,enable=${{ inputs.flavor == 'nightly' }}
-            type=sha,prefix=sha-,enable=${{ inputs.flavor == 'nightly' }}
             type=ref,event=tag,enable=${{ inputs.flavor == 'release' }}
             type=raw,value=latest,enable=${{ inputs.flavor == 'release' }}
-            type=raw,value=${{ inputs.extra_tag }},enable=${{ inputs.extra_tag != '' }}
       - uses: docker/build-push-action@v7
         with:
           context: .

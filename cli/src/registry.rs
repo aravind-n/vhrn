@@ -8,13 +8,6 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-/// A registry manifest `Accept` header covering the multi-arch index and single manifest
-/// media types, so `Docker-Content-Digest` names the same digest the engine stores locally.
-const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
-     application/vnd.docker.distribution.manifest.list.v2+json, \
-     application/vnd.oci.image.manifest.v1+json, \
-     application/vnd.docker.distribution.manifest.v2+json";
-
 /// A parsed `WWW-Authenticate: Bearer realm=…,service=…,scope=…` challenge.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct BearerChallenge {
@@ -85,7 +78,7 @@ fn repo_path(base: &str, image: &str) -> String {
 }
 
 /// Parse a strict `X.Y.Z` tag into a comparable tuple. Anything with a suffix (`2.1.3-x`),
-/// a moving tag (`nightly`, `latest`), or non-numeric parts is rejected.
+/// a moving tag (`latest`), or non-numeric parts is rejected.
 fn parse_semver(tag: &str) -> Option<(u64, u64, u64)> {
     let mut it = tag.split('.');
     let major = it.next()?.parse().ok()?;
@@ -98,7 +91,7 @@ fn parse_semver(tag: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// The newest strict-`X.Y.Z` tag in a tag list, returned in its original string form. Tags
-/// that are not strict semver (`latest`, `nightly-…`, `2.1.3-20260101`) are ignored.
+/// that are not strict semver (`latest`, `beta`, `2.1.3-20260101`) are ignored.
 pub(crate) fn newest_semver(tags: &[String]) -> Option<String> {
     tags.iter()
         .filter_map(|t| parse_semver(t).map(|v| (v, t)))
@@ -137,28 +130,18 @@ fn http_agent() -> ureq::Agent {
 
 /// GET `url` doing the OCI bearer-challenge transparently: on a 401, parse the challenge,
 /// fetch a token, and retry once with it. Returns the final response.
-fn get_challenged(
-    agent: &ureq::Agent,
-    url: &str,
-    accept: Option<&str>,
-) -> Option<ureq::http::Response<ureq::Body>> {
-    let mut first = agent.get(url);
-    if let Some(a) = accept {
-        first = first.header("Accept", a);
-    }
-    let resp = first.call().ok()?;
+fn get_challenged(agent: &ureq::Agent, url: &str) -> Option<ureq::http::Response<ureq::Body>> {
+    let resp = agent.get(url).call().ok()?;
     if resp.status().as_u16() != 401 {
         return Some(resp);
     }
     let challenge = resp.headers().get("www-authenticate")?.to_str().ok()?;
     let token = fetch_token(agent, &parse_www_authenticate(challenge)?)?;
-    let mut retry = agent
+    agent
         .get(url)
-        .header("Authorization", &format!("Bearer {token}"));
-    if let Some(a) = accept {
-        retry = retry.header("Accept", a);
-    }
-    retry.call().ok()
+        .header("Authorization", &format!("Bearer {token}"))
+        .call()
+        .ok()
 }
 
 /// Fetch an anonymous bearer token from the challenge's realm.
@@ -200,7 +183,7 @@ fn fetch_tags(registry: &str, image: &str) -> Option<Vec<String>> {
     let mut url = format!("https://{host}/v2/{repo}/tags/list");
     let mut all = Vec::new();
     for _ in 0..50 {
-        let resp = get_challenged(&agent, &url, None)?;
+        let resp = get_challenged(&agent, &url)?;
         if resp.status().as_u16() != 200 {
             return (!all.is_empty()).then_some(all);
         }
@@ -222,26 +205,6 @@ fn fetch_tags(registry: &str, image: &str) -> Option<Vec<String>> {
 /// can't be reached or has no semver tag.
 pub(crate) fn newest_published_version(registry: &str, image: &str) -> Option<String> {
     newest_semver(&fetch_tags(registry, image)?)
-}
-
-/// The manifest digest (`sha256:…`) a tag resolves to in the registry — the same value the
-/// engine stores locally, for the nightly digest comparison. `None` on any failure.
-pub(crate) fn remote_manifest_digest(registry: &str, image: &str, tag: &str) -> Option<String> {
-    let host = split_registry(registry).0;
-    let repo = repo_path(registry, image);
-    let url = format!("https://{host}/v2/{repo}/manifests/{tag}");
-    let resp = get_challenged(&http_agent(), &url, Some(MANIFEST_ACCEPT))?;
-    if resp.status().as_u16() != 200 {
-        return None;
-    }
-    let digest = resp
-        .headers()
-        .get("docker-content-digest")?
-        .to_str()
-        .ok()?
-        .trim()
-        .to_string();
-    digest.starts_with("sha256:").then_some(digest)
 }
 
 #[cfg(test)]
@@ -321,7 +284,7 @@ mod tests {
     fn parse_semver_is_strict() {
         assert_eq!(parse_semver("2.1.218"), Some((2, 1, 218)));
         assert_eq!(parse_semver("2.1.218-20260724"), None); // dated suffix
-        assert_eq!(parse_semver("nightly"), None);
+        assert_eq!(parse_semver("beta"), None);
         assert_eq!(parse_semver("latest"), None);
         assert_eq!(parse_semver("2.1"), None); // too few
         assert_eq!(parse_semver("2.1.3.4"), None); // too many
@@ -331,7 +294,7 @@ mod tests {
     #[test]
     fn newest_semver_picks_max_ignoring_non_semver() {
         let tags: Vec<String> = [
-            "nightly",
+            "beta",
             "2.1.218",
             "latest",
             "2.1.218-20260724",
@@ -342,7 +305,7 @@ mod tests {
         .map(ToString::to_string)
         .collect();
         assert_eq!(newest_semver(&tags).as_deref(), Some("2.10.0"));
-        assert_eq!(newest_semver(&["nightly".into(), "latest".into()]), None);
+        assert_eq!(newest_semver(&["beta".into(), "latest".into()]), None);
         assert_eq!(newest_semver(&[]), None);
     }
 
@@ -352,7 +315,7 @@ mod tests {
         assert_eq!(update_available("2.1.218", "2.1.218"), Some(false));
         assert_eq!(update_available("2.1.217", "2.1.218"), Some(false));
         assert_eq!(update_available("2.2.0", "2.1.999"), Some(true));
-        assert_eq!(update_available("nightly", "2.1.218"), None);
+        assert_eq!(update_available("beta", "2.1.218"), None);
     }
 
     #[test]

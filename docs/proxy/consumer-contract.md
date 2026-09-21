@@ -532,13 +532,13 @@ The contract-selected limits are intentionally few:
 ## Stable delivery and runtime invariants
 
 - The CLI and proxy are a matched runtime pair. Registry installs pull `vhrn-proxy` at the CLI
-  binary's release tag: a `vX.Y.Z` CLI uses `vX.Y.Z`, a nightly CLI uses `nightly`, and an otherwise
-  untagged development CLI uses `latest`. The harness agent version does not select the proxy tag.
+  binary's release tag: a `vX.Y.Z` CLI uses `vX.Y.Z`, and an untagged development CLI uses
+  `latest`. The harness agent version does not select the proxy tag.
 - `VHRN_REGISTRY` changes the registry prefix. `VHRN_PROXY_IMAGE` may replace the full runtime image
   reference. A `--local` harness install uses the local unqualified `vhrn-proxy` image.
-- Release publishes `vX.Y.Z` and `latest`; master publishes `nightly`, `sha-<sha>`, and the dated
-  nightly tag; same-repository image pull requests publish `pr-<n>` and `pr-<n>-<sha>`.
-  Published immutable tags are not replaced to perform migration testing.
+- Release publishes `vX.Y.Z` and `latest`; same-repository image pull requests publish
+  `pr-<n>` and `pr-<n>-<sha>`. Published immutable tags are not replaced to perform migration
+  testing.
 - Apple `container` and Docker remain supported build and run engines. The image name, executable,
   port, env and mount interface, scratch/unprivileged posture, multi-platform publication, and
   CLI release clock remain unchanged across an implementation replacement.

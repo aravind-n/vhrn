@@ -1,13 +1,15 @@
-# Pull-request gate. Tests and deliverable builds have separate path selectors; ci-gate
-# is the single required status check, so an unselected build may skip without blocking
-# the merge. master runs the full suite unfiltered (see nightly.yml).
+# Pull-request gate and full master validation. Pull requests use separate path selectors;
+# master runs every test and deliverable build without publishing. ci-gate is the single
+# required status check, so unselected pull-request work may skip without blocking a merge.
 name: ci
 
 on:
   pull_request:
+  push:
+    branches: [master]
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: true
 
 permissions:
@@ -17,14 +19,14 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     outputs:
-      cli: ${{ steps.filter.outputs.cli }}
-      proxy: ${{ steps.filter.outputs.proxy }}
-      scripts: ${{ steps.filter.outputs.scripts }}
-      test_selected: ${{ steps.filter.outputs.cli == 'true' || steps.filter.outputs.proxy == 'true' || steps.filter.outputs.scripts == 'true' }}
-      build_cli: ${{ steps.filter.outputs.build_cli }}
-      build_proxy: ${{ steps.filter.outputs.build_proxy }}
-      build_harness_images: ${{ steps.filter.outputs.build_harness_images }}
-      workflows: ${{ steps.filter.outputs.workflows }}
+      cli: ${{ github.event_name == 'push' || steps.filter.outputs.cli == 'true' }}
+      proxy: ${{ github.event_name == 'push' || steps.filter.outputs.proxy == 'true' }}
+      scripts: ${{ github.event_name == 'push' || steps.filter.outputs.scripts == 'true' }}
+      test_selected: ${{ github.event_name == 'push' || steps.filter.outputs.cli == 'true' || steps.filter.outputs.proxy == 'true' || steps.filter.outputs.scripts == 'true' }}
+      build_cli: ${{ github.event_name == 'push' || steps.filter.outputs.build_cli == 'true' }}
+      build_proxy: ${{ github.event_name == 'push' || steps.filter.outputs.build_proxy == 'true' }}
+      build_harness_images: ${{ github.event_name == 'push' || steps.filter.outputs.build_harness_images == 'true' }}
+      workflows: ${{ github.event_name == 'push' || steps.filter.outputs.workflows == 'true' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
@@ -89,7 +91,7 @@ jobs:
       }}
     uses: ./.github/workflows/_build-binaries.yml
     with:
-      version: pr-${{ github.event.number }}
+      version: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.number) || format('ci-{0}', github.sha) }}
 
   build-proxy:
     needs: [changes, test]
@@ -107,8 +109,8 @@ jobs:
       packages: write
     uses: ./.github/workflows/_build-proxy.yml
     with:
-      flavor: pr
-      push: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+      flavor: ${{ github.event_name == 'pull_request' && 'pr' || 'ci' }}
+      push: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
 
   build-harness-images:
     needs: [changes, test]
@@ -126,8 +128,8 @@ jobs:
       packages: write
     uses: ./.github/workflows/_build-harness-images.yml
     with:
-      flavor: pr
-      push: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+      flavor: ${{ github.event_name == 'pull_request' && 'pr' || 'ci' }}
+      push: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
 
   # Lint the workflows themselves (shellcheck runs on their inline scripts too).
   actionlint:

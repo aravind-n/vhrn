@@ -52,7 +52,7 @@ Environment:
   VHRN_PROXY_PORT    proxy port (default: 8080)
 ";
 
-/// The reported version: an override baked in by release/nightly CI, else the crate version.
+/// The reported version: an override baked in by release CI, else the crate version.
 pub(crate) fn version() -> &'static str {
     option_env!("VHRN_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
@@ -131,11 +131,11 @@ fn run_list(_args: &[String]) -> i32 {
 }
 
 /// The version detail for an installed harness: the concrete agent version resolved from
-/// the image's label when the tag is floating (latest/nightly), else the tag itself (a
-/// pinned version or `local` already names itself). Best-effort — no engine, or no label
+/// the image's label when the tag is `latest`, else the tag itself (a pinned version or
+/// `local` already names itself). Best-effort — no engine, or no label
 /// (the image isn't pulled, or predates the label), falls back to the tag.
 fn installed_detail(engine: Option<&str>, registry: &str, name: &str, tag: &str) -> String {
-    if tag == crate::image::LOCAL_VERSION || (tag != "latest" && tag != "nightly") {
+    if tag != "latest" {
         return tag.to_string();
     }
     engine
@@ -306,28 +306,12 @@ fn update_one(engine: &str, registry: &str, ih: &crate::installed::InstalledHarn
         println!("  {name:<12} local build — rebuild with `make -C image`");
         return true;
     }
-    if version != "latest" && version != "nightly" {
+    if version != "latest" {
         println!("  {name:<12} pinned at {version} — `vhrn install {name}` to return to latest");
         return true;
     }
 
     let harness_img = crate::image::harness_image_ref(registry, &h, version);
-
-    // Nightly has no X.Y.Z tag, so compare the published :nightly digest to the local one.
-    if version == "nightly" {
-        let Some(remote) = crate::registry::remote_manifest_digest(registry, &h.image, "nightly")
-        else {
-            report_unreachable(name, registry);
-            return false;
-        };
-        if crate::image::image_manifest_digest(engine, &harness_img).as_deref() == Some(&*remote) {
-            println!("  {name:<12} nightly — already current");
-            return true;
-        }
-        return pull_update(engine, registry, &h, version, || {
-            println!("  {name:<12} nightly updated");
-        });
-    }
 
     // Latest: pull only if the newest published version is strictly ahead of the installed one.
     let Some(newest) = crate::registry::newest_published_version(registry, &h.image) else {
@@ -773,10 +757,6 @@ mod tests {
     #[test]
     fn installed_detail_falls_back_to_tag() {
         assert_eq!(installed_detail(None, "reg", "claude", "latest"), "latest");
-        assert_eq!(
-            installed_detail(None, "reg", "claude", "nightly"),
-            "nightly"
-        );
         assert_eq!(installed_detail(None, "reg", "claude", "2.1.30"), "2.1.30");
         assert_eq!(
             installed_detail(Some("docker"), "reg", "claude", "2.1.30"),
