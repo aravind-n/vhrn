@@ -11,6 +11,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
+#[cfg(unix)]
+use std::{collections::HashMap, os::fd::RawFd};
 
 pub(crate) const REQUEST_LINE_LIMIT: usize = 8 * 1024;
 pub(crate) const HEADER_SECTION_LIMIT: usize = 64 * 1024;
@@ -26,39 +33,111 @@ const PEER_CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[cfg(unix)]
 struct PeerCloseMonitor {
+    raw: RawFd,
+    token: mio::Token,
+    closed: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+struct PeerClosePoll {
     poll: mio::Poll,
     events: mio::Events,
+    states: HashMap<mio::Token, Arc<AtomicBool>>,
+    next_token: usize,
+}
+
+#[cfg(unix)]
+static PEER_CLOSE_POLL: OnceLock<Result<Mutex<PeerClosePoll>, io::ErrorKind>> = OnceLock::new();
+
+#[cfg(unix)]
+fn peer_close_poll() -> io::Result<&'static Mutex<PeerClosePoll>> {
+    match PEER_CLOSE_POLL.get_or_init(|| {
+        mio::Poll::new()
+            .map(|poll| {
+                Mutex::new(PeerClosePoll {
+                    poll,
+                    events: mio::Events::with_capacity(512),
+                    states: HashMap::new(),
+                    next_token: 0,
+                })
+            })
+            .map_err(|error| error.kind())
+    }) {
+        Ok(poll) => Ok(poll),
+        Err(kind) => Err(io::Error::new(*kind, "initialize downstream TCP poll")),
+    }
 }
 
 #[cfg(unix)]
 impl PeerCloseMonitor {
     fn new(stream: &tokio::net::TcpStream) -> io::Result<Self> {
-        let poll = mio::Poll::new()?;
         let raw = stream.as_raw_fd();
-        poll.registry().register(
+        let shared = peer_close_poll()?;
+        let mut shared = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let token = loop {
+            let token = mio::Token(shared.next_token);
+            shared.next_token = shared.next_token.wrapping_add(1);
+            if !shared.states.contains_key(&token) {
+                break token;
+            }
+        };
+        shared.poll.registry().register(
             &mut mio::unix::SourceFd(&raw),
-            mio::Token(0),
+            token,
             mio::Interest::READABLE,
         )?;
-        Ok(Self {
-            poll,
-            events: mio::Events::with_capacity(4),
-        })
+        let closed = Arc::new(AtomicBool::new(false));
+        shared.states.insert(token, closed.clone());
+        Ok(Self { raw, token, closed })
     }
 
     async fn wait(&mut self) -> io::Result<()> {
         loop {
-            self.events.clear();
-            self.poll.poll(&mut self.events, Some(Duration::ZERO))?;
-            if self
-                .events
-                .iter()
-                .any(|event| event.is_read_closed() || event.is_error())
-            {
+            if self.closed.load(Ordering::Acquire) {
                 return Ok(());
+            }
+            {
+                let shared = peer_close_poll()?;
+                let mut shared = shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let closed = {
+                    let PeerClosePoll { poll, events, .. } = &mut *shared;
+                    events.clear();
+                    poll.poll(events, Some(Duration::ZERO))?;
+                    events
+                        .iter()
+                        .filter(|event| event.is_read_closed() || event.is_error())
+                        .map(mio::event::Event::token)
+                        .collect::<Vec<_>>()
+                };
+                for token in closed {
+                    if let Some(state) = shared.states.get(&token) {
+                        state.store(true, Ordering::Release);
+                    }
+                }
             }
             tokio::time::sleep(PEER_CLOSE_POLL_INTERVAL).await;
         }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PeerCloseMonitor {
+    fn drop(&mut self) {
+        let Ok(shared) = peer_close_poll() else {
+            return;
+        };
+        let mut shared = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = shared
+            .poll
+            .registry()
+            .deregister(&mut mio::unix::SourceFd(&self.raw));
+        shared.states.remove(&self.token);
     }
 }
 
@@ -162,8 +241,8 @@ pub(crate) struct RequestHead {
 
 /// One downstream connection and its sole fixed-capacity read buffer.
 pub(crate) struct Http1Connection<S> {
-    io: S,
     peer_close: PeerCloseState,
+    io: S,
     buffer: Box<[u8]>,
     start: usize,
     end: usize,
@@ -177,8 +256,8 @@ impl<S: 'static> Http1Connection<S> {
     pub(crate) fn new(io: S) -> Self {
         let peer_close = PeerCloseState::for_io(&io);
         Self {
-            io,
             peer_close,
+            io,
             buffer: vec![0; CONNECTION_BUFFER_LIMIT].into_boxed_slice(),
             start: 0,
             end: 0,
@@ -302,6 +381,10 @@ where
 
     pub(crate) async fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.io.write_all(bytes).await
+    }
+
+    pub(crate) async fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.io.write(bytes).await
     }
 
     pub(crate) async fn flush(&mut self) -> std::io::Result<()> {

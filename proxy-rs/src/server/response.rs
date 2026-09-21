@@ -1,6 +1,6 @@
 //! Infallible, bounded proxy response construction.
 
-use crate::connect::origin_body::SharedOriginResponse;
+use crate::{Shutdown, connect::origin_body::SharedOriginResponse};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::{Method, Response, StatusCode, Version, header};
@@ -230,6 +230,84 @@ where
     Ok(close)
 }
 
+pub(crate) async fn write_response_drain_aware<S>(
+    connection: &mut Http1Connection<S>,
+    mut response: Response<ProxyBody>,
+    version: Version,
+    method: &Method,
+    close: bool,
+    shutdown: &Shutdown,
+) -> std::io::Result<Option<bool>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (body_allowed, chunked, close, head) =
+        prepare_response_head(&mut response, version, method, close);
+    let Some(written) = commit_head_before_drain(connection, &head, shutdown).await? else {
+        return Ok(None);
+    };
+    finish_committed_response(
+        connection,
+        &head,
+        written,
+        body_allowed,
+        chunked,
+        response.body_mut(),
+        shutdown,
+    )
+    .await?;
+    Ok(Some(close))
+}
+
+pub(crate) async fn write_response_prompt<S>(
+    connection: &mut Http1Connection<S>,
+    mut response: Response<ProxyBody>,
+    version: Version,
+    method: &Method,
+    close: bool,
+    shutdown: &Shutdown,
+) -> std::io::Result<Option<bool>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (body_allowed, chunked, close, head) =
+        prepare_response_head(&mut response, version, method, close);
+    let Some(written) = commit_head_promptly(connection, &head, shutdown).await? else {
+        return Ok(None);
+    };
+    finish_committed_response(
+        connection,
+        &head,
+        written,
+        body_allowed,
+        chunked,
+        response.body_mut(),
+        shutdown,
+    )
+    .await?;
+    Ok(Some(close))
+}
+
+async fn finish_committed_response<S>(
+    connection: &mut Http1Connection<S>,
+    head: &[u8],
+    written: usize,
+    body_allowed: bool,
+    chunked: bool,
+    body: &mut ProxyBody,
+    shutdown: &Shutdown,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    active_write_all(connection, &head[written..], shutdown).await?;
+    if body_allowed {
+        write_active_response_body(connection, body, chunked, shutdown).await?;
+    }
+    active_flush(connection, shutdown).await?;
+    Ok(())
+}
+
 fn prepare_response_head(
     response: &mut Response<ProxyBody>,
     version: Version,
@@ -348,6 +426,148 @@ where
     Ok(())
 }
 
+async fn commit_head_before_drain<S>(
+    connection: &mut Http1Connection<S>,
+    head: &[u8],
+    shutdown: &Shutdown,
+) -> std::io::Result<Option<usize>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let written = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Ok(None),
+        result = connection.write(head) => result?,
+    };
+    if written == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "response head write returned zero",
+        ));
+    }
+    Ok(Some(written))
+}
+
+async fn commit_head_promptly<S>(
+    connection: &mut Http1Connection<S>,
+    head: &[u8],
+    shutdown: &Shutdown,
+) -> std::io::Result<Option<usize>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let prompt = tokio::task::yield_now();
+    tokio::pin!(prompt);
+    let written = tokio::select! {
+        biased;
+        () = shutdown.forced() => return Ok(None),
+        result = connection.write(head) => result?,
+        () = &mut prompt => return Ok(None),
+    };
+    if written == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "response head write returned zero",
+        ));
+    }
+    Ok(Some(written))
+}
+
+async fn active_write_all<S>(
+    connection: &mut Http1Connection<S>,
+    bytes: &[u8],
+    shutdown: &Shutdown,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    tokio::select! {
+        biased;
+        () = shutdown.forced() => Err(forced_shutdown_error()),
+        result = connection.write_all(bytes) => result,
+    }
+}
+
+async fn active_flush<S>(
+    connection: &mut Http1Connection<S>,
+    shutdown: &Shutdown,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::select! {
+        biased;
+        () = shutdown.forced() => Err(forced_shutdown_error()),
+        result = connection.flush() => result,
+    }
+}
+
+async fn write_active_response_body<S>(
+    connection: &mut Http1Connection<S>,
+    body: &mut ProxyBody,
+    chunked: bool,
+    shutdown: &Shutdown,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let frame = tokio::select! {
+            biased;
+            () = shutdown.forced() => return Err(forced_shutdown_error()),
+            frame = body.frame() => frame,
+            _ = connection.wait_for_peer_close() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "downstream disconnected",
+                ));
+            }
+        };
+        let Some(frame) = frame else {
+            break;
+        };
+        let frame = frame.map_err(std::io::Error::other)?;
+        match frame.into_data() {
+            Ok(data) if !data.is_empty() && chunked => {
+                let prefix = ChunkPrefix::new(data.len());
+                debug_assert!(data.len() <= RESPONSE_BODY_FRAME_LIMIT);
+                debug_assert!(data.len() + prefix.as_bytes().len() <= APPLICATION_BUFFER_LIMIT);
+                active_write_all(connection, prefix.as_bytes(), shutdown).await?;
+                active_write_all(connection, &data, shutdown).await?;
+                active_write_all(connection, b"\r\n", shutdown).await?;
+            }
+            Ok(data) if !data.is_empty() => {
+                active_write_all(connection, &data, shutdown).await?;
+            }
+            Err(frame) if chunked => {
+                if let Ok(trailers) = frame.into_trailers() {
+                    active_write_all(connection, b"0\r\n", shutdown).await?;
+                    for (name, value) in &trailers {
+                        active_write_all(connection, name.as_str().as_bytes(), shutdown).await?;
+                        active_write_all(connection, b": ", shutdown).await?;
+                        active_write_all(connection, value.as_bytes(), shutdown).await?;
+                        active_write_all(connection, b"\r\n", shutdown).await?;
+                    }
+                    active_write_all(connection, b"\r\n", shutdown).await?;
+                    return Ok(());
+                }
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    if chunked {
+        active_write_all(connection, b"0\r\n\r\n", shutdown).await?;
+    }
+    Ok(())
+}
+
+fn forced_shutdown_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "forced shutdown")
+}
+
 struct ChunkPrefix {
     bytes: [u8; CHUNK_PREFIX_LIMIT],
     start: usize,
@@ -379,6 +599,7 @@ impl ChunkPrefix {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn write_connect_established<S>(
     connection: &mut Http1Connection<S>,
 ) -> std::io::Result<()>
@@ -389,6 +610,22 @@ where
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
     connection.flush().await
+}
+
+pub(crate) async fn write_connect_established_drain_aware<S>(
+    connection: &mut Http1Connection<S>,
+    shutdown: &Shutdown,
+) -> std::io::Result<bool>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    const HEAD: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+    let Some(written) = commit_head_before_drain(connection, HEAD, shutdown).await? else {
+        return Ok(false);
+    };
+    active_write_all(connection, &HEAD[written..], shutdown).await?;
+    active_flush(connection, shutdown).await?;
+    Ok(true)
 }
 
 #[cfg(test)]

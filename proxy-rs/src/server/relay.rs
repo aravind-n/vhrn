@@ -43,7 +43,7 @@ where
     D: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    if shutdown.is_requested() {
+    if shutdown.is_forced() {
         return Ok(());
     }
     let TunnelParts {
@@ -61,7 +61,7 @@ where
     let downstream_to_upstream = async {
         tokio::select! {
             biased;
-            () = shutdown.cancelled() => Ok(()),
+            () = shutdown.forced() => Ok(()),
             result = copy_direction(
                 &mut downstream_read,
                 &mut upstream_write,
@@ -72,7 +72,7 @@ where
     let upstream_to_downstream = async {
         tokio::select! {
             biased;
-            () = shutdown.cancelled() => Ok(()),
+            () = shutdown.forced() => Ok(()),
             result = copy_direction(
                 &mut upstream_read,
                 &mut downstream_write,
@@ -127,12 +127,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_closes_owned_streams() {
+    async fn forced_close_closes_owned_streams_but_drain_does_not() {
         let (client, mut client_peer) = tokio::io::duplex(64);
         let (server, mut server_peer) = tokio::io::duplex(64);
         let shutdown = Shutdown::new();
-        let task = tokio::spawn(relay(parts(client, server), shutdown.clone()));
+        let mut task = tokio::spawn(relay(parts(client, server), shutdown.clone()));
         shutdown.request();
+        assert!(timeout(Duration::from_millis(10), &mut task).await.is_err());
+        shutdown.force();
         timeout(Duration::from_secs(1), task)
             .await
             .unwrap()
@@ -144,11 +146,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn already_cancelled_returns_without_waiting() {
+    async fn already_forced_returns_without_waiting() {
         let (first, _) = tokio::io::duplex(1);
         let (second, _) = tokio::io::duplex(1);
         let shutdown = Shutdown::new();
-        shutdown.request();
+        shutdown.force();
         timeout(
             Duration::from_secs(1),
             relay(parts(first, second), shutdown),
@@ -169,7 +171,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!task.is_finished());
 
-        shutdown.request();
+        shutdown.force();
         let mut byte = [0];
         assert_eq!(first_peer.read(&mut byte).await.unwrap(), 0);
         timeout(Duration::from_secs(1), &mut task)

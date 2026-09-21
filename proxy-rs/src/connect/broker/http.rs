@@ -20,6 +20,7 @@ use crate::connect::pool::IdlePool;
 #[cfg(test)]
 use crate::connect::pool::{IDLE_POOL_CAPACITY, IDLE_POOL_LIFETIME, NonZeroDuration};
 use crate::server::http1::{Http1Connection, RequestHead};
+use crate::shutdown::ProcessResources;
 
 /// Private connector for the broker capability.
 #[derive(Clone)]
@@ -43,9 +44,13 @@ pub(crate) enum BrokerForwardError {
 }
 
 impl BrokerConnector {
-    pub(crate) fn new(endpoint: impl Into<BrokerEndpoint>, token: BrokerToken) -> Self {
+    pub(crate) fn new(
+        endpoint: impl Into<BrokerEndpoint>,
+        token: BrokerToken,
+        resources: ProcessResources,
+    ) -> Self {
         Self {
-            protocol: BrokerProtocol::new(endpoint, token),
+            protocol: BrokerProtocol::new(endpoint, token, resources),
             pool: IdlePool::new(),
             #[cfg(test)]
             test_connect_stream: Arc::new(std::sync::Mutex::new(None)),
@@ -107,6 +112,14 @@ impl BrokerConnector {
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(BrokerStream::test_with_stream(stream));
         connector
+    }
+
+    pub(crate) fn prune_pool(&self) {
+        self.pool.prune();
+    }
+
+    pub(crate) fn close_pool(&self) {
+        self.pool.close();
     }
 }
 

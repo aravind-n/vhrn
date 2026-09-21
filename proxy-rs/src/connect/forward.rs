@@ -802,7 +802,7 @@ mod tests {
         (
             Arc::new(RequestContext::new(
                 config,
-                PublicConnector::system(),
+                PublicConnector::system(crate::shutdown::ProcessResources::testing(256, 256)),
                 Some(local),
                 shutdown,
             )),
@@ -906,6 +906,7 @@ mod tests {
         let connector = BrokerConnector::new(
             broker_listener.local_addr().unwrap(),
             "a".repeat(64).parse().unwrap(),
+            crate::shutdown::ProcessResources::testing(256, 256),
         );
         let directory = tempfile::tempdir().unwrap();
         let shutdown = Shutdown::new();
@@ -1719,6 +1720,9 @@ mod tests {
         }
         assert!(committed.starts_with(b"HTTP/1.1 200 OK\r\n"));
         shutdown.request();
+        tokio::task::yield_now().await;
+        assert!(!server_task.is_finished());
+        shutdown.force();
         let mut rest = Vec::new();
         timeout(Duration::from_secs(1), client.read_to_end(&mut rest))
             .await

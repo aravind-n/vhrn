@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,6 +19,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{MissedTickBehavior, timeout};
 
 const DEADLINE: Duration = Duration::from_secs(3);
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(8);
 const ACCEPT_DEADLINE: Duration = Duration::from_secs(10);
 const SCENARIO_DEADLINE: Duration = Duration::from_secs(20);
 const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -677,6 +678,27 @@ async fn accept(listener: &TcpListener) -> (TcpStream, SocketAddr) {
         .expect("broker connection")
 }
 
+async fn accept_for_child(
+    listener: &TcpListener,
+    child: &mut ManagedChild,
+    operation: &str,
+) -> (TcpStream, SocketAddr) {
+    match timeout(ACCEPT_DEADLINE, listener.accept()).await {
+        Ok(Ok(accepted)) => accepted,
+        Ok(Err(error)) => panic!("{operation} broker accept failed: {error}"),
+        Err(_) => {
+            let status = child.try_wait().expect("query proxy child status");
+            if status.is_some() {
+                child.finish_stderr();
+            }
+            panic!(
+                "{operation} broker accept timed out; child status: {status:?}; stderr: {}",
+                child.diagnostics()
+            );
+        }
+    }
+}
+
 async fn unused_address() -> SocketAddr {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -1215,7 +1237,8 @@ async fn listener_does_not_serve_until_broker_readiness_and_refusal_is_fatal() {
         let mut command = fixture.command(address);
         fixture.configure_local(&mut command, broker.address());
         let mut child = ManagedChild::spawn(&mut command);
-        let (mut readiness, _) = accept(&broker.listener).await;
+        let (mut readiness, _) =
+            accept_for_child(&broker.listener, &mut child, "broker readiness approval").await;
         assert_eq!(
             String::from_utf8(read_line(&mut readiness).await).expect("READY frame"),
             format!("VHRN-BROKER/1 READY {TOKEN}\n")
@@ -1254,7 +1277,8 @@ async fn listener_does_not_serve_until_broker_readiness_and_refusal_is_fatal() {
         let mut command = fixture.command(address);
         fixture.configure_local(&mut command, broker.address());
         let mut child = ManagedChild::spawn(&mut command);
-        let (mut readiness, _) = accept(&broker.listener).await;
+        let (mut readiness, _) =
+            accept_for_child(&broker.listener, &mut child, "broker readiness refusal").await;
         let _ = read_line(&mut readiness).await;
         let mut client = TcpStream::connect(address)
             .await
@@ -1299,7 +1323,8 @@ async fn broker_readiness_timeout_is_fatal_and_redacted() {
         let mut command = fixture.command(address);
         fixture.configure_local(&mut command, broker.address());
         let mut child = ManagedChild::spawn(&mut command);
-        let (mut readiness, _) = accept(&broker.listener).await;
+        let (mut readiness, _) =
+            accept_for_child(&broker.listener, &mut child, "broker readiness timeout").await;
         let _ = read_line(&mut readiness).await;
         let exit = child
             .wait_for_exit(Duration::from_secs(5), "broker readiness timeout")
@@ -1921,7 +1946,7 @@ async fn local_connect_preserves_buffered_bytes_and_survives_revocation() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn sigterm_closes_an_established_local_tunnel() {
+async fn sigterm_drains_then_forces_an_established_tunnel_without_policy_mounts() {
     scenario(async {
         let broker = Broker::bind().await;
         let authority = "localhost:8128";
@@ -1940,24 +1965,136 @@ async fn sigterm_closes_an_established_local_tunnel() {
                 .expect("CONNECT response")
                 .starts_with("HTTP/1.1 200")
         );
+        let started = Instant::now();
         send_sigterm(&proxy.child);
+        for path in &proxy.local.as_ref().expect("local fixture").policies {
+            std::fs::remove_file(path).expect("remove local policy during drain");
+        }
+        std::fs::remove_file(&proxy.policy).expect("remove public policy during drain");
+        std::fs::remove_file(&proxy.mode).expect("remove mode during drain");
+        std::fs::remove_file(&proxy.local.as_ref().expect("local fixture").token)
+            .expect("remove token during drain");
+
+        client
+            .write_all(b"during-drain")
+            .await
+            .expect("client remains active during drain");
+        let mut drained = [0_u8; 12];
+        peer.read_exact(&mut drained)
+            .await
+            .expect("origin receives active tunnel bytes");
+        assert_eq!(&drained, b"during-drain");
         let mut end = [0_u8; 1];
-        let client_count = timeout(Duration::from_secs(1), client.read(&mut end))
+        assert!(
+            timeout(Duration::from_secs(1), client.read(&mut end))
+                .await
+                .is_err(),
+            "first signal must not cancel an established tunnel"
+        );
+        let client_count = timeout(SHUTDOWN_DEADLINE, client.read(&mut end))
             .await
             .expect("client SIGTERM deadline")
             .expect("client SIGTERM read");
-        let peer_count = timeout(Duration::from_secs(1), peer.read(&mut end))
+        let peer_count = timeout(DEADLINE, peer.read(&mut end))
             .await
             .expect("peer SIGTERM deadline")
             .expect("peer SIGTERM read");
         assert_eq!(client_count, 0);
         assert_eq!(peer_count, 0);
-        let exit = proxy.child.wait_for_exit(DEADLINE, "SIGTERM").await;
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_secs(5));
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "forced closure must remain anchored to the first signal: {elapsed:?}"
+        );
+        let exit = proxy
+            .child
+            .wait_for_exit(SHUTDOWN_DEADLINE, "SIGTERM drain")
+            .await;
         assert!(
             exit.success(),
             "SIGTERM should be graceful; stderr: {}",
             proxy.child.diagnostics()
         );
+    })
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn second_sigterm_forces_idempotent_shutdown_and_exits_zero() {
+    scenario(async {
+        let broker = Broker::bind().await;
+        let authority = "localhost:8129";
+        let mut proxy = Proxy::start_local(&broker, authority).await;
+        let mut client = TcpStream::connect(proxy.address)
+            .await
+            .expect("client connect");
+        client
+            .write_all(b"CONNECT localhost:8129 HTTP/1.1\r\nHost: localhost:8129\r\n\r\n")
+            .await
+            .expect("CONNECT request");
+        let mut peer = broker.connect(authority).await;
+        let response = read_through(&mut client, b"\r\n\r\n").await;
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+
+        let started = Instant::now();
+        send_sigterm(&proxy.child);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        send_sigterm(&proxy.child);
+        let mut end = [0_u8; 1];
+        assert_eq!(
+            timeout(DEADLINE, client.read(&mut end))
+                .await
+                .expect("forced client closure")
+                .expect("forced client read"),
+            0
+        );
+        assert_eq!(
+            timeout(DEADLINE, peer.read(&mut end))
+                .await
+                .expect("forced peer closure")
+                .expect("forced peer read"),
+            0
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let exit = proxy.child.wait_for_exit(DEADLINE, "second SIGTERM").await;
+        assert!(
+            exit.success(),
+            "second SIGTERM should remain graceful; stderr: {}",
+            proxy.child.diagnostics()
+        );
+    })
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_supports_one_hundred_twenty_eight_established_clients() {
+    scenario(async {
+        let mut proxy = Proxy::start(None).await;
+        let mut clients = Vec::with_capacity(128);
+        for _ in 0..128 {
+            let mut client = TcpStream::connect(proxy.address)
+                .await
+                .expect("establish client");
+            client.write_all(b"G").await.expect("start request head");
+            clients.push(client);
+        }
+
+        let health = proxy
+            .request("GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await;
+        assert_eq!(status(&health), 200);
+        assert_eq!(clients.len(), 128);
+        drop(clients);
+
+        send_sigterm(&proxy.child);
+        let exit = proxy
+            .child
+            .wait_for_exit(SHUTDOWN_DEADLINE, "128-client shutdown")
+            .await;
+        assert!(exit.success());
     })
     .await;
 }
