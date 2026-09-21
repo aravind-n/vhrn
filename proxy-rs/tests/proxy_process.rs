@@ -1787,6 +1787,50 @@ async fn local_broker_timeout_is_bounded_and_redacted() {
 }
 
 #[tokio::test]
+async fn local_connect_client_disconnect_before_approval_cancels_broker_work() {
+    scenario(async {
+        let broker = Broker::bind().await;
+        let authority = "localhost:8125";
+        let proxy = Proxy::start_local(&broker, authority).await;
+        let mut client = TcpStream::connect(proxy.address)
+            .await
+            .expect("client connect");
+        client
+            .write_all(b"CONNECT localhost:8125 HTTP/1.1\r\nHost: localhost:8125\r\n\r\n")
+            .await
+            .expect("CONNECT request");
+        let (mut origin, _) = accept(&broker.listener).await;
+        assert_eq!(
+            String::from_utf8(read_line(&mut origin).await).expect("CONNECT frame"),
+            format!("VHRN-BROKER/1 CONNECT {TOKEN} {authority}\n")
+        );
+
+        drop(client);
+
+        let mut end = [0_u8; 1];
+        assert_eq!(
+            timeout(DEADLINE, origin.read(&mut end))
+                .await
+                .expect("broker cancellation deadline")
+                .expect("broker cancellation read"),
+            0
+        );
+        assert!(
+            timeout(Duration::from_millis(150), broker.listener.accept())
+                .await
+                .is_err(),
+            "client cancellation must not create another broker connection"
+        );
+        assert!(
+            !std::fs::read_to_string(&proxy.log)
+                .unwrap_or_default()
+                .contains(TOKEN)
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn local_connect_preserves_buffered_bytes_and_survives_revocation() {
     scenario(async {
         let broker = Broker::bind().await;
@@ -1795,12 +1839,16 @@ async fn local_connect_preserves_buffered_bytes_and_survives_revocation() {
         let mut client = TcpStream::connect(proxy.address)
             .await
             .expect("client connect");
-        client
-            .write_all(
-                b"CONNECT localhost:8124 HTTP/1.1\r\nHost: localhost:8124\r\n\r\nclient-prefix",
-            )
-            .await
-            .expect("CONNECT request");
+        let client_prefix = (0..16 * 1024)
+            .map(|index| u8::try_from(index % 251).expect("prefix byte"))
+            .collect::<Vec<_>>();
+        let broker_prefix = (0..16 * 1024)
+            .map(|index| u8::try_from(250 - index % 251).expect("prefix byte"))
+            .collect::<Vec<_>>();
+        let mut request =
+            b"CONNECT localhost:8124 HTTP/1.1\r\nHost: localhost:8124\r\n\r\n".to_vec();
+        request.extend_from_slice(&client_prefix);
+        client.write_all(&request).await.expect("CONNECT request");
         let (mut origin, _) = accept(&broker.listener).await;
         assert_eq!(
             String::from_utf8(read_line(&mut origin).await).expect("CONNECT frame"),
@@ -1812,19 +1860,25 @@ async fn local_connect_preserves_buffered_bytes_and_survives_revocation() {
                 .is_err(),
             "no upgrade before broker approval"
         );
-        origin.write_all(b"OK\n").await.expect("broker approval");
+        origin.write_all(b"O").await.expect("fragmented approval");
+        tokio::task::yield_now().await;
+        let mut approval = b"K\n".to_vec();
+        approval.extend_from_slice(&broker_prefix);
+        origin.write_all(&approval).await.expect("broker approval");
         let response = read_through(&mut client, b"\r\n\r\n").await;
-        assert!(
-            String::from_utf8(response)
-                .expect("CONNECT response")
-                .starts_with("HTTP/1.1 200")
-        );
-        let mut buffered = [0_u8; 13];
+        assert_eq!(response, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+        let mut buffered = vec![0_u8; client_prefix.len()];
         timeout(DEADLINE, origin.read_exact(&mut buffered))
             .await
             .expect("buffered relay deadline")
             .expect("buffered relay");
-        assert_eq!(&buffered, b"client-prefix");
+        assert_eq!(buffered, client_prefix);
+        let mut broker_buffered = vec![0_u8; broker_prefix.len()];
+        timeout(DEADLINE, client.read_exact(&mut broker_buffered))
+            .await
+            .expect("broker prefix relay deadline")
+            .expect("broker prefix relay");
+        assert_eq!(broker_buffered, broker_prefix);
         proxy.revoke_local_grant();
         origin
             .write_all(b"peer-data")

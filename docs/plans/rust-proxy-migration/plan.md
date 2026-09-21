@@ -62,8 +62,8 @@ does not open predecessor or pre-flight documents to reconstruct readiness.
 | Phase 7 | Complete | Phase 6 | [Public dialing](phase-07-public-dialing.md) |
 | Phase 8 | Complete | Phase 7 | [Loopback broker](phase-08-broker.md) |
 | Phase 9 | Complete | Phase 8 | [HTTP forwarding](phase-09-forwarding.md) |
-| Phase 10 | Ready | Phase 9 | [CONNECT tunnels](phase-10-connect.md) |
-| Phase 11 | Blocked | Phase 10 | [Resources and shutdown](phase-11-resources-shutdown.md) |
+| Phase 10 | Complete | Phase 9 | [CONNECT tunnels](phase-10-connect.md) |
+| Phase 11 | Ready | Phase 10 | [Resources and shutdown](phase-11-resources-shutdown.md) |
 | Phase 12 | Blocked | Phase 11 | [Candidate qualification](phase-12-qualification.md) |
 | Phase 13 | Blocked | Phase 12; explicit user cutover approval | [Atomic cutover](phase-13-cutover.md) |
 

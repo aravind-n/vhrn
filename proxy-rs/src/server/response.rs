@@ -396,6 +396,7 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
     use hyper::header::HeaderValue;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn chunk_prefix_and_maximum_response_frame_fit_the_aggregate_budget() {
@@ -407,6 +408,21 @@ mod tests {
             format!("{RESPONSE_BODY_FRAME_LIMIT:x}\r\n").as_bytes()
         );
         assert!(RESPONSE_BODY_FRAME_LIMIT + prefix.as_bytes().len() <= APPLICATION_BUFFER_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn connect_success_head_is_exact_and_has_no_framing_fields() {
+        let (server, mut client) = tokio::io::duplex(128);
+        let mut connection = Http1Connection::new(server);
+
+        write_connect_established(&mut connection).await.unwrap();
+        drop(connection);
+
+        let mut wire = Vec::new();
+        client.read_to_end(&mut wire).await.unwrap();
+        assert_eq!(wire, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+        assert!(!wire.windows(15).any(|value| value == b"Content-Length:"));
+        assert!(!wire.windows(18).any(|value| value == b"Transfer-Encoding:"));
     }
 
     #[tokio::test]
