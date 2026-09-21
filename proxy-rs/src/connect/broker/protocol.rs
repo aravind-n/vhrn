@@ -350,6 +350,13 @@ impl fmt::Debug for BrokerStream {
     }
 }
 
+impl BrokerStream {
+    /// Removes bytes co-read with `OK\n` for the CONNECT tunnel handoff.
+    pub(crate) fn take_prefix(&mut self) -> Bytes {
+        std::mem::take(&mut self.prefix)
+    }
+}
+
 enum BrokerIo {
     Tcp(TcpStream),
     #[cfg(test)]

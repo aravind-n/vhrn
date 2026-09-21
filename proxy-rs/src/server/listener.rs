@@ -2,17 +2,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use hyper::{Method, Version, header};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::{
     Bootstrap, Shutdown,
     server::{
         http1::{Http1Connection, IngressError, RequestHead},
+        relay::TunnelParts,
         response::{ProxyFailure, failure, write_connect_established, write_response},
-        router::{RequestContext, connect_http1, drain_http1_body, handle_http1},
+        router::{BoxTunnel, RequestContext, connect_http1, drain_http1_body, handle_http1},
     },
 };
 
@@ -47,10 +48,20 @@ pub(crate) async fn serve(bootstrap: Bootstrap) -> Result<()> {
     ));
     let admission = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut connections = tokio::task::JoinSet::new();
+    let mut tunnels = tokio::task::JoinSet::new();
+    let (tunnel_sender, mut tunnel_receiver) = mpsc::channel(MAX_CONNECTIONS);
     let outcome = loop {
         tokio::select! {
             biased;
             () = shutdown.cancelled() => break Ok(()),
+            Some(tunnel) = tunnel_receiver.recv() => {
+                spawn_tunnel(&mut tunnels, tunnel, shutdown.clone());
+            }
+            joined = tunnels.join_next(), if !tunnels.is_empty() => {
+                if let Some(joined) = joined {
+                    report_task_result(joined, false, "join CONNECT tunnel");
+                }
+            }
             joined = connections.join_next(), if !connections.is_empty() => {
                 if let Some(joined) = joined {
                     report_task_result(joined, false, "join proxy connection");
@@ -63,17 +74,43 @@ pub(crate) async fn serve(bootstrap: Bootstrap) -> Result<()> {
                     };
                     let context = context.clone();
                     let shutdown = shutdown.clone();
+                    let tunnel_sender = tunnel_sender.clone();
                     connections.spawn(async move {
-                        let _permit = permit;
-                        serve_connection_io(stream, context, shutdown).await
+                        match serve_connection_io(stream, context, shutdown).await? {
+                            ConnectionOutcome::Complete => Ok(()),
+                            ConnectionOutcome::Tunnel(parts) => tunnel_sender
+                                .send(OwnedTunnel { parts, permit })
+                                .await
+                                .map_err(|_| anyhow!("CONNECT tunnel supervisor unavailable")),
+                        }
                     });
                 }
                 Err(_) => break Err(anyhow!("listener_accept_failed")),
             },
         }
     };
+    drop(tunnel_receiver);
     drain_connections(&mut connections, CONNECTION_DRAIN_TIMEOUT).await;
+    drain_tunnels(&mut tunnels, CONNECTION_DRAIN_TIMEOUT).await;
     outcome
+}
+
+struct OwnedTunnel {
+    parts: TunnelParts<tokio::net::TcpStream, BoxTunnel>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+fn spawn_tunnel(
+    tunnels: &mut tokio::task::JoinSet<anyhow::Result<()>>,
+    tunnel: OwnedTunnel,
+    shutdown: Shutdown,
+) {
+    tunnels.spawn(async move {
+        let _permit = tunnel.permit;
+        crate::server::relay::relay(tunnel.parts, shutdown)
+            .await
+            .map_err(anyhow::Error::new)
+    });
 }
 
 fn acquire_connection_permit(
@@ -90,24 +127,34 @@ pub(crate) async fn serve_test_connection<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
-    serve_connection_io(stream, context, shutdown).await
+    match serve_connection_io(stream, context, shutdown.clone()).await? {
+        ConnectionOutcome::Complete => Ok(()),
+        ConnectionOutcome::Tunnel(parts) => crate::server::relay::relay(parts, shutdown)
+            .await
+            .map_err(anyhow::Error::new),
+    }
+}
+
+enum ConnectionOutcome<S> {
+    Complete,
+    Tunnel(TunnelParts<S, BoxTunnel>),
 }
 
 async fn serve_connection_io<S>(
     stream: S,
     context: Arc<RequestContext>,
     shutdown: Shutdown,
-) -> Result<()>
+) -> Result<ConnectionOutcome<S>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
     if shutdown.is_requested() {
-        return Ok(());
+        return Ok(ConnectionOutcome::Complete);
     }
     let mut connection = Http1Connection::new(stream);
     loop {
         let Some(head) = read_request_head(&mut connection, &shutdown).await else {
-            return Ok(());
+            return Ok(ConnectionOutcome::Complete);
         };
 
         if head.method == Method::CONNECT {
@@ -118,9 +165,15 @@ where
                 let response = failure(ProxyFailure::BadRequest, false);
                 let _ = write_response(&mut connection, response, head.version, &head.method, true)
                     .await;
-                return Ok(());
+                return Ok(ConnectionOutcome::Complete);
             }
-            let upstream = match connect_http1(&head, &context).await {
+            let upstream = match tokio::select! {
+                biased;
+                _ = connection.wait_for_peer_close() => {
+                    return Ok(ConnectionOutcome::Complete);
+                }
+                result = connect_http1(&head, &context) => result,
+            } {
                 Ok(upstream) => upstream,
                 Err(error) => {
                     let response = failure(error, false);
@@ -134,22 +187,26 @@ where
                     )
                     .await?;
                     if closed {
-                        return Ok(());
+                        return Ok(ConnectionOutcome::Complete);
                     }
                     continue;
                 }
             };
             write_connect_established(&mut connection).await?;
-            return crate::server::relay::relay(connection.into_buffered_io(), upstream, shutdown)
-                .await
-                .context("relay CONNECT tunnel");
+            let (downstream, downstream_prefix) = connection.into_buffered_io().into_parts();
+            return Ok(ConnectionOutcome::Tunnel(TunnelParts {
+                downstream,
+                downstream_prefix,
+                upstream: upstream.stream,
+                upstream_prefix: upstream.prefix,
+            }));
         }
 
         if head.upgrade {
             let response = failure(ProxyFailure::NotImplemented, head.method == Method::HEAD);
             let _ =
                 write_response(&mut connection, response, head.version, &head.method, true).await;
-            return Ok(());
+            return Ok(ConnectionOutcome::Complete);
         }
 
         let framing = head.framing;
@@ -164,13 +221,13 @@ where
         let closed =
             write_response(&mut connection, outcome.response, version, &method, close).await?;
         if closed {
-            return Ok(());
+            return Ok(ConnectionOutcome::Complete);
         }
         if !outcome.body_consumed
             && framing.has_body()
             && drain_http1_body(&mut connection, framing).await.is_err()
         {
-            return Ok(());
+            return Ok(ConnectionOutcome::Complete);
         }
     }
 }
@@ -214,7 +271,6 @@ where
 }
 
 /// Wait briefly for CONNECT relays, then cancel and observe every remaining task.
-#[cfg(test)]
 async fn drain_tunnels(
     tunnels: &mut tokio::task::JoinSet<anyhow::Result<()>>,
     deadline: Duration,
@@ -394,6 +450,66 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn public_connect_emits_no_success_while_resolution_is_pending() {
+        struct PendingResolver;
+        impl crate::connect::public::Resolver for PendingResolver {
+            fn resolve(&self, _: String, _: u16) -> crate::connect::public::ResolveFuture {
+                Box::pin(pending())
+            }
+        }
+        struct UnusedDialer;
+        impl crate::connect::public::NumericDialer for UnusedDialer {
+            fn dial(&self, _: std::net::SocketAddr) -> crate::connect::public::DialFuture {
+                panic!("pending resolution must not dial")
+            }
+        }
+
+        let directory = tempfile::tempdir().expect("test directory");
+        let allowlist = directory.path().join("allowlist");
+        let mode = directory.path().join("mode");
+        std::fs::write(&allowlist, "allowed.example\n").expect("allowlist");
+        std::fs::write(&mode, "enforce\n").expect("mode");
+        let config = crate::Config::resolve(|name| match name {
+            "VHRN_ALLOWLIST" => Some(allowlist.display().to_string()),
+            "VHRN_MODE_FILE" => Some(mode.display().to_string()),
+            "VHRN_PROXY_LISTEN" => Some("127.0.0.1:8080".to_owned()),
+            _ => None,
+        })
+        .expect("test config");
+        let shutdown = Shutdown::new();
+        let context = Arc::new(RequestContext::new(
+            config,
+            crate::connect::public::PublicConnector::new(
+                Arc::new(PendingResolver),
+                Arc::new(UnusedDialer),
+            ),
+            None,
+            &shutdown,
+        ));
+        let (mut client, server_stream) = tokio::io::duplex(1024);
+        let task_shutdown = shutdown.clone();
+        let server = tokio::spawn(serve_test_connection(server_stream, context, task_shutdown));
+        client
+            .write_all(b"CONNECT allowed.example:443 HTTP/1.1\r\nHost: allowed.example:443\r\n\r\n")
+            .await
+            .expect("CONNECT request");
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), client.read_u8())
+                .await
+                .is_err(),
+            "CONNECT must not commit success before resolution and dial"
+        );
+
+        shutdown.request();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 503"));
+        assert!(!response.windows(7).any(|value| value == b"200 Con"));
+        server.await.expect("server task").expect("server result");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn incomplete_head_closes_thirty_seconds_after_its_first_octet() {
         let directory = tempfile::tempdir().expect("test directory");
         let shutdown = Shutdown::new();
@@ -458,11 +574,7 @@ mod tests {
                 break;
             }
         }
-        assert!(
-            std::str::from_utf8(&response)
-                .expect("response text")
-                .starts_with("HTTP/1.1 200")
-        );
+        assert_eq!(response, b"HTTP/1.1 200 Connection Established\r\n\r\n");
     }
 
     #[tokio::test(start_paused = true)]
@@ -527,6 +639,52 @@ mod tests {
             .await
             .expect("server task")
             .expect("serve connection");
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_after_success_closes_upstream_and_observes_relay_result() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let allowlist = directory.path().join("allowlist");
+        let mode = directory.path().join("mode");
+        std::fs::write(&allowlist, "allowed.example\n").expect("allowlist");
+        std::fs::write(&mode, "enforce\n").expect("mode");
+        let config = crate::Config::resolve(|name| match name {
+            "VHRN_ALLOWLIST" => Some(allowlist.display().to_string()),
+            "VHRN_MODE_FILE" => Some(mode.display().to_string()),
+            "VHRN_PROXY_LISTEN" => Some("127.0.0.1:8080".to_owned()),
+            _ => None,
+        })
+        .expect("test config");
+        let shutdown = Shutdown::new();
+        let (upstream, mut origin) = tokio::io::duplex(1024);
+        let context = Arc::new(RequestContext::new(
+            config,
+            crate::connect::public::PublicConnector::test_with_stream(upstream),
+            None,
+            &shutdown,
+        ));
+        let (mut client, server_stream) = tokio::io::duplex(1024);
+        let server = tokio::spawn(serve_test_connection(server_stream, context, shutdown));
+        client
+            .write_all(b"CONNECT allowed.example:443 HTTP/1.1\r\nHost: allowed.example:443\r\n\r\n")
+            .await
+            .expect("CONNECT request");
+        read_connect_response(&mut client).await;
+
+        drop(client);
+
+        let mut end = [0_u8; 1];
+        assert_eq!(origin.read(&mut end).await.unwrap(), 0);
+        origin
+            .write_all(b"reverse bytes after client cancellation")
+            .await
+            .expect("queue reverse bytes");
+        let error = server
+            .await
+            .expect("server task")
+            .expect_err("cancelled client makes reverse relay terminal");
+        assert_eq!(error.to_string(), "CONNECT tunnel I/O failure");
+        assert!(origin.write_all(b"after terminal result").await.is_err());
     }
 
     #[tokio::test(start_paused = true)]

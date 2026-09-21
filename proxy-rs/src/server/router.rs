@@ -6,7 +6,6 @@ use std::time::Duration;
 
 #[cfg(test)]
 use anyhow::Context;
-#[cfg(test)]
 use bytes::Bytes;
 #[cfg(test)]
 use http_body_util::BodyExt;
@@ -147,6 +146,11 @@ impl<T> TunnelIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 pub(crate) type BoxTunnel = Box<dyn TunnelIo>;
 
+pub(crate) struct ConnectedUpstream {
+    pub(crate) stream: BoxTunnel,
+    pub(crate) prefix: Bytes,
+}
+
 pub(crate) async fn handle_http1<S>(
     head: RequestHead,
     connection: &mut Http1Connection<S>,
@@ -196,7 +200,7 @@ where
 pub(crate) async fn connect_http1(
     head: &RequestHead,
     context: &RequestContext,
-) -> Result<BoxTunnel, ProxyFailure> {
+) -> Result<ConnectedUpstream, ProxyFailure> {
     let target = classify(&head.method, &head.raw_target);
     match authorize(target, context).await? {
         AuthorizedRoute::PublicConnect(public) => match context
@@ -204,7 +208,10 @@ pub(crate) async fn connect_http1(
             .connect_target(public.target.clone(), &context.shutdown)
             .await
         {
-            Ok(stream) => Ok(Box::new(stream)),
+            Ok(stream) => Ok(ConnectedUpstream {
+                stream: Box::new(stream),
+                prefix: Bytes::new(),
+            }),
             Err(error) => Err(public_failure(error, &public, context).await),
         },
         AuthorizedRoute::LocalConnect(target) => match &context.local {
@@ -212,7 +219,13 @@ pub(crate) async fn connect_http1(
                 .connect(target.canonical_authority(), &context.shutdown)
                 .await
             {
-                Ok(stream) => Ok(Box::new(stream)),
+                Ok(mut stream) => {
+                    let prefix = stream.take_prefix();
+                    Ok(ConnectedUpstream {
+                        stream: Box::new(stream),
+                        prefix,
+                    })
+                }
                 Err(error) => Err(broker_failure(error)),
             },
             None => Err(ProxyFailure::LocalDenied(
@@ -341,11 +354,16 @@ async fn spawn_tunnel<B, S>(
     tunnels.lock().await.spawn(async move {
         match upgrade.await {
             Ok(upgraded) => crate::server::relay::relay(
-                hyper_util::rt::TokioIo::new(upgraded),
-                upstream,
+                crate::server::relay::TunnelParts {
+                    downstream: hyper_util::rt::TokioIo::new(upgraded),
+                    downstream_prefix: Bytes::new(),
+                    upstream,
+                    upstream_prefix: Bytes::new(),
+                },
                 shutdown,
             )
             .await
+            .map_err(anyhow::Error::new)
             .context("relay CONNECT tunnel"),
             Err(error) => Err(anyhow::Error::new(error).context("upgrade CONNECT request")),
         }

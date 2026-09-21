@@ -1231,6 +1231,14 @@ pub(crate) struct BufferedIo<S> {
     offset: usize,
 }
 
+impl<S> BufferedIo<S> {
+    /// Separates the socket and unread CONNECT bytes for the tunnel handoff.
+    pub(crate) fn into_parts(self) -> (S, Bytes) {
+        let Self { io, prefix, offset } = self;
+        (io, prefix.slice(offset..))
+    }
+}
+
 impl<S: AsyncRead + Unpin> AsyncRead for BufferedIo<S> {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
