@@ -1,6 +1,6 @@
-# Reusable: build the isolated Rust proxy candidate for both production platforms.
-# Qualification owns smoke checks later; this migration workflow deliberately has no
-# registry login, push input, metadata action, or publication tags.
+# Reusable: audit and build the isolated Rust proxy candidate for both production
+# platforms. This workflow deliberately has no registry login, push input,
+# metadata action, or publication tags.
 name: build-proxy-rs
 
 on:
@@ -10,6 +10,15 @@ permissions:
   contents: read
 
 jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust dependency audit
+        run: |
+          cargo install --locked cargo-audit --version 0.22.2
+          cargo audit --deny warnings
+
   proxy:
     runs-on: ubuntu-latest
     steps:
@@ -22,3 +31,51 @@ jobs:
           file: proxy-rs/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: false
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: proxy-rs/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: vhrn-proxy:rust-candidate
+      - name: Candidate image smoke
+        run: |
+          mkdir -p target
+          work=$(mktemp -d "$PWD/target/proxy-smoke.XXXXXX")
+          name=vhrn-proxy-smoke
+          trap 'docker rm --force "$name" >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
+          mkdir -p "$work/policy" "$work/log"
+          : > "$work/policy/allowlist"
+          printf 'enforce\n' > "$work/policy/mode"
+          : > "$work/log/denied.log"
+          chmod 0755 "$work" "$work/policy" "$work/log"
+          chmod 0666 "$work/log/denied.log"
+
+          test "$(docker image inspect --format '{{.Config.User}}' vhrn-proxy:rust-candidate)" = 65532:65532
+          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' vhrn-proxy:rust-candidate)" = '["/vhrn-proxy"]'
+          test "$(docker image inspect --format '{{json .Config.ExposedPorts}}' vhrn-proxy:rust-candidate)" = '{"8080/tcp":{}}'
+          test "$(docker image inspect --format '{{len .RootFS.Layers}}' vhrn-proxy:rust-candidate)" -eq 1
+          if docker run --rm --entrypoint /bin/sh vhrn-proxy:rust-candidate -c true >/dev/null 2>&1; then
+            echo 'scratch image unexpectedly contains /bin/sh' >&2
+            exit 1
+          fi
+
+          docker run --detach --rm --name "$name" \
+            --read-only --cap-drop ALL \
+            --publish 127.0.0.1::8080 \
+            --volume "$work/policy:/etc/vhrn:ro" \
+            --volume "$work/log:/var/log/vhrn" \
+            --env VHRN_ALLOWLIST=/etc/vhrn/allowlist \
+            --env VHRN_MODE_FILE=/etc/vhrn/mode \
+            --env VHRN_DENY_LOG=/var/log/vhrn/denied.log \
+            vhrn-proxy:rust-candidate
+          proxy_port=$(docker port "$name" 8080/tcp | sed -n 's/.*://p')
+          for _ in $(seq 1 50); do
+            test "$(curl --noproxy '*' --silent --show-error "http://127.0.0.1:$proxy_port/healthz" || true)" = ok && break
+            sleep 0.1
+          done
+          test "$(curl --noproxy '*' --silent --show-error "http://127.0.0.1:$proxy_port/healthz")" = ok
+          test "$(curl --noproxy '*' --silent --show-error "http://127.0.0.1:$proxy_port/__status")" = '{"mode":"enforce"}'
+          test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}} {{json .HostConfig.CapDrop}} {{len .Mounts}}' "$name")" = 'true ["ALL"] 2'
+          docker stop --time 8 "$name"

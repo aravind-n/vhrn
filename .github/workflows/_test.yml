@@ -51,6 +51,8 @@ jobs:
       - run: cargo clippy --package vhrn-proxy --all-targets --locked -- -D warnings
       - run: cargo test --package vhrn-proxy --locked
       - run: cargo build --release --locked -p vhrn-proxy
+      - name: Release executable process contract
+        run: VHRN_PROXY_TEST_BIN="$PWD/target/release/vhrn-proxy" cargo test --package vhrn-proxy --locked --test proxy_process
 
   proxy-go:
     if: ${{ inputs.run_proxy_go }}
