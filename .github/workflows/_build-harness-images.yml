@@ -1,7 +1,6 @@
-# Reusable: build the base and harness images multi-arch and optionally publish them to
-# ghcr. Harness images use the base built in the same run by digest. With build_base
-# false, the daily refresh uses the existing published latest base. Release callers stage
-# images here and promote them separately.
+# Reusable: build the base and harness images natively for each architecture and
+# optionally publish them to ghcr. Release callers stage images here and promote
+# them separately.
 name: build-harness-images
 
 on:
@@ -33,7 +32,7 @@ on:
     outputs:
       staging_tag:
         description: temporary tag pushed by the base and harness staging build
-        value: ${{ jobs.base.outputs.staging_tag }}
+        value: ${{ jobs.base-amd64.outputs.staging_tag }}
 
 permissions:
   contents: read
@@ -43,15 +42,14 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  base:
+  base-amd64:
     if: ${{ inputs.build_base }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
-      digest: ${{ steps.build.outputs.digest }}
-      staging_tag: ${{ inputs.staging_tag }}
+      image_tag: ${{ inputs.staging && format('{0}-amd64', inputs.staging_tag) || inputs.flavor == 'ci' && 'ci-amd64' || format('pr-{0}-amd64', github.event.number) }}
+      staging_tag: ${{ inputs.staging && inputs.staging_tag || '' }}
     steps:
       - uses: actions/checkout@v7
-      - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
       - if: ${{ inputs.push }}
         uses: docker/login-action@v4
@@ -75,27 +73,118 @@ jobs:
           flavor: |
             latest=false
           tags: |
+            type=raw,value=ci-amd64,enable=${{ inputs.flavor == 'ci' }}
+            type=ref,event=pr,suffix=-amd64,enable=${{ inputs.flavor == 'pr' }}
+            type=sha,prefix=pr-${{ github.event.number }}-,suffix=-amd64,format=short,enable=${{ inputs.flavor == 'pr' }}
+            type=raw,value=${{ inputs.staging_tag }}-amd64,enable=${{ inputs.staging }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: image/base
+          platforms: linux/amd64
+          load: ${{ !inputs.push }}
+          push: ${{ inputs.push }}
+          tags: ${{ inputs.push && steps.meta.outputs.tags || 'vhrn-base:workflow' }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Build harness images
+        if: ${{ !inputs.push }}
+        run: |
+          for harness in claude codex pi; do
+            docker build --build-arg BASE=vhrn-base:workflow \
+              --tag "vhrn-$harness:workflow" "image/$harness"
+          done
+
+  base-arm64:
+    if: ${{ inputs.build_base }}
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      image_tag: ${{ inputs.staging && format('{0}-arm64', inputs.staging_tag) || inputs.flavor == 'ci' && 'ci-arm64' || format('pr-{0}-arm64', github.event.number) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - if: ${{ inputs.push }}
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Validate staging tag
+        if: ${{ inputs.staging }}
+        env:
+          STAGING_TAG: ${{ inputs.staging_tag }}
+        run: |
+          [[ "$STAGING_TAG" =~ ^staging-[0-9]+-[0-9]+$ ]] || {
+            echo "::error::invalid staging tag: $STAGING_TAG"
+            exit 1
+          }
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/vhrn-base
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=ci-arm64,enable=${{ inputs.flavor == 'ci' }}
+            type=ref,event=pr,suffix=-arm64,enable=${{ inputs.flavor == 'pr' }}
+            type=sha,prefix=pr-${{ github.event.number }}-,suffix=-arm64,format=short,enable=${{ inputs.flavor == 'pr' }}
+            type=raw,value=${{ inputs.staging_tag }}-arm64,enable=${{ inputs.staging }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: image/base
+          platforms: linux/arm64
+          load: ${{ !inputs.push }}
+          push: ${{ inputs.push }}
+          tags: ${{ inputs.push && steps.meta.outputs.tags || 'vhrn-base:workflow' }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Build harness images
+        if: ${{ !inputs.push }}
+        run: |
+          for harness in claude codex pi; do
+            docker build --build-arg BASE=vhrn-base:workflow \
+              --tag "vhrn-$harness:workflow" "image/$harness"
+          done
+
+  base-manifest:
+    needs: [base-amd64, base-arm64]
+    if: ${{ !cancelled() && inputs.push && needs.base-amd64.result == 'success' && needs.base-arm64.result == 'success' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/vhrn-base
+          flavor: |
+            latest=false
+          tags: |
             type=raw,value=ci,enable=${{ inputs.flavor == 'ci' }}
             type=ref,event=pr,enable=${{ inputs.flavor == 'pr' }}
             type=sha,prefix=pr-${{ github.event.number }}-,format=short,enable=${{ inputs.flavor == 'pr' }}
             type=raw,value=${{ inputs.staging_tag }},enable=${{ inputs.staging }}
-      - id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: image/base
-          platforms: linux/amd64,linux/arm64
-          push: ${{ inputs.push }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+      - name: Create multi-architecture image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/vhrn-base
+          TAGS: ${{ steps.meta.outputs.tags }}
+          SOURCE_TAG: ${{ needs.base-amd64.outputs.image_tag }}
+        run: |
+          args=()
+          while IFS= read -r tag; do args+=(--tag "$tag"); done <<< "$TAGS"
+          source_tag="${SOURCE_TAG%-amd64}"
+          docker buildx imagetools create "${args[@]}" \
+            "$IMAGE:$source_tag-amd64" "$IMAGE:$source_tag-arm64"
 
-  # One job per harness (add aider and friends to the matrix as they land). Each image is
-  # probed for its agent version, which becomes both the image tag and the
-  # org.opencontainers.image.version label the host reads back.
-  harness:
-    needs: base
-    if: ${{ !cancelled() && inputs.push && needs.base.result != 'failure' }}
-    runs-on: ubuntu-latest
+  # amd64 determines the agent version. arm64 consumes that result, so both native
+  # builds carry the same image tags before the manifest is made.
+  harness-amd64:
+    needs: base-amd64
+    if: ${{ !cancelled() && inputs.push && needs.base-amd64.result != 'failure' }}
+    runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         include:
           - harness: claude
@@ -106,41 +195,35 @@ jobs:
             version_cmd: pi --version
     steps:
       - uses: actions/checkout@v7
-      - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - if: ${{ inputs.push }}
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - id: date
         run: echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
-
-      # Prefer the base just built in this run (by digest); the daily refresh uses the
-      # published latest base. No base at all: warn and exit 0 so a cron doesn't go red
-      # before the first stable base is ever published.
       - id: base
         env:
+          PUSH: ${{ inputs.push }}
           REG: ${{ env.REGISTRY }}/${{ github.repository_owner }}
-          DIGEST: ${{ needs.base.outputs.digest }}
+          BASE_TAG: ${{ needs.base-amd64.outputs.image_tag }}
           HARNESS: ${{ matrix.harness }}
         run: |
-          if [ -n "$DIGEST" ]; then
-            echo "ref=${REG}/vhrn-base@${DIGEST}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if docker buildx imagetools inspect "${REG}/vhrn-base:latest" >/dev/null 2>&1; then
+          if [ "$PUSH" != true ]; then
+            docker build --tag vhrn-base:workflow image/base
+            echo 'ref=vhrn-base:workflow' >> "$GITHUB_OUTPUT"
+          elif [ -n "$BASE_TAG" ]; then
+            echo "ref=${REG}/vhrn-base:${BASE_TAG}" >> "$GITHUB_OUTPUT"
+          elif docker buildx imagetools inspect "${REG}/vhrn-base:latest" >/dev/null 2>&1; then
             echo "ref=${REG}/vhrn-base:latest" >> "$GITHUB_OUTPUT"
-            exit 0
+          else
+            echo "::warning::no vhrn-base:latest image — skipping ${HARNESS} build"
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
           fi
-          echo "::warning::no vhrn-base:latest image — skipping ${HARNESS} build"
-          echo "skip=true" >> "$GITHUB_OUTPUT"
-
-      # Probe: build amd64 only (loaded locally, no cache so the agent's unpinned install
-      # layer is refetched), run the agent's version command, and parse the semver. The
-      # multi-arch push below reuses these layers, so amd64 users get exactly this version.
       - id: probe
-        if: ${{ steps.base.outputs.skip != 'true' }}
+        if: ${{ inputs.push && steps.base.outputs.skip != 'true' }}
         env:
           BASE: ${{ steps.base.outputs.ref }}
           HARNESS: ${{ matrix.harness }}
@@ -154,12 +237,8 @@ jobs:
           [ -n "$ver" ] || { echo "::error::no version parsed from: $raw"; exit 1; }
           echo "version=$ver" >> "$GITHUB_OUTPUT"
           echo "probed ${HARNESS} $ver"
-
-      # Skip-if-unchanged for the harness refresh cron: nothing to do if the agent
-      # version is already published. Release leaves skip_if_exists false and rebuilds
-      # unconditionally, so a base change still propagates.
       - id: exists
-        if: ${{ steps.base.outputs.skip != 'true' && inputs.skip_if_exists }}
+        if: ${{ inputs.push && steps.base.outputs.skip != 'true' && inputs.skip_if_exists }}
         env:
           REG: ${{ env.REGISTRY }}/${{ github.repository_owner }}
           HARNESS: ${{ matrix.harness }}
@@ -167,73 +246,257 @@ jobs:
         run: |
           if docker buildx imagetools inspect "${REG}/vhrn-${HARNESS}:${VERSION}" >/dev/null 2>&1; then
             echo "::notice::vhrn-${HARNESS}:${VERSION} already published — nothing to do"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
           fi
-
       - id: meta
-        if: ${{ steps.base.outputs.skip != 'true' && steps.exists.outputs.skip != 'true' }}
+        if: ${{ inputs.push && steps.base.outputs.skip != 'true' && steps.exists.outputs.skip != 'true' }}
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/vhrn-${{ matrix.harness }}
           flavor: |
             latest=false
-          # Harness tags are the agent's version, not vhrn's vX.Y.Z. A staging release
-          # pushes only its temporary tag; promotion creates stable tags later. The daily
-          # refresh keeps publishing <version>, <version>-<date>, and latest directly.
           tags: |
-            type=ref,event=pr,enable=${{ inputs.flavor == 'pr' }}
-            type=sha,prefix=pr-${{ github.event.number }}-,format=short,enable=${{ inputs.flavor == 'pr' }}
-            type=raw,value=${{ inputs.staging_tag }},enable=${{ inputs.staging }}
-            type=raw,value=${{ steps.probe.outputs.version }},enable=${{ inputs.flavor == 'release' && !inputs.staging }}
-            type=raw,value=${{ steps.probe.outputs.version }}-${{ steps.date.outputs.date }},enable=${{ inputs.flavor == 'release' && !inputs.staging }}
-            type=raw,value=latest,enable=${{ inputs.flavor == 'release' && !inputs.staging }}
-          # The label the host reads back via inspect — same probed value as the tag.
+            type=raw,value=ci-amd64,enable=${{ inputs.flavor == 'ci' }}
+            type=ref,event=pr,suffix=-amd64,enable=${{ inputs.flavor == 'pr' }}
+            type=sha,prefix=pr-${{ github.event.number }}-,suffix=-amd64,format=short,enable=${{ inputs.flavor == 'pr' }}
+            type=raw,value=${{ inputs.staging_tag }}-amd64,enable=${{ inputs.staging }}
+            type=raw,value=${{ steps.probe.outputs.version }}-amd64,enable=${{ inputs.flavor == 'release' && !inputs.staging }}
+            type=raw,value=${{ steps.probe.outputs.version }}-${{ steps.date.outputs.date }}-amd64,enable=${{ inputs.flavor == 'release' && !inputs.staging }}
+            type=raw,value=latest-amd64,enable=${{ inputs.flavor == 'release' && !inputs.staging }}
           labels: |
             org.opencontainers.image.version=${{ steps.probe.outputs.version }}
       - id: build
-        if: ${{ steps.base.outputs.skip != 'true' && steps.exists.outputs.skip != 'true' }}
+        if: ${{ inputs.push && steps.base.outputs.skip != 'true' && steps.exists.outputs.skip != 'true' }}
         uses: docker/build-push-action@v7
         with:
           context: image/${{ matrix.harness }}
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           build-args: |
             BASE=${{ steps.base.outputs.ref }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-      - name: Record staged harness version
-        if: ${{ inputs.staging && steps.base.outputs.skip != 'true' && steps.exists.outputs.skip != 'true' }}
+      - name: Record amd64 result
+        if: ${{ always() && inputs.push }}
         env:
           HARNESS: ${{ matrix.harness }}
           VERSION: ${{ steps.probe.outputs.version }}
           DATE: ${{ steps.date.outputs.date }}
+          BASE_SKIP: ${{ steps.base.outputs.skip }}
+          EXISTS_SKIP: ${{ steps.exists.outputs.skip }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        run: |
+          mkdir -p harness-input
+          if [ "$BASE_SKIP" = true ] || [ "$EXISTS_SKIP" = true ]; then
+            echo 'skip=true' > "harness-input/$HARNESS-amd64"
+          elif [ "$BUILD_OUTCOME" != success ]; then
+            echo 'failure=true' > "harness-input/$HARNESS-amd64"
+          else
+            { echo 'built=true'; echo "version=$VERSION"; echo "date=$DATE"; } > "harness-input/$HARNESS-amd64"
+          fi
+      - if: ${{ always() && inputs.push }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: harness-image-input-${{ matrix.harness }}-amd64
+          path: harness-input/${{ matrix.harness }}-amd64
+          if-no-files-found: error
+
+  harness-arm64:
+    needs: [base-arm64, harness-amd64]
+    if: ${{ always() && !cancelled() && inputs.push && needs.base-arm64.result != 'failure' }}
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        harness: [claude, codex, pi]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - if: ${{ inputs.push }}
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - if: ${{ inputs.push }}
+        uses: actions/download-artifact@v8
+        with:
+          name: harness-image-input-${{ matrix.harness }}-amd64
+          path: harness-input
+      - id: input
+        if: ${{ inputs.push }}
+        env:
+          HARNESS: ${{ matrix.harness }}
+        run: |
+          # shellcheck source=/dev/null
+          source "harness-input/$HARNESS-amd64"
+          if [ "${failure:-false}" = true ]; then
+            echo 'failure=true' >> "$GITHUB_OUTPUT"
+          elif [ "${skip:-false}" = true ]; then
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+            echo "date=$date" >> "$GITHUB_OUTPUT"
+          fi
+      - id: base
+        env:
+          PUSH: ${{ inputs.push }}
+          REG: ${{ env.REGISTRY }}/${{ github.repository_owner }}
+          BASE_TAG: ${{ needs.base-arm64.outputs.image_tag }}
+          HARNESS: ${{ matrix.harness }}
+        run: |
+          if [ "$PUSH" != true ]; then
+            docker build --tag vhrn-base:workflow image/base
+            echo 'ref=vhrn-base:workflow' >> "$GITHUB_OUTPUT"
+          elif [ -n "$BASE_TAG" ]; then
+            echo "ref=${REG}/vhrn-base:${BASE_TAG}" >> "$GITHUB_OUTPUT"
+          elif docker buildx imagetools inspect "${REG}/vhrn-base:latest" >/dev/null 2>&1; then
+            echo "ref=${REG}/vhrn-base:latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::no vhrn-base:latest image — skipping ${HARNESS} build"
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
+          fi
+      - id: meta
+        if: ${{ inputs.push && steps.input.outputs.failure != 'true' && steps.input.outputs.skip != 'true' && steps.base.outputs.skip != 'true' }}
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/vhrn-${{ matrix.harness }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=ci-arm64,enable=${{ inputs.flavor == 'ci' }}
+            type=ref,event=pr,suffix=-arm64,enable=${{ inputs.flavor == 'pr' }}
+            type=sha,prefix=pr-${{ github.event.number }}-,suffix=-arm64,format=short,enable=${{ inputs.flavor == 'pr' }}
+            type=raw,value=${{ inputs.staging_tag }}-arm64,enable=${{ inputs.staging }}
+            type=raw,value=${{ steps.input.outputs.version }}-arm64,enable=${{ inputs.flavor == 'release' && !inputs.staging }}
+            type=raw,value=${{ steps.input.outputs.version }}-${{ steps.input.outputs.date }}-arm64,enable=${{ inputs.flavor == 'release' && !inputs.staging }}
+            type=raw,value=latest-arm64,enable=${{ inputs.flavor == 'release' && !inputs.staging }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.input.outputs.version }}
+      - id: build
+        if: ${{ inputs.push && steps.input.outputs.failure != 'true' && steps.input.outputs.skip != 'true' && steps.base.outputs.skip != 'true' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: image/${{ matrix.harness }}
+          platforms: linux/arm64
+          push: true
+          build-args: |
+            BASE=${{ steps.base.outputs.ref }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Record arm64 result
+        if: ${{ always() && inputs.push }}
+        env:
+          HARNESS: ${{ matrix.harness }}
+          INPUT_FAILURE: ${{ steps.input.outputs.failure }}
+          INPUT_SKIP: ${{ steps.input.outputs.skip }}
+          BASE_SKIP: ${{ steps.base.outputs.skip }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        run: |
+          mkdir -p harness-input
+          if [ "$INPUT_FAILURE" = true ]; then
+            echo 'failure=true' > "harness-input/$HARNESS-arm64"
+          elif [ "$INPUT_SKIP" = true ] || [ "$BASE_SKIP" = true ]; then
+            echo 'skip=true' > "harness-input/$HARNESS-arm64"
+          elif [ "$BUILD_OUTCOME" != success ]; then
+            echo 'failure=true' > "harness-input/$HARNESS-arm64"
+          else
+            echo 'built=true' > "harness-input/$HARNESS-arm64"
+          fi
+      - if: ${{ always() && inputs.push }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: harness-image-input-${{ matrix.harness }}-arm64
+          path: harness-input/${{ matrix.harness }}-arm64
+          if-no-files-found: error
+
+  harness-manifest:
+    needs: [harness-amd64, harness-arm64]
+    if: ${{ always() && !cancelled() && inputs.push }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        harness: [claude, codex, pi]
+    steps:
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: harness-image-input-${{ matrix.harness }}-amd64
+          path: harness-input
+      - uses: actions/download-artifact@v8
+        with:
+          name: harness-image-input-${{ matrix.harness }}-arm64
+          path: harness-input
+      - id: input
+        env:
+          HARNESS: ${{ matrix.harness }}
+        run: |
+          built=false; version=; date=
+          # shellcheck source=/dev/null
+          source "harness-input/$HARNESS-amd64"
+          amd64_built=$built; amd64_version=$version; amd64_date=$date
+          built=false
+          # shellcheck source=/dev/null
+          source "harness-input/$HARNESS-arm64"
+          if [ "$amd64_built" != true ] || [ "$built" != true ]; then
+            echo "::notice::vhrn-$HARNESS was not rebuilt"
+            exit 0
+          fi
+          { echo 'built=true'; echo "version=$amd64_version"; echo "date=$amd64_date"; } >> "$GITHUB_OUTPUT"
+      - id: meta
+        if: ${{ steps.input.outputs.built == 'true' }}
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/vhrn-${{ matrix.harness }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=ci,enable=${{ inputs.flavor == 'ci' }}
+            type=ref,event=pr,enable=${{ inputs.flavor == 'pr' }}
+            type=sha,prefix=pr-${{ github.event.number }}-,format=short,enable=${{ inputs.flavor == 'pr' }}
+            type=raw,value=${{ inputs.staging_tag }},enable=${{ inputs.staging }}
+            type=raw,value=${{ steps.input.outputs.version }},enable=${{ inputs.flavor == 'release' && !inputs.staging }}
+            type=raw,value=${{ steps.input.outputs.version }}-${{ steps.input.outputs.date }},enable=${{ inputs.flavor == 'release' && !inputs.staging }}
+            type=raw,value=latest,enable=${{ inputs.flavor == 'release' && !inputs.staging }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.input.outputs.version }}
+      - name: Create multi-architecture image
+        if: ${{ steps.input.outputs.built == 'true' }}
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/vhrn-${{ matrix.harness }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          FLAVOR: ${{ inputs.flavor }}
+          STAGING: ${{ inputs.staging }}
+          STAGING_TAG: ${{ inputs.staging_tag }}
+          VERSION: ${{ steps.input.outputs.version }}
+        run: |
+          if [ "$STAGING" = true ]; then source_tag=$STAGING_TAG
+          elif [ "$FLAVOR" = ci ]; then source_tag=ci
+          elif [ "$FLAVOR" = pr ]; then source_tag="pr-${{ github.event.number }}"
+          else source_tag=$VERSION; fi
+          args=()
+          while IFS= read -r tag; do args+=(--tag "$tag"); done <<< "$TAGS"
+          docker buildx imagetools create "${args[@]}" \
+            "$IMAGE:$source_tag-amd64" "$IMAGE:$source_tag-arm64"
+      - name: Record staged harness version
+        if: ${{ inputs.staging && steps.input.outputs.built == 'true' }}
+        env:
+          HARNESS: ${{ matrix.harness }}
+          VERSION: ${{ steps.input.outputs.version }}
+          DATE: ${{ steps.input.outputs.date }}
           STAGING_TAG: ${{ inputs.staging_tag }}
         run: |
           mkdir -p release-input
-          {
-            echo "harness=$HARNESS"
-            echo "version=$VERSION"
-            echo "date=$DATE"
-            echo "staging_tag=$STAGING_TAG"
-          } > "release-input/$HARNESS"
-      - if: ${{ inputs.staging && steps.base.outputs.skip != 'true' && steps.exists.outputs.skip != 'true' }}
+          { echo "harness=$HARNESS"; echo "version=$VERSION"; echo "date=$DATE"; echo "staging_tag=$STAGING_TAG"; } > "release-input/$HARNESS"
+      - if: ${{ inputs.staging && steps.input.outputs.built == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: harness-release-input-${{ matrix.harness }}
           path: release-input/${{ matrix.harness }}
           if-no-files-found: error
-
-  # A non-publishing call cannot consume the multi-platform base by registry digest.
-  # Build it locally once, then build every harness against that exact candidate.
-  validate-harnesses:
-    needs: base
-    if: ${{ !cancelled() && !inputs.push && needs.base.result == 'success' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: docker build --tag vhrn-base:ci image/base
-      - name: Build harness images
-        run: |
-          for harness in claude codex pi; do
-            docker build --build-arg BASE=vhrn-base:ci --tag "vhrn-${harness}:ci" "image/${harness}"
-          done
