@@ -81,7 +81,9 @@ jobs:
       packages: write
     env:
       REGISTRY: ghcr.io/${{ github.repository_owner }}
-      STAGING_TAG: ${{ needs.build-proxy.outputs.staging_tag }}
+      STAGING_TAG: ${{ needs.build-harness-images.outputs.staging_tag }}
+      PROXY_STAGING_AMD64_TAG: ${{ needs.build-proxy.outputs.staging_amd64_tag }}
+      PROXY_STAGING_ARM64_TAG: ${{ needs.build-proxy.outputs.staging_arm64_tag }}
     steps:
       - uses: actions/checkout@v7 # for CHANGELOG.md — the release notes source
       - uses: actions/download-artifact@v8
@@ -103,7 +105,15 @@ jobs:
             exit 1
           }
           [ "$STAGING_TAG" = "$BASE_STAGING_TAG" ] || {
-            echo "::error::proxy and base staging tags differ"
+            echo "::error::base and harness staging tags differ"
+            exit 1
+          }
+          [ "$PROXY_STAGING_AMD64_TAG" = "$STAGING_TAG-amd64" ] || {
+            echo "::error::invalid amd64 proxy staging tag: $PROXY_STAGING_AMD64_TAG"
+            exit 1
+          }
+          [ "$PROXY_STAGING_ARM64_TAG" = "$STAGING_TAG-arm64" ] || {
+            echo "::error::invalid arm64 proxy staging tag: $PROXY_STAGING_ARM64_TAG"
             exit 1
           }
           for asset in vhrn-darwin-amd64 vhrn-darwin-arm64 vhrn-linux-amd64 vhrn-linux-arm64; do
@@ -125,7 +135,10 @@ jobs:
           password: ${{ github.token }}
       - name: Confirm staging images
         run: |
-          for image in vhrn-proxy vhrn-base vhrn-claude vhrn-codex vhrn-pi; do
+          for tag in "$PROXY_STAGING_AMD64_TAG" "$PROXY_STAGING_ARM64_TAG"; do
+            docker buildx imagetools inspect "$REGISTRY/vhrn-proxy:$tag" >/dev/null
+          done
+          for image in vhrn-base vhrn-claude vhrn-codex vhrn-pi; do
             docker buildx imagetools inspect "$REGISTRY/$image:$STAGING_TAG" >/dev/null
           done
       - name: Checksums
@@ -136,7 +149,8 @@ jobs:
           docker buildx imagetools create \
             --tag "$REGISTRY/vhrn-proxy:$GITHUB_REF_NAME" \
             --tag "$REGISTRY/vhrn-proxy:latest" \
-            "$REGISTRY/vhrn-proxy:$STAGING_TAG"
+            "$REGISTRY/vhrn-proxy:$PROXY_STAGING_AMD64_TAG" \
+            "$REGISTRY/vhrn-proxy:$PROXY_STAGING_ARM64_TAG"
           docker buildx imagetools create \
             --tag "$REGISTRY/vhrn-base:$GITHUB_REF_NAME" \
             --tag "$REGISTRY/vhrn-base:latest" \
