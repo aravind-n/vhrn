@@ -11,28 +11,21 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::client::conn::http1;
-use hyper::{Request, Uri};
-use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::task::JoinHandle;
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::time::{Instant, timeout_at};
 
 use crate::Shutdown;
-use crate::connect::origin_body::{BoundedOriginBody, OriginBodyLimits, SharedOriginResponse};
+use crate::connect::forward::{ForwardError, ForwardErrorKind, Forwarded, exchange, forward_error};
+use crate::connect::origin_body::{HttpOrigin, OriginLease, take_origin};
 use crate::connect::pool::IdlePool;
 use crate::domain::target::{PublicHost, PublicTarget};
-use crate::headers::sanitize_hop_by_hop;
+use crate::server::http1::{Http1Connection, RequestHead};
 
 use self::registry::{ipv4_is_global, ipv6_is_global};
 
 const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 const MAX_DNS_ANSWERS: usize = 64;
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// A validated, numeric public connection.
 #[derive(Debug)]
@@ -168,7 +161,12 @@ pub(crate) enum PublicConnectError {
     Unavailable,
     DeadlineExceeded,
     Cancelled,
-    OriginFailure,
+}
+
+#[derive(Debug)]
+pub(crate) enum PublicForwardError {
+    Connect(PublicConnectError),
+    Exchange(ForwardError),
 }
 
 impl PublicConnectError {
@@ -184,7 +182,6 @@ impl fmt::Display for PublicConnectError {
             Self::Unavailable => "public destination unavailable",
             Self::DeadlineExceeded => "public connection deadline exceeded",
             Self::Cancelled => "public connection cancelled",
-            Self::OriginFailure => "public origin exchange failed",
         })
     }
 }
@@ -262,40 +259,9 @@ impl ValidatedAnswers {
 pub(crate) struct PublicConnector {
     resolver: Arc<dyn Resolver>,
     dialer: Arc<dyn NumericDialer>,
-    pool: IdlePool<OriginKey, OriginConnection>,
-    response_timeout: Duration,
-    response_limit: usize,
+    pool: IdlePool<OriginKey, HttpOrigin<PublicStream>>,
     #[cfg(test)]
     public_calls: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
-    active_drivers: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-struct OriginConnection {
-    sender: http1::SendRequest<Full<Bytes>>,
-    driver: JoinHandle<()>,
-}
-
-pub(crate) type PublicResponse = SharedOriginResponse;
-
-#[cfg(test)]
-struct DriverGuard(Arc<std::sync::atomic::AtomicUsize>);
-
-#[cfg(test)]
-impl Drop for DriverGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-impl Drop for OriginConnection {
-    fn drop(&mut self) {
-        self.driver.abort();
-    }
-}
-
-fn origin_connection_reusable(connection: &OriginConnection) -> bool {
-    !connection.driver.is_finished() && connection.sender.is_ready()
 }
 
 impl PublicConnector {
@@ -342,46 +308,14 @@ impl PublicConnector {
     fn from_parts(
         resolver: Arc<dyn Resolver>,
         dialer: Arc<dyn NumericDialer>,
-        pool: IdlePool<OriginKey, OriginConnection>,
+        pool: IdlePool<OriginKey, HttpOrigin<PublicStream>>,
     ) -> Self {
         Self {
             resolver,
             dialer,
             pool,
-            response_timeout: HTTP_TIMEOUT,
-            response_limit: MAX_RESPONSE_BYTES,
             #[cfg(test)]
             public_calls: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            active_drivers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        }
-    }
-
-    #[cfg(test)]
-    fn with_pool_limits(
-        resolver: Arc<dyn Resolver>,
-        dialer: Arc<dyn NumericDialer>,
-        capacity: std::num::NonZeroUsize,
-        lifetime: crate::connect::pool::NonZeroDuration,
-    ) -> Self {
-        Self::from_parts(resolver, dialer, IdlePool::with_limits(capacity, lifetime))
-    }
-
-    #[cfg(test)]
-    fn with_response_limits(
-        resolver: Arc<dyn Resolver>,
-        dialer: Arc<dyn NumericDialer>,
-        response_timeout: Duration,
-        response_limit: usize,
-    ) -> Self {
-        Self {
-            resolver,
-            dialer,
-            pool: IdlePool::new(),
-            response_timeout,
-            response_limit,
-            public_calls: std::sync::atomic::AtomicUsize::new(0),
-            active_drivers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -455,80 +389,54 @@ impl PublicConnector {
         self.open_target(target, cancellation).await
     }
 
-    async fn open_sender(
+    async fn checkout(
         &self,
         target: &PublicTarget,
         cancellation: &Shutdown,
-    ) -> std::result::Result<OriginConnection, PublicConnectError> {
-        let stream = self.open_target(target.clone(), cancellation).await?;
-        let (sender, connection) = timeout(HTTP_TIMEOUT, http1::handshake(TokioIo::new(stream)))
-            .await
-            .map_err(|_| PublicConnectError::OriginFailure)?
-            .map_err(|_| PublicConnectError::OriginFailure)?;
-        #[cfg(test)]
-        let driver_guard = {
-            self.active_drivers
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            DriverGuard(self.active_drivers.clone())
+    ) -> std::result::Result<OriginLease<OriginKey, PublicStream>, PublicConnectError> {
+        let key = OriginKey::from_target(target);
+        let origin = match take_origin(&self.pool, &key) {
+            Some(origin) => origin,
+            None => HttpOrigin::new(self.open_target(target.clone(), cancellation).await?),
         };
-        let driver = tokio::spawn(async move {
-            #[cfg(test)]
-            let _driver_guard = driver_guard;
-            let _ = connection.await;
-        });
-        Ok(OriginConnection { sender, driver })
+        Ok(OriginLease::new(origin, key, self.pool.clone()))
     }
 
-    pub(crate) async fn send(
+    pub(crate) async fn forward<D>(
         &self,
         target: PublicTarget,
-        request: Request<Full<Bytes>>,
+        head: &RequestHead,
+        downstream: &mut Http1Connection<D>,
         cancellation: &Shutdown,
-    ) -> std::result::Result<PublicResponse, PublicConnectError> {
+    ) -> std::result::Result<Forwarded, PublicForwardError>
+    where
+        D: AsyncRead + AsyncWrite + Unpin,
+    {
         #[cfg(test)]
         self.public_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let key = OriginKey::from_target(&target);
-        let request = outbound_request(request).map_err(|_| PublicConnectError::OriginFailure)?;
-        let connection = self.pool.take_if_reusable(&key, origin_connection_reusable);
-        let mut connection = match connection {
-            Some(connection) => connection,
-            None => self.open_sender(&target, cancellation).await?,
+        let lease = tokio::select! {
+            biased;
+            _ = downstream.wait_for_peer_close() => {
+                return Err(PublicForwardError::Exchange(forward_error(
+                    ForwardErrorKind::ClientDisconnected,
+                    false,
+                )));
+            }
+            result = self.checkout(&target, cancellation) => {
+                result.map_err(PublicForwardError::Connect)?
+            }
         };
-        let response = timeout(
-            self.response_timeout,
-            connection.sender.send_request(request),
+        exchange(
+            downstream,
+            head,
+            target.path_and_query(),
+            target.authority(),
+            lease,
+            cancellation,
         )
         .await
-        .map_err(|_| PublicConnectError::OriginFailure)?
-        .map_err(|_| PublicConnectError::OriginFailure)?;
-        let (parts, incoming) = response.into_parts();
-        Ok(PublicResponse {
-            status: parts.status,
-            headers: parts.headers,
-            body: BoundedOriginBody::new(
-                incoming,
-                connection,
-                key,
-                self.pool.clone(),
-                origin_connection_reusable,
-                OriginBodyLimits {
-                    origin: target.authority().to_string(),
-                    timeout: self.response_timeout,
-                    limit: self.response_limit,
-                },
-            )
-            .boxed_unsync(),
-        })
-    }
-
-    #[cfg(test)]
-    async fn http(
-        &self,
-        target: PublicTarget,
-        request: Request<Full<Bytes>>,
-    ) -> std::result::Result<PublicResponse, PublicConnectError> {
-        self.send(target, request, &Shutdown::new()).await
+        .map_err(PublicForwardError::Exchange)
     }
 
     #[cfg(test)]
@@ -540,34 +448,9 @@ impl PublicConnector {
     }
 
     #[cfg(test)]
-    pub(crate) async fn pool_len(&self) -> usize {
-        tokio::task::yield_now().await;
-        self.pool.len()
-    }
-
-    #[cfg(test)]
     pub(crate) fn public_calls(&self) -> usize {
         self.public_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
-
-    #[cfg(test)]
-    pub(crate) fn active_drivers(&self) -> usize {
-        self.active_drivers
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-fn outbound_request(request: Request<Full<Bytes>>) -> Result<Request<Full<Bytes>>> {
-    let (mut parts, body) = request.into_parts();
-    sanitize_hop_by_hop(&mut parts.headers);
-    let path = parts
-        .uri
-        .path_and_query()
-        .map_or("/", |value| value.as_str());
-    parts.uri = path
-        .parse::<Uri>()
-        .map_err(|_| anyhow!("invalid origin path"))?;
-    Ok(Request::from_parts(parts, body))
 }
 
 #[cfg(test)]
@@ -577,9 +460,6 @@ mod tests {
         Mutex,
         atomic::{AtomicBool, Ordering},
     };
-
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::oneshot;
 
     use super::*;
     use crate::domain::target::{Target, classify};
@@ -710,207 +590,6 @@ mod tests {
             .split(',')
             .map(|address| ResolvedAddress::unscoped(address.parse().unwrap()))
             .collect()
-    }
-
-    #[tokio::test]
-    async fn bounded_idle_pool_retires_public_drivers_and_reuses_live_key() {
-        let targets =
-            ["one", "two", "three"].map(|host| public_target(&format!("http://{host}.example/")));
-        let resolver = Arc::new(FakeResolver::new(
-            (0..targets.len())
-                .map(|_| Ok(parse_addresses("8.8.8.8")))
-                .collect(),
-        ));
-        let mut clients = Vec::new();
-        let mut closed = Vec::new();
-        for requests in [1, 2, 1] {
-            let (client, mut peer) = tokio::io::duplex(1024);
-            clients.push(PublicStream::Test(client));
-            let (sender, receiver) = oneshot::channel();
-            tokio::spawn(async move {
-                for _ in 0..requests {
-                    let mut bytes = [0; 1024];
-                    assert!(
-                        timeout(Duration::from_millis(200), peer.read(&mut bytes))
-                            .await
-                            .unwrap()
-                            .unwrap()
-                            > 0
-                    );
-                    peer.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                        .await
-                        .unwrap();
-                }
-                let mut byte = [0];
-                let _ = sender.send(
-                    timeout(Duration::from_millis(500), peer.read(&mut byte))
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                );
-            });
-            closed.push(receiver);
-        }
-        let dialer = Arc::new(QueueDialer::new(clients));
-        let connector = PublicConnector::with_pool_limits(
-            resolver,
-            dialer.clone(),
-            std::num::NonZeroUsize::new(2).unwrap(),
-            crate::connect::pool::NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
-        );
-        for index in 0..3 {
-            let response = connector
-                .http(
-                    targets[index].clone(),
-                    Request::builder()
-                        .uri(format!(
-                            "http://{}.example/",
-                            ["one", "two", "three"][index]
-                        ))
-                        .body(Full::new(Bytes::new()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            response.body.collect().await.unwrap();
-        }
-        assert_eq!(connector.pool_len().await, 2);
-        assert_eq!(
-            timeout(Duration::from_millis(50), &mut closed[0])
-                .await
-                .unwrap()
-                .unwrap(),
-            0
-        );
-        let response = connector
-            .http(
-                targets[1].clone(),
-                Request::builder()
-                    .uri("http://two.example/reused")
-                    .body(Full::new(Bytes::new()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        response.body.collect().await.unwrap();
-        assert_eq!(connector.public_calls(), 4);
-        assert_eq!(dialer.calls.lock().unwrap().len(), 3);
-        assert_eq!(connector.pool_len().await, 2);
-        drop(connector);
-        assert_eq!((&mut closed[1]).await.unwrap(), 0);
-        assert_eq!((&mut closed[2]).await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn public_idle_pool_expires_without_a_later_request() {
-        let (client, mut peer) = tokio::io::duplex(1024);
-        let resolver = Arc::new(FakeResolver::new(vec![Ok(parse_addresses("8.8.8.8"))]));
-        let connector = PublicConnector::with_pool_limits(
-            resolver,
-            Arc::new(QueueDialer::new(vec![PublicStream::Test(client)])),
-            std::num::NonZeroUsize::new(2).unwrap(),
-            crate::connect::pool::NonZeroDuration::new(Duration::from_millis(20)).unwrap(),
-        );
-        let peer_task = tokio::spawn(async move {
-            let mut request = [0; 1024];
-            assert!(peer.read(&mut request).await.unwrap() > 0);
-            peer.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                .await
-                .unwrap();
-            let mut byte = [0];
-            peer.read(&mut byte).await.unwrap()
-        });
-        let target = public_target("http://expiry.example/");
-        connector
-            .http(
-                target,
-                Request::builder()
-                    .uri("http://expiry.example/")
-                    .body(Full::new(Bytes::new()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        timeout(Duration::from_millis(500), async {
-            while connector.active_drivers() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(connector.pool_len().await, 0);
-        assert_eq!(
-            timeout(Duration::from_millis(500), peer_task)
-                .await
-                .unwrap()
-                .unwrap(),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn connection_close_response_is_not_reused() {
-        let (first, mut first_peer) = tokio::io::duplex(1024);
-        let (second, mut second_peer) = tokio::io::duplex(1024);
-        let resolver = Arc::new(FakeResolver::new(vec![
-            Ok(parse_addresses("8.8.8.8")),
-            Ok(parse_addresses("8.8.8.8")),
-        ]));
-        let dialer = Arc::new(QueueDialer::new(vec![
-            PublicStream::Test(first),
-            PublicStream::Test(second),
-        ]));
-        let connector = PublicConnector::new(resolver, dialer.clone());
-        let first_server = tokio::spawn(async move {
-            let mut request = [0; 1024];
-            assert!(
-                timeout(Duration::from_millis(200), first_peer.read(&mut request))
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    > 0
-            );
-            first_peer
-                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-                .await
-                .unwrap();
-        });
-        let second_server = tokio::spawn(async move {
-            let mut request = [0; 1024];
-            assert!(
-                timeout(Duration::from_millis(200), second_peer.read(&mut request))
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    > 0
-            );
-            second_peer
-                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                .await
-                .unwrap();
-        });
-        let target = public_target("http://close.example/");
-        for path in ["/first", "/second"] {
-            connector
-                .http(
-                    target.clone(),
-                    Request::builder()
-                        .uri(format!("http://close.example{path}"))
-                        .body(Full::new(Bytes::new()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-        }
-        timeout(Duration::from_millis(200), first_server)
-            .await
-            .unwrap()
-            .unwrap();
-        timeout(Duration::from_millis(200), second_server)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(dialer.calls.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -1287,88 +966,5 @@ mod tests {
         assert_eq!(first, same);
         assert_ne!(first, port);
         assert_ne!(unscoped, scoped);
-    }
-
-    #[test]
-    fn outbound_request_strips_hop_by_hop_fields() {
-        let request = Request::builder()
-            .method("POST")
-            .uri("http://api.example.com:8080/path?q=one")
-            .header("host", "api.example.com:8080")
-            .header("connection", "X-Remove")
-            .header("x-remove", "removed")
-            .header("proxy-connection", "close")
-            .header("proxy-authorization", "Basic ignored")
-            .body(Full::new(Bytes::from_static(b"body")))
-            .unwrap();
-        let request = outbound_request(request).unwrap();
-        assert_eq!(request.uri(), "/path?q=one");
-        assert!(!request.headers().contains_key("connection"));
-        assert!(!request.headers().contains_key("x-remove"));
-        assert_eq!(request.headers()["host"], "api.example.com:8080");
-        assert!(!request.headers().contains_key("proxy-connection"));
-        assert!(!request.headers().contains_key("proxy-authorization"));
-    }
-
-    #[tokio::test]
-    async fn bounded_origin_response_errors_do_not_retain_pool_entries() {
-        let (client, mut peer) = tokio::io::duplex(4096);
-        let resolver = Arc::new(FakeResolver::new(vec![Ok(parse_addresses("8.8.8.8"))]));
-        let dialer = Arc::new(QueueDialer::new(vec![PublicStream::Test(client)]));
-        let connector =
-            PublicConnector::with_response_limits(resolver, dialer, Duration::from_millis(80), 3);
-        let peer_task = tokio::spawn(async move {
-            let mut request = [0; 1024];
-            let _ = timeout(Duration::from_millis(300), peer.read(&mut request))
-                .await
-                .unwrap()
-                .unwrap();
-            peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ntool")
-                .await
-                .unwrap();
-        });
-        let request = Request::builder()
-            .uri("http://allowed.example/")
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-        let mut response = connector
-            .http(public_target("http://allowed.example/"), request)
-            .await
-            .unwrap();
-        assert!(response.body.frame().await.unwrap().is_err());
-        timeout(Duration::from_millis(300), peer_task)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(connector.pool_len().await, 0);
-
-        let (client, mut peer) = tokio::io::duplex(4096);
-        let resolver = Arc::new(FakeResolver::new(vec![Ok(parse_addresses("8.8.8.8"))]));
-        let dialer = Arc::new(QueueDialer::new(vec![PublicStream::Test(client)]));
-        let connector =
-            PublicConnector::with_response_limits(resolver, dialer, Duration::from_millis(50), 16);
-        let peer_task = tokio::spawn(async move {
-            let mut request = [0; 1024];
-            let _ = timeout(Duration::from_millis(300), peer.read(&mut request))
-                .await
-                .unwrap()
-                .unwrap();
-            tokio::time::sleep(Duration::from_millis(120)).await;
-        });
-        let request = Request::builder()
-            .uri("http://allowed.example/")
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-        assert!(
-            connector
-                .http(public_target("http://allowed.example/"), request)
-                .await
-                .is_err()
-        );
-        timeout(Duration::from_millis(300), peer_task)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(connector.pool_len().await, 0);
     }
 }

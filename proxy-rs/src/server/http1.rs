@@ -1,14 +1,99 @@
 //! Bounded HTTP/1 request-head parsing and request-body framing.
 
+use std::any::Any;
+use std::future::pending;
+use std::io;
+use std::time::Duration;
+
 use bytes::Bytes;
-use hyper::{HeaderMap, Method, Version, header};
+use hyper::{HeaderMap, Method, StatusCode, Version, header};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 pub(crate) const REQUEST_LINE_LIMIT: usize = 8 * 1024;
 pub(crate) const HEADER_SECTION_LIMIT: usize = 64 * 1024;
 pub(crate) const APPLICATION_BUFFER_LIMIT: usize = 64 * 1024;
+pub(crate) const REQUEST_BODY_FRAME_LIMIT: usize = APPLICATION_BUFFER_LIMIT / 2;
+pub(crate) const CHUNK_PREFIX_LIMIT: usize = size_of::<usize>() * 2 + 2;
+pub(crate) const RESPONSE_BODY_FRAME_LIMIT: usize = APPLICATION_BUFFER_LIMIT - CHUNK_PREFIX_LIMIT;
+const _: () = assert!(REQUEST_BODY_FRAME_LIMIT * 2 <= APPLICATION_BUFFER_LIMIT);
+const _: () = assert!(RESPONSE_BODY_FRAME_LIMIT + CHUNK_PREFIX_LIMIT <= APPLICATION_BUFFER_LIMIT);
 const CONNECTION_BUFFER_LIMIT: usize = REQUEST_LINE_LIMIT + HEADER_SECTION_LIMIT;
 const CHUNK_LINE_LIMIT: usize = REQUEST_LINE_LIMIT;
+const PEER_CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[cfg(unix)]
+struct PeerCloseMonitor {
+    poll: mio::Poll,
+    events: mio::Events,
+}
+
+#[cfg(unix)]
+impl PeerCloseMonitor {
+    fn new(stream: &tokio::net::TcpStream) -> io::Result<Self> {
+        let poll = mio::Poll::new()?;
+        let raw = stream.as_raw_fd();
+        poll.registry().register(
+            &mut mio::unix::SourceFd(&raw),
+            mio::Token(0),
+            mio::Interest::READABLE,
+        )?;
+        Ok(Self {
+            poll,
+            events: mio::Events::with_capacity(4),
+        })
+    }
+
+    async fn wait(&mut self) -> io::Result<()> {
+        loop {
+            self.events.clear();
+            self.poll.poll(&mut self.events, Some(Duration::ZERO))?;
+            if self
+                .events
+                .iter()
+                .any(|event| event.is_read_closed() || event.is_error())
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(PEER_CLOSE_POLL_INTERVAL).await;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct PeerCloseMonitor;
+
+#[cfg(not(unix))]
+impl PeerCloseMonitor {
+    fn new(_: &tokio::net::TcpStream) -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn wait(&mut self) -> io::Result<()> {
+        pending().await
+    }
+}
+
+enum PeerCloseState {
+    Absent,
+    Monitoring(PeerCloseMonitor),
+    Failed(io::ErrorKind),
+}
+
+impl PeerCloseState {
+    fn for_io<S: 'static>(io: &S) -> Self {
+        // The listener owns a concrete TCP stream; in-memory codec tests do not need a monitor.
+        let Some(stream) = (io as &dyn Any).downcast_ref::<tokio::net::TcpStream>() else {
+            return Self::Absent;
+        };
+        match PeerCloseMonitor::new(stream) {
+            Ok(monitor) => Self::Monitoring(monitor),
+            Err(error) => Self::Failed(error.kind()),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IngressError {
@@ -23,6 +108,38 @@ pub(crate) enum BodyFraming {
     None,
     ContentLength(u64),
     Chunked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OriginError {
+    Invalid,
+    HeadersTooLarge,
+    Incomplete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OriginBodyFraming {
+    None,
+    ContentLength(u64),
+    Chunked,
+    CloseDelimited,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OriginTransferCoding {
+    Absent,
+    FinalChunked { has_prior: bool },
+    FinalNonChunked,
+}
+
+#[derive(Debug)]
+pub(crate) struct OriginResponseHead {
+    pub(crate) version: Version,
+    pub(crate) status: StatusCode,
+    pub(crate) headers: HeaderMap,
+    pub(crate) framing: OriginBodyFraming,
+    pub(crate) transfer_coding: OriginTransferCoding,
+    pub(crate) close: bool,
 }
 
 impl BodyFraming {
@@ -46,28 +163,37 @@ pub(crate) struct RequestHead {
 /// One downstream connection and its sole fixed-capacity read buffer.
 pub(crate) struct Http1Connection<S> {
     io: S,
+    peer_close: PeerCloseState,
     buffer: Box<[u8]>,
     start: usize,
     end: usize,
     request_is_head: bool,
     prefetched_error: Option<(IngressError, bool)>,
+    #[cfg(test)]
+    peak_body_buffered: usize,
+}
+
+impl<S: 'static> Http1Connection<S> {
+    pub(crate) fn new(io: S) -> Self {
+        let peer_close = PeerCloseState::for_io(&io);
+        Self {
+            io,
+            peer_close,
+            buffer: vec![0; CONNECTION_BUFFER_LIMIT].into_boxed_slice(),
+            start: 0,
+            end: 0,
+            request_is_head: false,
+            prefetched_error: None,
+            #[cfg(test)]
+            peak_body_buffered: 0,
+        }
+    }
 }
 
 impl<S> Http1Connection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    pub(crate) fn new(io: S) -> Self {
-        Self {
-            io,
-            buffer: vec![0; CONNECTION_BUFFER_LIMIT].into_boxed_slice(),
-            start: 0,
-            end: 0,
-            request_is_head: false,
-            prefetched_error: None,
-        }
-    }
-
     pub(crate) async fn wait_for_head_start(&mut self) -> Result<bool, IngressError> {
         if self.start != self.end {
             return Ok(true);
@@ -159,12 +285,15 @@ where
     pub(crate) fn incoming_body(&mut self, framing: BodyFraming) -> IncomingBody<'_, S> {
         IncomingBody {
             connection: self,
-            state: match framing {
-                BodyFraming::None => BodyState::Complete,
-                BodyFraming::ContentLength(remaining) => BodyState::Fixed { remaining },
-                BodyFraming::Chunked => BodyState::ChunkSize,
-            },
+            decoder: BodyDecoder::new(framing),
         }
+    }
+
+    pub(crate) async fn read_body_frame(
+        &mut self,
+        decoder: &mut BodyDecoder,
+    ) -> Result<Option<BodyFrame>, IngressError> {
+        decoder.next_frame(self).await
     }
 
     pub(crate) const fn request_is_head(&self) -> bool {
@@ -179,6 +308,18 @@ where
         self.io.flush().await
     }
 
+    pub(crate) async fn wait_for_peer_close(&mut self) -> io::Result<()> {
+        match &mut self.peer_close {
+            PeerCloseState::Absent => pending().await,
+            PeerCloseState::Monitoring(monitor) => monitor.wait().await,
+            PeerCloseState::Failed(kind) => Err(io::Error::new(
+                *kind,
+                "initialize downstream TCP close monitor",
+            )),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) async fn buffer_during_response(&mut self) -> std::io::Result<bool> {
         self.compact();
         if self.prefetched_error.is_some() {
@@ -200,6 +341,7 @@ where
         Ok(count != 0)
     }
 
+    #[cfg(test)]
     fn prefetch_limit(&mut self) -> Option<usize> {
         let available = &self.buffer[..self.end];
         if let Some(line) = find_crlf(available) {
@@ -249,9 +391,11 @@ where
         if self.end >= limit {
             return Ok(false);
         }
+        // Bound syntax read-ahead so retained body bytes plus a pending request
+        // frame remain below the aggregate application-buffer budget.
         let read_end = self
             .end
-            .saturating_add(APPLICATION_BUFFER_LIMIT)
+            .saturating_add(REQUEST_LINE_LIMIT)
             .min(limit)
             .min(self.buffer.len());
         let count = self
@@ -263,16 +407,31 @@ where
         Ok(count != 0)
     }
 
-    async fn read_at_most(&mut self, limit: usize) -> Result<usize, IngressError> {
+    async fn read_body_data(&mut self, maximum: usize) -> Result<Option<Bytes>, IngressError> {
+        let available = self.end - self.start;
+        if available != 0 {
+            let count = maximum.min(available);
+            let end = self.start + count;
+            let data = Bytes::copy_from_slice(&self.buffer[self.start..end]);
+            self.start = end;
+            #[cfg(test)]
+            self.observe_application_buffer(data.len());
+            return Ok(Some(data));
+        }
         self.compact();
-        let read_end = limit.min(self.buffer.len());
+        let mut data = vec![0; maximum.min(REQUEST_BODY_FRAME_LIMIT)];
         let count = self
             .io
-            .read(&mut self.buffer[..read_end])
+            .read(&mut data)
             .await
             .map_err(|_| IngressError::Incomplete)?;
-        self.end = count;
-        Ok(count)
+        if count == 0 {
+            return Ok(None);
+        }
+        data.truncate(count);
+        #[cfg(test)]
+        self.observe_application_buffer(count);
+        Ok(Some(Bytes::from(data)))
     }
 
     async fn ensure_buffered(&mut self, count: usize) -> Result<(), IngressError> {
@@ -295,9 +454,21 @@ where
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    const fn peak_body_buffered(&self) -> usize {
+        self.peak_body_buffered
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_application_buffer(&mut self, owned: usize) {
+        let aggregate = owned + (self.end - self.start);
+        assert!(aggregate <= APPLICATION_BUFFER_LIMIT);
+        self.peak_body_buffered = self.peak_body_buffered.max(aggregate);
+    }
 }
 
-fn validate_line_endings(bytes: &[u8]) -> Result<(), IngressError> {
+pub(crate) fn validate_line_endings(bytes: &[u8]) -> Result<(), IngressError> {
     for (index, byte) in bytes.iter().copied().enumerate() {
         if byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r') {
             return Err(IngressError::BadRequest);
@@ -316,7 +487,7 @@ fn validate_request_line_prefix(bytes: &[u8]) -> Result<(), IngressError> {
     Ok(())
 }
 
-fn find_crlf(bytes: &[u8]) -> Option<usize> {
+pub(crate) fn find_crlf(bytes: &[u8]) -> Option<usize> {
     bytes.windows(2).position(|window| window == b"\r\n")
 }
 
@@ -324,7 +495,7 @@ fn request_line_is_head(bytes: &[u8]) -> bool {
     bytes.split(|byte| *byte == b' ').next() == Some(b"HEAD".as_slice())
 }
 
-fn find_head_end(bytes: &[u8], request_line_len: usize) -> Option<usize> {
+pub(crate) fn find_head_end(bytes: &[u8], request_line_len: usize) -> Option<usize> {
     if bytes.get(request_line_len..request_line_len + 2) == Some(b"\r\n") {
         return Some(request_line_len + 2);
     }
@@ -395,7 +566,92 @@ fn parse_head(request_line: &[u8], header_section: &[u8]) -> Result<RequestHead,
     })
 }
 
-fn parse_fields(section: &[u8]) -> Result<HeaderMap, IngressError> {
+pub(crate) fn parse_origin_response_head(
+    status_line: &[u8],
+    header_section: &[u8],
+    request_method: &Method,
+) -> Result<OriginResponseHead, OriginError> {
+    let line = status_line
+        .strip_suffix(b"\r\n")
+        .ok_or(OriginError::Invalid)?;
+    let (version, remainder) = if let Some(value) = line.strip_prefix(b"HTTP/1.0 ") {
+        (Version::HTTP_10, value)
+    } else if let Some(value) = line.strip_prefix(b"HTTP/1.1 ") {
+        (Version::HTTP_11, value)
+    } else {
+        return Err(OriginError::Invalid);
+    };
+    if remainder.len() < 4
+        || !remainder[..3].iter().all(u8::is_ascii_digit)
+        || remainder[3] != b' '
+        || remainder.get(4..).is_some_and(|reason| {
+            reason
+                .iter()
+                .any(|byte| (*byte < b' ' && *byte != b'\t') || *byte == 0x7f)
+        })
+    {
+        return Err(OriginError::Invalid);
+    }
+    let status_number = remainder[..3]
+        .iter()
+        .fold(0_u16, |value, digit| value * 10 + u16::from(*digit - b'0'));
+    if status_number > 599 {
+        return Err(OriginError::Invalid);
+    }
+    let status = StatusCode::from_u16(status_number).map_err(|_| OriginError::Invalid)?;
+    let headers = parse_fields(header_section).map_err(|_| OriginError::Invalid)?;
+    let content_length = parse_content_length(&headers).map_err(|_| OriginError::Invalid)?;
+    let transfer_coding =
+        parse_origin_transfer_encoding(&headers).map_err(|_| OriginError::Invalid)?;
+    if version == Version::HTTP_10 && transfer_coding != OriginTransferCoding::Absent {
+        return Err(OriginError::Invalid);
+    }
+    if content_length.is_some() && transfer_coding != OriginTransferCoding::Absent {
+        return Err(OriginError::Invalid);
+    }
+    if (status.is_informational() || status == StatusCode::NO_CONTENT)
+        && (content_length.is_some() || transfer_coding != OriginTransferCoding::Absent)
+    {
+        return Err(OriginError::Invalid);
+    }
+    let connection_tokens =
+        comma_tokens(&headers, header::CONNECTION).map_err(|_| OriginError::Invalid)?;
+    let mut close = if version == Version::HTTP_10 {
+        !connection_tokens
+            .iter()
+            .any(|token| token.eq_ignore_ascii_case(b"keep-alive"))
+    } else {
+        connection_tokens
+            .iter()
+            .any(|token| token.eq_ignore_ascii_case(b"close"))
+    };
+    let bodyless = request_method == Method::HEAD
+        || status.is_informational()
+        || matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED);
+    let framing = if bodyless {
+        OriginBodyFraming::None
+    } else if matches!(transfer_coding, OriginTransferCoding::FinalChunked { .. }) {
+        OriginBodyFraming::Chunked
+    } else if transfer_coding == OriginTransferCoding::FinalNonChunked {
+        close = true;
+        OriginBodyFraming::CloseDelimited
+    } else if let Some(length) = content_length {
+        OriginBodyFraming::ContentLength(length)
+    } else {
+        close = true;
+        OriginBodyFraming::CloseDelimited
+    };
+    Ok(OriginResponseHead {
+        version,
+        status,
+        headers,
+        framing,
+        transfer_coding,
+        close,
+    })
+}
+
+pub(crate) fn parse_fields(section: &[u8]) -> Result<HeaderMap, IngressError> {
     if !section.ends_with(b"\r\n") {
         return Err(IngressError::BadRequest);
     }
@@ -412,34 +668,45 @@ fn parse_fields(section: &[u8]) -> Result<HeaderMap, IngressError> {
             }
             break;
         }
-        if line
-            .first()
-            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
-        {
-            return Err(IngressError::BadRequest);
-        }
-        let colon = line
-            .iter()
-            .position(|byte| *byte == b':')
-            .ok_or(IngressError::BadRequest)?;
-        let name = &line[..colon];
-        if name.is_empty() || name.last().is_some_and(u8::is_ascii_whitespace) {
-            return Err(IngressError::BadRequest);
-        }
-        let value = trim_ows(&line[colon + 1..]);
-        if value
-            .iter()
-            .any(|byte| (*byte < 0x20 && *byte != b'\t') || *byte == 0x7f)
-        {
-            return Err(IngressError::BadRequest);
-        }
-        let name =
-            hyper::header::HeaderName::from_bytes(name).map_err(|_| IngressError::BadRequest)?;
-        let value =
-            hyper::header::HeaderValue::from_bytes(value).map_err(|_| IngressError::BadRequest)?;
-        headers.append(name, value);
+        append_field_line(&mut headers, line)?;
     }
     Ok(headers)
+}
+
+pub(crate) fn append_field_line(headers: &mut HeaderMap, line: &[u8]) -> Result<(), IngressError> {
+    if line
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        return Err(IngressError::BadRequest);
+    }
+    let colon = line
+        .iter()
+        .position(|byte| *byte == b':')
+        .ok_or(IngressError::BadRequest)?;
+    let name = &line[..colon];
+    if name.is_empty() || name.last().is_some_and(u8::is_ascii_whitespace) {
+        return Err(IngressError::BadRequest);
+    }
+    let value = trim_ows(&line[colon + 1..]);
+    if value
+        .iter()
+        .any(|byte| (*byte < 0x20 && *byte != b'\t') || *byte == 0x7f)
+    {
+        return Err(IngressError::BadRequest);
+    }
+    let name = hyper::header::HeaderName::from_bytes(name).map_err(|_| IngressError::BadRequest)?;
+    let value =
+        hyper::header::HeaderValue::from_bytes(value).map_err(|_| IngressError::BadRequest)?;
+    headers.append(name, value);
+    Ok(())
+}
+
+pub(crate) fn header_field_bytes(headers: &HeaderMap) -> usize {
+    headers
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.as_bytes().len())
+        .sum()
 }
 
 fn trim_ows(mut value: &[u8]) -> &[u8] {
@@ -540,6 +807,41 @@ fn parse_transfer_encoding(headers: &HeaderMap) -> Result<bool, IngressError> {
         return Err(IngressError::BadRequest);
     }
     Ok(true)
+}
+
+fn parse_origin_transfer_encoding(
+    headers: &HeaderMap,
+) -> Result<OriginTransferCoding, IngressError> {
+    let mut values = Vec::new();
+    for value in headers.get_all(header::TRANSFER_ENCODING) {
+        values.extend(
+            split_quoted(value.as_bytes(), b',')?
+                .into_iter()
+                .map(trim_ows),
+        );
+    }
+    if values.is_empty() {
+        return Ok(OriginTransferCoding::Absent);
+    }
+    if values.iter().any(|value| !valid_transfer_coding(value)) {
+        return Err(IngressError::BadRequest);
+    }
+    let chunked = |value: &&[u8]| transfer_coding_name(value).eq_ignore_ascii_case(b"chunked");
+    let final_chunked = values.last().is_some_and(chunked);
+    if values[..values.len() - 1].iter().any(chunked)
+        || values.iter().any(|value| {
+            transfer_coding_name(value).eq_ignore_ascii_case(b"chunked") && value.contains(&b';')
+        })
+    {
+        return Err(IngressError::BadRequest);
+    }
+    Ok(if final_chunked {
+        OriginTransferCoding::FinalChunked {
+            has_prior: values.len() > 1,
+        }
+    } else {
+        OriginTransferCoding::FinalNonChunked
+    })
 }
 
 fn valid_transfer_coding(value: &[u8]) -> bool {
@@ -660,7 +962,7 @@ fn comma_tokens(
     Ok(tokens)
 }
 
-enum BodyState {
+enum DecoderState {
     Complete,
     Fixed { remaining: u64 },
     ChunkSize,
@@ -675,84 +977,94 @@ pub(crate) enum BodyFrame {
     Trailers(HeaderMap),
 }
 
-/// A streaming decoder borrowing the only owner of the downstream socket.
-pub(crate) struct IncomingBody<'a, S> {
-    connection: &'a mut Http1Connection<S>,
-    state: BodyState,
+pub(crate) struct BodyDecoder {
+    state: DecoderState,
+    trailer_headers: HeaderMap,
+    trailer_octets: usize,
 }
 
-impl<S> IncomingBody<'_, S>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    pub(crate) async fn next_frame(&mut self) -> Result<Option<BodyFrame>, IngressError> {
+impl BodyDecoder {
+    pub(crate) fn new(framing: BodyFraming) -> Self {
+        Self {
+            state: match framing {
+                BodyFraming::None => DecoderState::Complete,
+                BodyFraming::ContentLength(remaining) => DecoderState::Fixed { remaining },
+                BodyFraming::Chunked => DecoderState::ChunkSize,
+            },
+            trailer_headers: HeaderMap::new(),
+            trailer_octets: 0,
+        }
+    }
+
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        header_field_bytes(&self.trailer_headers)
+    }
+
+    async fn next_frame<S>(
+        &mut self,
+        connection: &mut Http1Connection<S>,
+    ) -> Result<Option<BodyFrame>, IngressError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         loop {
             match self.state {
-                BodyState::Complete => return Ok(None),
-                BodyState::Fixed { remaining: 0 } => self.state = BodyState::Complete,
-                BodyState::Fixed { remaining } => {
+                DecoderState::Complete => return Ok(None),
+                DecoderState::Fixed { remaining: 0 } => self.state = DecoderState::Complete,
+                DecoderState::Fixed { remaining } => {
                     let maximum = usize::try_from(remaining)
                         .unwrap_or(usize::MAX)
-                        .min(APPLICATION_BUFFER_LIMIT);
-                    let available = self.connection.end - self.connection.start;
-                    if available == 0 && self.connection.read_at_most(maximum).await? == 0 {
+                        .min(REQUEST_BODY_FRAME_LIMIT);
+                    let Some(data) = connection.read_body_data(maximum).await? else {
                         return Err(IngressError::Incomplete);
-                    }
-                    let count = maximum.min(self.connection.end - self.connection.start);
-                    let end = self.connection.start + count;
-                    let data =
-                        Bytes::copy_from_slice(&self.connection.buffer[self.connection.start..end]);
-                    self.connection.start = end;
-                    self.state = BodyState::Fixed {
-                        remaining: remaining - count as u64,
+                    };
+                    self.state = DecoderState::Fixed {
+                        remaining: remaining - data.len() as u64,
                     };
                     return Ok(Some(BodyFrame::Data(data)));
                 }
-                BodyState::ChunkSize => {
-                    let line = self.read_line(CHUNK_LINE_LIMIT).await?;
+                DecoderState::ChunkSize => {
+                    let line = read_body_line(connection, CHUNK_LINE_LIMIT).await?;
                     let size = parse_chunk_size(&line)?;
                     self.state = if size == 0 {
-                        BodyState::Trailers
+                        DecoderState::Trailers
                     } else {
-                        BodyState::ChunkData { remaining: size }
+                        DecoderState::ChunkData { remaining: size }
                     };
                 }
-                BodyState::ChunkData { remaining } => {
+                DecoderState::ChunkData { remaining } => {
                     let maximum = usize::try_from(remaining)
                         .unwrap_or(usize::MAX)
-                        .min(APPLICATION_BUFFER_LIMIT);
-                    let available = self.connection.end - self.connection.start;
-                    if available == 0 && self.connection.read_at_most(maximum).await? == 0 {
+                        .min(REQUEST_BODY_FRAME_LIMIT);
+                    let Some(data) = connection.read_body_data(maximum).await? else {
                         return Err(IngressError::Incomplete);
-                    }
-                    let count = maximum.min(self.connection.end - self.connection.start);
-                    let end = self.connection.start + count;
-                    let data =
-                        Bytes::copy_from_slice(&self.connection.buffer[self.connection.start..end]);
-                    self.connection.start = end;
-                    let remaining = remaining - count as u64;
+                    };
+                    let remaining = remaining - data.len() as u64;
                     self.state = if remaining == 0 {
-                        BodyState::ChunkDataEnd
+                        DecoderState::ChunkDataEnd
                     } else {
-                        BodyState::ChunkData { remaining }
+                        DecoderState::ChunkData { remaining }
                     };
                     return Ok(Some(BodyFrame::Data(data)));
                 }
-                BodyState::ChunkDataEnd => {
-                    self.connection.ensure_buffered(2).await?;
-                    if &self.connection.buffer[self.connection.start..self.connection.start + 2]
-                        != b"\r\n"
-                    {
+                DecoderState::ChunkDataEnd => {
+                    connection.ensure_buffered(2).await?;
+                    if &connection.buffer[connection.start..connection.start + 2] != b"\r\n" {
                         return Err(IngressError::BadRequest);
                     }
-                    self.connection.start += 2;
-                    self.state = BodyState::ChunkSize;
+                    connection.start += 2;
+                    self.state = DecoderState::ChunkSize;
                 }
-                BodyState::Trailers => {
-                    let raw = self.read_trailers().await?;
-                    let trailers = parse_fields(&raw)?;
-                    validate_trailers(&trailers)?;
-                    self.state = BodyState::Complete;
+                DecoderState::Trailers => {
+                    read_body_trailers(
+                        connection,
+                        &mut self.trailer_headers,
+                        &mut self.trailer_octets,
+                    )
+                    .await?;
+                    validate_trailers(&self.trailer_headers)?;
+                    self.state = DecoderState::Complete;
+                    let trailers = std::mem::take(&mut self.trailer_headers);
                     if trailers.is_empty() {
                         return Ok(None);
                     }
@@ -761,53 +1073,99 @@ where
             }
         }
     }
+}
 
-    async fn read_line(&mut self, limit: usize) -> Result<Vec<u8>, IngressError> {
-        loop {
-            let available = &self.connection.buffer[self.connection.start..self.connection.end];
-            let line_end = find_crlf(available);
-            let validated_end = line_end.map_or(available.len(), |end| end + 2);
-            validate_line_endings(&available[..validated_end])?;
-            if let Some(end) = line_end {
-                if end + 2 > limit {
-                    return Err(IngressError::BadRequest);
-                }
-                let line = available[..end].to_vec();
-                self.connection.start += end + 2;
-                return Ok(line);
-            }
-            if available.len() >= limit {
+/// A streaming decoder borrowing the only owner of the downstream socket.
+pub(crate) struct IncomingBody<'a, S> {
+    connection: &'a mut Http1Connection<S>,
+    decoder: BodyDecoder,
+}
+
+impl<S> IncomingBody<'_, S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    pub(crate) async fn next_frame(&mut self) -> Result<Option<BodyFrame>, IngressError> {
+        self.decoder.next_frame(self.connection).await
+    }
+}
+
+async fn read_body_line<S>(
+    connection: &mut Http1Connection<S>,
+    limit: usize,
+) -> Result<Vec<u8>, IngressError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let available = &connection.buffer[connection.start..connection.end];
+        let line_end = find_crlf(available);
+        let validated_end = line_end.map_or(available.len(), |end| end + 2);
+        validate_line_endings(&available[..validated_end])?;
+        if let Some(end) = line_end {
+            if end + 2 > limit {
                 return Err(IngressError::BadRequest);
             }
-            self.connection.compact();
-            if !self.connection.read_more_until(limit).await? {
-                return Err(IngressError::Incomplete);
-            }
+            let line = available[..end].to_vec();
+            connection.start += end + 2;
+            #[cfg(test)]
+            connection.observe_application_buffer(line.len());
+            return Ok(line);
         }
-    }
-
-    async fn read_trailers(&mut self) -> Result<Vec<u8>, IngressError> {
-        let mut raw = Vec::new();
-        loop {
-            let remaining = HEADER_SECTION_LIMIT.saturating_sub(raw.len());
-            if remaining < 2 {
-                return Err(IngressError::HeadersTooLarge);
-            }
-            let line = self.read_line(remaining).await?;
-            if line.len() + 2 > remaining {
-                return Err(IngressError::HeadersTooLarge);
-            }
-            let empty = line.is_empty();
-            raw.extend_from_slice(&line);
-            raw.extend_from_slice(b"\r\n");
-            if empty {
-                return Ok(raw);
-            }
+        if available.len() >= limit {
+            return Err(IngressError::BadRequest);
+        }
+        connection.compact();
+        if !connection.read_more_until(limit).await? {
+            return Err(IngressError::Incomplete);
         }
     }
 }
 
-fn parse_chunk_size(line: &[u8]) -> Result<u64, IngressError> {
+async fn read_body_trailers<S>(
+    connection: &mut Http1Connection<S>,
+    headers: &mut HeaderMap,
+    raw_octets: &mut usize,
+) -> Result<(), IngressError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let available = &connection.buffer[connection.start..connection.end];
+        let line_end = find_crlf(available);
+        let validated_end = line_end.map_or(available.len(), |end| end + 2);
+        validate_line_endings(&available[..validated_end])?;
+        if let Some(relative_end) = line_end {
+            let line_octets = relative_end + 2;
+            *raw_octets = raw_octets
+                .checked_add(line_octets)
+                .filter(|total| *total <= HEADER_SECTION_LIMIT)
+                .ok_or(IngressError::HeadersTooLarge)?;
+            let line_start = connection.start;
+            let line_end = line_start + relative_end;
+            connection.start = line_end + 2;
+            if relative_end == 0 {
+                #[cfg(test)]
+                connection.observe_application_buffer(header_field_bytes(headers));
+                return Ok(());
+            }
+            append_field_line(headers, &connection.buffer[line_start..line_end])?;
+            #[cfg(test)]
+            connection.observe_application_buffer(header_field_bytes(headers));
+            continue;
+        }
+        if raw_octets.saturating_add(available.len()) >= HEADER_SECTION_LIMIT {
+            return Err(IngressError::HeadersTooLarge);
+        }
+        let remaining = HEADER_SECTION_LIMIT - *raw_octets;
+        connection.compact();
+        if !connection.read_more_until(remaining).await? {
+            return Err(IngressError::Incomplete);
+        }
+    }
+}
+
+pub(crate) fn parse_chunk_size(line: &[u8]) -> Result<u64, IngressError> {
     let parts = split_quoted(line, b';')?;
     let size = parts.first().copied().unwrap_or_default();
     if size.is_empty() || !size.iter().all(u8::is_ascii_hexdigit) {
@@ -918,11 +1276,75 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt as _;
 
+    #[test]
+    fn origin_response_framing_preserves_bodyless_semantics_and_overflow_is_invalid() {
+        for (method, status, fields) in [
+            (
+                Method::HEAD,
+                b"HTTP/1.1 200 OK\r\n".as_slice(),
+                b"Content-Length: 99\r\n\r\n".as_slice(),
+            ),
+            (Method::GET, b"HTTP/1.1 103 Early Hints\r\n", b"\r\n"),
+            (Method::GET, b"HTTP/1.1 204 No Content\r\n", b"\r\n"),
+            (
+                Method::GET,
+                b"HTTP/1.1 304 Not Modified\r\n",
+                b"Content-Length: 99\r\n\r\n",
+            ),
+        ] {
+            let parsed = parse_origin_response_head(status, fields, &method).unwrap();
+            assert_eq!(parsed.framing, OriginBodyFraming::None);
+        }
+        assert_eq!(
+            parse_origin_response_head(
+                b"HTTP/1.1 200 OK\r\n",
+                b"Content-Length: 18446744073709551616\r\n\r\n",
+                &Method::GET,
+            )
+            .unwrap_err(),
+            OriginError::Invalid
+        );
+        assert_eq!(
+            parse_origin_response_head(
+                b"HTTP/1.1 204 No Content\r\n",
+                b"Content-Length: 0\r\n\r\n",
+                &Method::GET,
+            )
+            .unwrap_err(),
+            OriginError::Invalid
+        );
+    }
+
     async fn test_connection(bytes: &[u8]) -> Http1Connection<tokio::io::DuplexStream> {
         let (mut client, server) = tokio::io::duplex(CONNECTION_BUFFER_LIMIT * 2);
         client.write_all(bytes).await.unwrap();
         client.shutdown().await.unwrap();
         Http1Connection::new(server)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tcp_peer_close_monitor_ignores_unread_data_and_observes_eof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mut connection = Http1Connection::new(server);
+        client
+            .write_all(&vec![b'x'; APPLICATION_BUFFER_LIMIT])
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), connection.wait_for_peer_close())
+                .await
+                .is_err()
+        );
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), connection.wait_for_peer_close())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1124,7 +1546,9 @@ mod tests {
         let mut connection = Http1Connection::new(server);
         let head = connection.read_head().await.unwrap().unwrap();
         assert_eq!(head.raw_target, b"/healthz");
-        assert!(connection.buffer_during_response().await.unwrap());
+        while connection.end < REQUEST_LINE_LIMIT {
+            assert!(connection.buffer_during_response().await.unwrap());
+        }
         assert_eq!(
             connection.end, REQUEST_LINE_LIMIT,
             "prefetch stopped at the active request-line boundary"
@@ -1145,7 +1569,9 @@ mod tests {
         let mut connection = Http1Connection::new(server);
         let head = connection.read_head().await.unwrap().unwrap();
         assert_eq!(head.raw_target, b"/healthz");
-        assert!(connection.buffer_during_response().await.unwrap());
+        while connection.end < next_line.len() + HEADER_SECTION_LIMIT {
+            assert!(connection.buffer_during_response().await.unwrap());
+        }
         assert_eq!(
             connection.end,
             next_line.len() + HEADER_SECTION_LIMIT,
@@ -1215,15 +1641,17 @@ mod tests {
         let mut connection = test_connection(&bytes).await;
         let head = connection.read_head().await.unwrap().unwrap();
         let mut body = connection.incoming_body(head.framing);
-        let first = body.next_frame().await.unwrap().unwrap();
-        let second = body.next_frame().await.unwrap().unwrap();
-        assert!(
-            matches!(first, BodyFrame::Data(ref data) if data.len() <= APPLICATION_BUFFER_LIMIT)
-        );
-        assert!(
-            matches!(second, BodyFrame::Data(ref data) if data.len() <= APPLICATION_BUFFER_LIMIT)
-        );
-        assert_eq!(body.next_frame().await.unwrap(), None);
+        let mut total = 0;
+        while let Some(frame) = body.next_frame().await.unwrap() {
+            let BodyFrame::Data(data) = frame else {
+                panic!("fixed body cannot have trailers");
+            };
+            assert!(data.len() <= REQUEST_BODY_FRAME_LIMIT);
+            total += data.len();
+        }
+        assert_eq!(total, payload.len());
+        drop(body);
+        assert!(connection.peak_body_buffered() <= APPLICATION_BUFFER_LIMIT);
 
         let mut connection = test_connection(
             b"POST / HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\nTrailer: X-End\r\n\r\n4\r\nbody\r\n0\r\nX-End: yes\r\n\r\n",
@@ -1252,6 +1680,31 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn request_trailer_limit_stays_within_the_aggregate_buffer_budget() {
+        let prefix = b"X-Large: ";
+        let value_length = HEADER_SECTION_LIMIT - prefix.len() - 4;
+        let mut bytes =
+            b"POST / HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
+        bytes.extend_from_slice(prefix);
+        bytes.extend(std::iter::repeat_n(b'a', value_length));
+        bytes.extend_from_slice(b"\r\n\r\n");
+
+        let mut connection = test_connection(&bytes).await;
+        let head = connection.read_head().await.unwrap().unwrap();
+        let frame = connection
+            .incoming_body(head.framing)
+            .next_frame()
+            .await
+            .unwrap()
+            .unwrap();
+        let BodyFrame::Trailers(trailers) = frame else {
+            panic!("zero chunk must be followed by trailers");
+        };
+        assert_eq!(trailers["x-large"].as_bytes().len(), value_length);
+        assert!(connection.peak_body_buffered() <= APPLICATION_BUFFER_LIMIT);
     }
 
     #[tokio::test]

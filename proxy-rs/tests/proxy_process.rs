@@ -964,9 +964,6 @@ async fn http1_persistence_connect_framing_and_upgrade_are_enforced_before_broke
             )
             .await
             .expect("Expect request head");
-        let interim = read_through(&mut expect_client, b"\r\n\r\n").await;
-        assert!(interim.starts_with(b"HTTP/1.1 100 Continue\r\n"));
-        expect_client.write_all(b"body").await.expect("Expect body");
         let mut origin = broker.connect(authority).await;
         let origin_head = String::from_utf8(read_through(&mut origin, b"\r\n\r\n").await)
             .expect("origin request head");
@@ -975,6 +972,13 @@ async fn http1_persistence_connect_framing_and_upgrade_are_enforced_before_broke
                 .to_ascii_lowercase()
                 .contains("expect: 100-continue")
         );
+        origin
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .expect("origin interim response");
+        let interim = read_through(&mut expect_client, b"\r\n\r\n").await;
+        assert!(interim.starts_with(b"HTTP/1.1 100 Continue\r\n"));
+        expect_client.write_all(b"body").await.expect("Expect body");
         let mut origin_body = [0; 4];
         origin
             .read_exact(&mut origin_body)

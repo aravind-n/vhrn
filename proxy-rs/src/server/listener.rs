@@ -82,11 +82,14 @@ fn acquire_connection_permit(
     admission.clone().try_acquire_owned().ok()
 }
 #[cfg(test)]
-pub(crate) async fn serve_test_connection(
-    stream: tokio::io::DuplexStream,
+pub(crate) async fn serve_test_connection<S>(
+    stream: S,
     context: Arc<RequestContext>,
     shutdown: Shutdown,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
     serve_connection_io(stream, context, shutdown).await
 }
 
