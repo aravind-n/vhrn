@@ -1,8 +1,14 @@
 # TSV: exchange<TAB>wire bytes using \n escapes<TAB>response<TAB>post-response bytes<TAB>outcome
 ready	VHRN-BROKER/1 READY <token>\n	OK\n		ready
+ready	VHRN-BROKER/1 READY <token>\n	OK\n	payload	rejected
+ready	VHRN-BROKER/1 READY <token>\n	ERR\n		rejected
+ready	VHRN-BROKER/1 READY <token>\n	eof		rejected
+ready	VHRN-BROKER/1 READY <token>\n	timeout		deadline
+connect	VHRN-BROKER/1 CONNECT <token> localhost:80\n	OK\n		connected
 connect	VHRN-BROKER/1 CONNECT <token> localhost:80\n	OK\n	payload	connected
-connect	VHRN-BROKER/1 CONNECT <token> localhost:80\n	ERR\n		denied
-connect	VHRN-BROKER/1 CONNECT <token> localhost:80\n	NO\n		denied
-connect	VHRN-BROKER/1 CONNECT <token> localhost:80\n	TOOLONG		denied
-connect	VHRN-BROKER/1 CONNECT <token> localhost:80\n	O		cancelled
-ready	VHRN-BROKER/1 READY <token>\n	timeout		cancelled
+connect	VHRN-BROKER/1 CONNECT <token> localhost:80\n	ERR\n		rejected
+connect	VHRN-BROKER/1 CONNECT <token> localhost:80\n	OK extra\n		rejected
+connect	VHRN-BROKER/1 CONNECT <token> localhost:80\n	OK\r\n		rejected
+connect	VHRN-BROKER/1 CONNECT <token> localhost:80\n	TOOLONG\n		rejected
+connect	VHRN-BROKER/1 CONNECT <token> localhost:80\n	eof		rejected
+connect	VHRN-BROKER/1 CONNECT <token> localhost:80\n	timeout		deadline

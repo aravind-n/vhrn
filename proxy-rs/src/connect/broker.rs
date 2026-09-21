@@ -4,4 +4,4 @@ mod http;
 mod protocol;
 
 pub(crate) use http::BrokerConnector;
-pub(crate) use protocol::BrokerToken;
+pub(crate) use protocol::{BrokerError, BrokerToken};
