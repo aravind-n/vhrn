@@ -176,7 +176,7 @@ required `ci-gate`, resolve conversations, choose **Squash and merge**, retain
 Completion criterion: PR is **Merged** into `master`, `ci-gate` is green, and
 the PR's squash commit is titled `release: X.Y.Z`.
 
-### 6. Verify exact merged candidate and nightly
+### 6. Verify exact merged candidate and CI
 
 **GitHub CLI:**
 
@@ -208,27 +208,27 @@ required subject and changes exactly the three release files; the merged
 candidate's committed version and changelog heading match the release. A
 concurrent merge is safe: `RELEASE_SHA`, not the branch tip, is the candidate.
 
-Wait for full `nightly` for this SHA.
+Wait for the full `ci` run for this SHA.
 
 **GitHub CLI:**
 
 ```sh
-NIGHTLY_RUN_ID=""
+CI_RUN_ID=""
 attempt=0
 while [ "$attempt" -lt 60 ]; do
-  NIGHTLY_RUN_ID="$(gh run list --workflow nightly.yml --commit "$RELEASE_SHA" --json databaseId --jq '.[0].databaseId')"
-  [ -n "$NIGHTLY_RUN_ID" ] && break
+  CI_RUN_ID="$(gh run list --workflow ci.yml --commit "$RELEASE_SHA" --json databaseId --jq '.[0].databaseId')"
+  [ -n "$CI_RUN_ID" ] && break
   attempt=$((attempt + 1))
   sleep 10
 done
-test -n "$NIGHTLY_RUN_ID"
-gh run watch "$NIGHTLY_RUN_ID" --exit-status
+test -n "$CI_RUN_ID"
+gh run watch "$CI_RUN_ID" --exit-status
 ```
 
-**GitHub web UI:** Open **Actions** → **nightly**, select the run whose commit
+**GitHub web UI:** Open **Actions** → **ci**, select the push run whose commit
 SHA exactly matches `RELEASE_SHA`, and wait for every job.
 
-Completion criterion: that nightly run is green. Do not tag before it is green.
+Completion criterion: that full master CI run is green. Do not tag before it is green.
 
 ### 7. Tag, approve, and publish
 
@@ -319,9 +319,9 @@ Use the first failed step.
 | --- | --- |
 | 2–4, before PR merge | Correct metadata with new commits on `$RELEASE_BRANCH`, rerun step 4, push normally, then continue at step 5. |
 | 5, PR checks fail | Fix through commits on `$RELEASE_BRANCH`, rerun step 4, push, and wait for `ci-gate`. |
-| 6, candidate verification fails | Do not tag. Merge a corrective PR to `master`, set `RELEASE_SHA` to its merge commit, then rerun the shared invariant block and nightly check in step 6. |
-| 6, nightly transiently fails | Run `gh run rerun "$NIGHTLY_RUN_ID" --failed`, or use **Re-run failed jobs**. Continue only when that SHA is green. |
-| 6, nightly deterministically fails | Do not tag. Fix through a PR to `master`; update the pending release section if needed; capture that PR's merge SHA as `RELEASE_SHA`; then rerun step 6's ancestry, committed-version, changelog-heading, and nightly checks. The initial release commit remains the required three-file metadata commit. |
+| 6, candidate verification fails | Do not tag. Merge a corrective PR to `master`, set `RELEASE_SHA` to its merge commit, then rerun the shared invariant block and CI check in step 6. |
+| 6, CI transiently fails | Run `gh run rerun "$CI_RUN_ID" --failed`, or use **Re-run failed jobs**. Continue only when that SHA is green. |
+| 6, CI deterministically fails | Do not tag. Fix through a PR to `master`; update the pending release section if needed; capture that PR's merge SHA as `RELEASE_SHA`; then rerun step 6's ancestry, committed-version, changelog-heading, and CI checks. The initial release commit remains the required three-file metadata commit. |
 | 7, tag push rejected | Leave local tag and escalate to a maintainer permitted to create protected `v*` tags. |
 | 7, tag exists but no workflow started | Prove in **Actions** and **Releases** no run/publication began, then prove local `$RELEASE_TAG` resolves to unchanged `RELEASE_SHA`. Delete only remote tag with `git push origin ":refs/tags/$RELEASE_TAG"`, re-push the verified local tag, and repeat step 7. |
 | 7, workflow job failed | Keep tag fixed. Run `gh run rerun "$RELEASE_RUN_ID" --failed`, or use **Re-run failed jobs**. Approve again if asked. |
@@ -363,12 +363,12 @@ select `master`, set **force** to `true`, then select **Run workflow**.
 Completion criterion: dispatched run is green. With `force=false`, an already
 published agent version is intentionally skipped.
 
-## What each trigger publishes
+## What each trigger does
 
-| Trigger | Workflow | Publishes |
+| Trigger | Workflow | Behavior |
 | --- | --- | --- |
 | Pull request | `ci.yml` | Tests and builds changed components; same-repository proxy inputs publish proxy PR tags, and base/harness inputs publish base and harness PR tags. |
-| Push to `master` | `nightly.yml` | Full suite; `nightly` base/proxy/harness images and rolling `nightly` prerelease binaries plus `SHA256SUMS`. |
+| Push to `master` | `ci.yml` | Runs the full test and build validation suite; publishes nothing. |
 | Push a `vX.Y.Z` tag | `release.yml` | After approval/full suite: `vX.Y.Z` + `latest` base/proxy; harness agent-version, dated, + `latest`; GitHub Release binaries + `SHA256SUMS`. |
 | Daily cron / dispatch | `harness-images.yml` | Rebuilds harnesses from published base; republishes changed agent versions unless forced. |
 
@@ -376,6 +376,6 @@ published agent version is intentionally skipped.
 
 | Image | Tags |
 | --- | --- |
-| `vhrn-base` | `vX.Y.Z`, `latest` (release) · `nightly`, `sha-<sha>`, `nightly-<date>-<sha>` (master) · `pr-<n>`, `pr-<n>-<sha>` (same-repository base/harness-input PR) |
-| `vhrn-proxy` | `vX.Y.Z`, `latest` (release) · `nightly`, `sha-<sha>`, `nightly-<date>-<sha>` (master) · `pr-<n>`, `pr-<n>-<sha>` (same-repository proxy-input PR) |
-| `vhrn-<harness>` | `<agent-version>`, `<agent-version>-<date>`, `latest` (release / refresh) · `nightly`, `nightly-<date>-<sha>` (master) · `pr-<n>`, `pr-<n>-<sha>` (same-repository base/harness-input PR) |
+| `vhrn-base` | `vX.Y.Z`, `latest` (release) · `pr-<n>`, `pr-<n>-<sha>` (same-repository base/harness-input PR) |
+| `vhrn-proxy` | `vX.Y.Z`, `latest` (release) · `pr-<n>`, `pr-<n>-<sha>` (same-repository proxy-input PR) |
+| `vhrn-<harness>` | `<agent-version>`, `<agent-version>-<date>`, `latest` (release / refresh) · `pr-<n>`, `pr-<n>-<sha>` (same-repository base/harness-input PR) |

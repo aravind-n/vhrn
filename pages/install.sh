@@ -5,7 +5,7 @@
 #   curl -fsSL https://aravind-n.github.io/vhrn/install.sh | sh
 #
 # Overridable via env: VHRN_REPO, VHRN_BINDIR, and VHRN_VERSION — the latest stable
-# release by default, or a tag like v0.3.0 or nightly.
+# release by default, or a tag like v0.3.0.
 set -eu
 
 REPO="${VHRN_REPO:-aravind-n/vhrn}"

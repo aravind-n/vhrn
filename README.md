@@ -19,9 +19,8 @@ vhrn install <harness>
 ```
 
 Run it with `vhrn <harness>`. Pin or roll back a harness to a specific agent version with
-`@` (`vhrn install claude@2.1.30`, or `@nightly` for the latest master build), and `vhrn
-update` re-pulls installed harnesses only when the registry has a newer agent. `VHRN_VERSION`
-pins the CLI installer.
+`@` (`vhrn install claude@2.1.30`), and `vhrn update` re-pulls installed harnesses only
+when the registry has a newer agent. `VHRN_VERSION` pins the CLI installer.
 
 ### Upgrading from an alias-managing version
 

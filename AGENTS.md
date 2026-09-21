@@ -127,11 +127,11 @@ Core behavioral invariants — keep these intact:
   pulls `vhrn-<harness>` at the *agent's* version (default `latest`) plus the `vhrn-proxy`
   matching the **CLI binary's own** version — the proxy rides the CLI's release clock, not the
   agent's, so a container and its proxy stay a matched set and upgrading the CLI upgrades its
-  proxy (`proxy_tag` derives it: a nightly CLI → nightly proxy, a `vX.Y.Z` CLI → its own tag).
+  proxy (`proxy_tag` derives it: a `vX.Y.Z` CLI uses its own tag; a development CLI uses `latest`).
   Override the registry with `VHRN_REGISTRY`. `--local` uses `make`-built images (version
   `local`). The installed registry (`~/.config/vhrn/installed`, `name <tag>` per line) records
   only the agent tag the run path resolves from. `vhrn update` queries the registry (OCI
-  tags-list / manifest digest over the anonymous bearer-challenge flow, `cli/src/registry.rs`) and
+  tags-list over the anonymous bearer-challenge flow, `cli/src/registry.rs`) and
   re-pulls a floating install only when a newer agent is published — never pulling just to
   diff; an unreachable registry is a hard error, not a blind pull. A daily `harness-images.yml`
   cron rebuilds a harness when its agent updates — both independent of a CLI release.
@@ -178,11 +178,11 @@ Day to day you build nothing — `vhrn install <harness>` pulls prebuilt images 
 For a local-image dev loop: `cargo install --path cli && make -C image && make -C proxy`, then
 `vhrn install claude --local`.
 
-**CI/CD** (`.github/workflows/`): `ci.yml` is the PR gate (path-filtered per component behind
-a single `ci-gate`); `nightly.yml` publishes `nightly` images + a rolling `nightly` binary
-prerelease on master; `release.yml` publishes `vX.Y.Z`+`latest` images + a GitHub Release on
-a `v*` tag. Reusable workflows separately own tests, CLI binaries, the proxy, and base/harness
-images (`_test`, `_build-binaries`, `_build-proxy`, `_build-harness-images`), plus `pages.yml`.
+**CI/CD** (`.github/workflows/`): `ci.yml` is the path-filtered PR gate behind a single
+`ci-gate` and runs the full validation suite on master without publishing; `release.yml`
+publishes `vX.Y.Z`+`latest` images + a GitHub Release on a `v*` tag. Reusable workflows
+separately own tests, CLI binaries, the proxy, and base/harness images (`_test`,
+`_build-binaries`, `_build-proxy`, `_build-harness-images`), plus `pages.yml`.
 See `docs/runbooks/release.md`.
 
 ## Code style guidelines

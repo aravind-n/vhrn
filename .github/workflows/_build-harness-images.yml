@@ -1,22 +1,18 @@
 # Reusable: build the base and harness images multi-arch and optionally publish them to
 # ghcr. Harness images use the base built in the same run by digest. With build_base
-# false, the daily refresh uses the existing published base (latest, then nightly).
+# false, the daily refresh uses the existing published latest base.
 name: build-harness-images
 
 on:
   workflow_call:
     inputs:
       flavor:
-        description: pr | nightly | release
+        description: ci | pr | release
         type: string
         required: true
       push:
         type: boolean
         default: false
-      extra_tag:
-        description: an extra raw tag, e.g. the immutable nightly version
-        type: string
-        default: ''
       build_base:
         description: build the base before the harness images
         type: boolean
@@ -54,13 +50,11 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/vhrn-base
           tags: |
+            type=raw,value=ci,enable=${{ inputs.flavor == 'ci' }}
             type=ref,event=pr,enable=${{ inputs.flavor == 'pr' }}
             type=sha,prefix=pr-${{ github.event.number }}-,format=short,enable=${{ inputs.flavor == 'pr' }}
-            type=raw,value=nightly,enable=${{ inputs.flavor == 'nightly' }}
-            type=sha,prefix=sha-,enable=${{ inputs.flavor == 'nightly' }}
             type=ref,event=tag,enable=${{ inputs.flavor == 'release' }}
             type=raw,value=latest,enable=${{ inputs.flavor == 'release' }}
-            type=raw,value=${{ inputs.extra_tag }},enable=${{ inputs.extra_tag != '' }}
       - id: build
         uses: docker/build-push-action@v7
         with:
@@ -98,9 +92,9 @@ jobs:
       - id: date
         run: echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
-      # Prefer the base just built in this run (by digest); otherwise fall back to the
-      # published base (latest, then nightly). No base at all: warn and exit 0 so a cron
-      # doesn't go red before the first base is ever published.
+      # Prefer the base just built in this run (by digest); the daily refresh uses the
+      # published latest base. No base at all: warn and exit 0 so a cron doesn't go red
+      # before the first stable base is ever published.
       - id: base
         env:
           REG: ${{ env.REGISTRY }}/${{ github.repository_owner }}
@@ -111,13 +105,11 @@ jobs:
             echo "ref=${REG}/vhrn-base@${DIGEST}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          for tag in latest nightly; do
-            if docker buildx imagetools inspect "${REG}/vhrn-base:${tag}" >/dev/null 2>&1; then
-              echo "ref=${REG}/vhrn-base:${tag}" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          done
-          echo "::warning::no vhrn-base image (latest or nightly) — skipping ${HARNESS} build"
+          if docker buildx imagetools inspect "${REG}/vhrn-base:latest" >/dev/null 2>&1; then
+            echo "ref=${REG}/vhrn-base:latest" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::warning::no vhrn-base:latest image — skipping ${HARNESS} build"
           echo "skip=true" >> "$GITHUB_OUTPUT"
 
       # Probe: build amd64 only (loaded locally, no cache so the agent's unpinned install
@@ -140,8 +132,8 @@ jobs:
           echo "probed ${HARNESS} $ver"
 
       # Skip-if-unchanged for the harness refresh cron: nothing to do if the agent
-      # version is already published. nightly/release leave skip_if_exists false and
-      # rebuild unconditionally, so a base change still propagates.
+      # version is already published. Release leaves skip_if_exists false and rebuilds
+      # unconditionally, so a base change still propagates.
       - id: exists
         if: ${{ steps.base.outputs.skip != 'true' && inputs.skip_if_exists }}
         env:
@@ -161,16 +153,14 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/vhrn-${{ matrix.harness }}
           # Harness tags are the agent's version, not vhrn's vX.Y.Z. The canonical
           # <version> / <version>-<date> tags publish on release and the refresh cron
-          # (flavor release) ONLY — never nightly or a PR, so the cron's skip-if-exists
-          # check stays accurate and an unreviewed build can't claim a version tag. latest
-          # tracks the newest agent; nightly is the bleeding edge; PRs get pr-<n>.
+          # (flavor release) ONLY — never CI or a PR, so the cron's skip-if-exists check
+          # stays accurate and an unreviewed build can't claim a version tag. latest tracks
+          # the newest agent; PRs get pr-<n>.
           tags: |
             type=ref,event=pr,enable=${{ inputs.flavor == 'pr' }}
             type=sha,prefix=pr-${{ github.event.number }}-,format=short,enable=${{ inputs.flavor == 'pr' }}
             type=raw,value=${{ steps.probe.outputs.version }},enable=${{ inputs.flavor == 'release' }}
             type=raw,value=${{ steps.probe.outputs.version }}-${{ steps.date.outputs.date }},enable=${{ inputs.flavor == 'release' }}
-            type=raw,value=nightly,enable=${{ inputs.flavor == 'nightly' }}
-            type=raw,value=${{ inputs.extra_tag }},enable=${{ inputs.extra_tag != '' }}
             type=raw,value=latest,enable=${{ inputs.flavor == 'release' }}
           # The label the host reads back via inspect — same probed value as the tag.
           labels: |
@@ -185,3 +175,18 @@ jobs:
             BASE=${{ steps.base.outputs.ref }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  # A non-publishing call cannot consume the multi-platform base by registry digest.
+  # Build it locally once, then build every harness against that exact candidate.
+  validate-harnesses:
+    needs: base
+    if: ${{ !cancelled() && !inputs.push && needs.base.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build --tag vhrn-base:ci image/base
+      - name: Build harness images
+        run: |
+          for harness in claude codex pi; do
+            docker build --build-arg BASE=vhrn-base:ci --tag "vhrn-${harness}:ci" "image/${harness}"
+          done

@@ -1,5 +1,5 @@
-# Reusable lint + test. Callers pick which components run via run_*: CI filters
-# by changed paths; nightly and release run the full suite.
+# Reusable lint + test. Callers pick which components run via run_*: pull-request CI
+# filters by changed paths, while master CI and release run the full suite.
 name: test
 
 on:
