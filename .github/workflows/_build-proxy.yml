@@ -1,5 +1,5 @@
 # Reusable: smoke and build the production Rust proxy for both platforms.
-# Tags follow the CLI release clock through the PR and release flavors.
+# Release callers can stage an image for a later, separately-approved promotion.
 name: build-proxy
 
 on:
@@ -12,6 +12,18 @@ on:
       push:
         type: boolean
         default: false
+      staging:
+        description: push only the supplied temporary staging tag
+        type: boolean
+        default: false
+      staging_tag:
+        description: temporary staging tag used when staging is true
+        type: string
+        default: ''
+    outputs:
+      staging_tag:
+        description: temporary tag pushed by a staging build
+        value: ${{ jobs.proxy.outputs.staging_tag }}
 
 permissions:
   contents: read
@@ -23,6 +35,8 @@ env:
 jobs:
   proxy:
     runs-on: ubuntu-latest
+    outputs:
+      staging_tag: ${{ inputs.staging_tag }}
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-qemu-action@v4
@@ -81,16 +95,26 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      - name: Validate staging tag
+        if: ${{ inputs.staging }}
+        env:
+          STAGING_TAG: ${{ inputs.staging_tag }}
+        run: |
+          [[ "$STAGING_TAG" =~ ^staging-[0-9]+-[0-9]+$ ]] || {
+            echo "::error::invalid staging tag: $STAGING_TAG"
+            exit 1
+          }
       - id: meta
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/vhrn-proxy
+          flavor: |
+            latest=false
           tags: |
             type=raw,value=ci,enable=${{ inputs.flavor == 'ci' }}
             type=ref,event=pr,enable=${{ inputs.flavor == 'pr' }}
             type=sha,prefix=pr-${{ github.event.number }}-,format=short,enable=${{ inputs.flavor == 'pr' }}
-            type=ref,event=tag,enable=${{ inputs.flavor == 'release' }}
-            type=raw,value=latest,enable=${{ inputs.flavor == 'release' }}
+            type=raw,value=${{ inputs.staging_tag }},enable=${{ inputs.staging }}
       - uses: docker/build-push-action@v7
         with:
           context: .

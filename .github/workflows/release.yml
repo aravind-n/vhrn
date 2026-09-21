@@ -55,6 +55,8 @@ jobs:
     with:
       flavor: release
       push: true
+      staging: true
+      staging_tag: staging-${{ github.run_id }}-${{ github.run_attempt }}
 
   build-harness-images:
     needs: [approve, test]
@@ -65,6 +67,8 @@ jobs:
     with:
       flavor: release
       push: true
+      staging: true
+      staging_tag: staging-${{ github.run_id }}-${{ github.run_attempt }}
 
   publish:
     needs:
@@ -74,6 +78,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      packages: write
+    env:
+      REGISTRY: ghcr.io/${{ github.repository_owner }}
+      STAGING_TAG: ${{ needs.build-proxy.outputs.staging_tag }}
     steps:
       - uses: actions/checkout@v7 # for CHANGELOG.md — the release notes source
       - uses: actions/download-artifact@v8
@@ -81,9 +89,68 @@ jobs:
           path: dist
           pattern: vhrn-*
           merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          path: release-input
+          pattern: harness-release-input-*
+          merge-multiple: true
+      - name: Verify staged release inputs
+        env:
+          BASE_STAGING_TAG: ${{ needs.build-harness-images.outputs.staging_tag }}
+        run: |
+          [[ "$STAGING_TAG" =~ ^staging-[0-9]+-[0-9]+$ ]] || {
+            echo "::error::invalid proxy staging tag: $STAGING_TAG"
+            exit 1
+          }
+          [ "$STAGING_TAG" = "$BASE_STAGING_TAG" ] || {
+            echo "::error::proxy and base staging tags differ"
+            exit 1
+          }
+          for asset in vhrn-darwin-amd64 vhrn-darwin-arm64 vhrn-linux-amd64 vhrn-linux-arm64; do
+            [ -f "dist/$asset" ] || { echo "::error::missing CLI artifact: $asset"; exit 1; }
+          done
+          for harness in claude codex pi; do
+            input="release-input/$harness"
+            [ -f "$input" ] || { echo "::error::missing staged $harness metadata"; exit 1; }
+            grep -qx "harness=$harness" "$input" || { echo "::error::invalid $harness metadata"; exit 1; }
+            grep -Eq '^version=[0-9]+\.[0-9]+\.[0-9]+$' "$input" || { echo "::error::invalid $harness version"; exit 1; }
+            grep -Eq '^date=[0-9]{8}$' "$input" || { echo "::error::invalid $harness date"; exit 1; }
+            grep -qx "staging_tag=$STAGING_TAG" "$input" || { echo "::error::$harness staging tag differs"; exit 1; }
+          done
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Confirm staging images
+        run: |
+          for image in vhrn-proxy vhrn-base vhrn-claude vhrn-codex vhrn-pi; do
+            docker buildx imagetools inspect "$REGISTRY/$image:$STAGING_TAG" >/dev/null
+          done
       - name: Checksums
         working-directory: dist
         run: sha256sum vhrn-* > SHA256SUMS
+      - name: Promote staged images
+        run: |
+          docker buildx imagetools create \
+            --tag "$REGISTRY/vhrn-proxy:$GITHUB_REF_NAME" \
+            --tag "$REGISTRY/vhrn-proxy:latest" \
+            "$REGISTRY/vhrn-proxy:$STAGING_TAG"
+          docker buildx imagetools create \
+            --tag "$REGISTRY/vhrn-base:$GITHUB_REF_NAME" \
+            --tag "$REGISTRY/vhrn-base:latest" \
+            "$REGISTRY/vhrn-base:$STAGING_TAG"
+          for harness in claude codex pi; do
+            input="release-input/$harness"
+            agent_version=$(sed -n 's/^version=//p' "$input")
+            date=$(sed -n 's/^date=//p' "$input")
+            docker buildx imagetools create \
+              --tag "$REGISTRY/vhrn-$harness:$agent_version" \
+              --tag "$REGISTRY/vhrn-$harness:$agent_version-$date" \
+              --tag "$REGISTRY/vhrn-$harness:latest" \
+              "$REGISTRY/vhrn-$harness:$STAGING_TAG"
+          done
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -101,7 +168,12 @@ jobs:
             cap {print}
           ' CHANGELOG.md | sed '/./,$!d' > notes.md
           [ -s notes.md ] || { echo "::error::no CHANGELOG.md section for ${ver}"; exit 1; }
-          # create on first publish; edit so a re-run corrects an existing release's body.
-          gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file notes.md \
-            || gh release edit "${GITHUB_REF_NAME}" --notes-file notes.md
-          gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+          # On first publish, create the release with its complete asset set. A rerun keeps
+          # using the same staged images and replaces the release body and assets in place.
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" --notes-file notes.md
+            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" \
+              --notes-file notes.md dist/*
+          fi
