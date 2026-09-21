@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli", "proxy-rs"]
+members = ["cli", "proxy"]
 resolver = "3"
 
 [workspace.package]

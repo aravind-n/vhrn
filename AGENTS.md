@@ -17,9 +17,8 @@ A small monorepo with three independently-built parts plus packaging:
   installation, `vhrn <harness> …` runs the agent in the container,
   `vhrn uninstall`/`list`/`net`/`help`/`--version` manage the environment. It orchestrates
   and shells out to rsync/cp/gh and the container engine.
-- **`proxy/`** — a hand-rolled Go CONNECT/HTTP egress proxy (a static binary in a `scratch`
-  image) enforcing the domain allowlist. Its own stdlib-only module (no third-party deps,
-  no `go.sum`), published as `vhrn-proxy`.
+- **`proxy/`** — the Rust CONNECT/HTTP egress proxy (a static binary in a `scratch` image)
+  enforcing the domain allowlist, published as `vhrn-proxy`.
 - **`image/`** — the container image recipes: `image/base/` (`Dockerfile` + `entrypoint.sh`)
   is the shared `vhrn-base`; `image/<harness>/` (`image/claude/`, `image/codex/`, `image/pi/`) is a thin
   `FROM vhrn-base` plus the agent binary.
@@ -182,13 +181,14 @@ For a local-image dev loop: `cargo install --path cli && make -C image && make -
 **CI/CD** (`.github/workflows/`): `ci.yml` is the PR gate (path-filtered per component behind
 a single `ci-gate`); `nightly.yml` publishes `nightly` images + a rolling `nightly` binary
 prerelease on master; `release.yml` publishes `vX.Y.Z`+`latest` images + a GitHub Release on
-a `v*` tag. Reusable workflows separately own tests, CLI binaries, the shipping Go proxy, the
-Rust proxy candidate, and base/harness images (`_test`, `_build-binaries`, `_build-proxy-go`,
-`_build-proxy-rs`, `_build-harness-images`), plus `pages.yml`. See `docs/runbooks/release.md`.
+a `v*` tag. Reusable workflows separately own tests, CLI binaries, the proxy, and base/harness
+images (`_test`, `_build-binaries`, `_build-proxy`, `_build-harness-images`), plus `pages.yml`.
+See `docs/runbooks/release.md`.
 
 ## Code style guidelines
 
-- **Rust** (`cli/src/`, package `vhrn`, `#![forbid(unsafe_code)]`): the code is `cargo fmt`-clean
+- **Rust** (`cli/src/` and `proxy/src/`, packages `vhrn` and `vhrn-proxy`,
+  `#![forbid(unsafe_code)]`): the code is `cargo fmt`-clean
   (enforced in CI with default settings — no `rustfmt.toml`); reach for `#[rustfmt::skip]`
   only on aligned test-case tables. Comments explain *why*, terse, one line where it fits.
   Group `use` imports std / external / crate, blank-line separated. Prefer small single-file
@@ -198,8 +198,6 @@ Rust proxy candidate, and base/harness images (`_test`, `_build-binaries`, `_bui
 - **Bash/sh** (entrypoint, `pages/install.sh`): `#!/usr/bin/env bash`/`sh` + `set -euo
   pipefail`; comments terse, one line where possible; helpers early-`return 0` when a source
   path is absent. Kept shellcheck-clean.
-- **Go** (`proxy/`): standard library only — no third-party modules, no `go.sum`. Keep it
-  `gofmt`- and `go vet`-clean.
 - **Commits:** Use Linux kernel style (`scope: imperative command`). Write the subject as an
   instruction to edit the repository. A complete subject names both the codebase artifact and the
   edit applied to it, using a repository-edit verb such as `add`, `move`, `split`, `extract`,
@@ -218,13 +216,12 @@ The suite runs per changed component on PRs and in full on master:
 
 - **CLI:** `cargo fmt --all -- --check`, then `cargo clippy -p vhrn --all-targets -- -D warnings`,
   then `cargo test -p vhrn` (fmt runs before clippy).
-- **Proxy:** `cd proxy && gofmt -l . && go vet ./... && go test ./...`, then `govulncheck
-  ./...` (`go install golang.org/x/vuln/cmd/govulncheck@latest`). The stdlib is the only
-  dependency, so a reachable toolchain CVE is the only kind this binary can have — and
-  with no `go.sum` there is no lockfile churn to surface one. The build image and `go.mod`
-  move together on a minor (`golang:1.26` / `go 1.26`) so patches land on their own and a
-  major is a deliberate bump of both; CI runs `go-version: stable`, so it meets the next
-  major before the image does.
+- **Proxy:** `cargo fmt --package vhrn-proxy -- --check`, then
+  `cargo clippy -p vhrn-proxy --all-targets --locked -- -D warnings`,
+  `cargo test -p vhrn-proxy --locked`, `cargo audit --deny warnings`, and
+  `cargo build --release --locked -p vhrn-proxy`. The Dockerfile builds the optimized static
+  executable and verifies that it has no interpreter or dynamic dependencies before copying it
+  into the `scratch` production image.
 - **Workflows:** `actionlint` (with shellcheck on inline `run:` scripts) validates
   `.github/workflows/**`.
 
@@ -280,7 +277,7 @@ exfiltrating freely. Guard these:
 - **The container stays ephemeral (`--rm`).** A fresh, tamper-proof firewall every boot — a
   security feature. Persistence is a property of what's mounted; do **not** move to a
   persistent "container machine."
-- **The proxy is the security-critical component** — a static Go binary in a `scratch` image
+- **The proxy is the security-critical component** — a static Rust binary in a `scratch` image
   (no shell, no userland), running unprivileged: minimal CVE surface. It matches on hostname
   and does **not** terminate TLS, so it can't stop exfiltration to an already-allowed domain
   or domain-fronting behind an allowed CDN.

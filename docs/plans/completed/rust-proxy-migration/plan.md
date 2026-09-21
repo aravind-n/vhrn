@@ -25,7 +25,7 @@ security boundaries, document pointers, and the authoritative readiness ledger.
 
 ## Clean-room and compatibility boundaries
 
-- [`docs/proxy/consumer-contract.md`](../../proxy/consumer-contract.md) is the sole normative
+- [`docs/proxy/consumer-contract.md`](../../../proxy/consumer-contract.md) is the sole normative
   description of externally observable proxy behavior. Its frozen SHA-256 is
   `f3499ff66aa9e15d3f7788153b3f109dc7b020956a6d306eda5e103e806075ed`.
 - Rust implementation agents may read the frozen consumer contract, allowed host-side Rust
@@ -65,7 +65,7 @@ does not open predecessor or pre-flight documents to reconstruct readiness.
 | Phase 10 | Complete | Phase 9 | [CONNECT tunnels](phase-10-connect.md) |
 | Phase 11 | Complete | Phase 10 | [Resources and shutdown](phase-11-resources-shutdown.md) |
 | Phase 12 | Complete | Phase 11 | [Candidate qualification](phase-12-qualification.md) |
-| Phase 13 | Blocked | Phase 12; explicit user cutover approval | [Atomic cutover](phase-13-cutover.md) |
+| Phase 13 | Complete | Phase 12; explicit user cutover approval | [Atomic cutover](phase-13-cutover.md) |
 
 ## Status transitions
 

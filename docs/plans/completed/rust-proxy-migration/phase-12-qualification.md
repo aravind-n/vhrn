@@ -7,8 +7,8 @@ This file is the authoritative implementation specification for Phase 12. Start 
 1. Read the shared [master plan](plan.md).
 2. Confirm the Phase 12 row in the master plan is exactly `Ready`. If it is not, stop; the
    table is the sole readiness source.
-3. Read repository [`AGENTS.md`](../../../AGENTS.md).
-4. Read the frozen [consumer contract](../../proxy/consumer-contract.md).
+3. Read repository [`AGENTS.md`](../../../../AGENTS.md).
+4. Read the frozen [consumer contract](../../../proxy/consumer-contract.md).
 5. Read the active [contract coverage ledger](coverage.md).
 6. Implement only this phase and stay within its editable paths and responsibility boundary.
 7. Record detailed implementation, validation, and review evidence in this file.

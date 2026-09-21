@@ -288,7 +288,7 @@ its tag target is `RELEASE_SHA`, and assets `vhrn-darwin-amd64`, `vhrn-darwin-ar
 verify the image tags below.
 
 For either path, inspect **Packages** (or the release workflow's
-**build-proxy-go** and **build-harness-images** jobs), record each harness's
+**build-proxy** and **build-harness-images** jobs), record each harness's
 probed agent version and the exact dated tag emitted by that release run, and
 verify all of these tags:
 
@@ -367,9 +367,9 @@ published agent version is intentionally skipped.
 
 | Trigger | Workflow | Publishes |
 | --- | --- | --- |
-| Pull request | `ci.yml` | Tests and builds changed components; same-repository Go proxy inputs publish proxy PR tags, and base/harness inputs publish base and harness PR tags. The Rust candidate builds without publishing. |
-| Push to `master` | `nightly.yml` | Full suite and required nonpublishing Rust candidate build; `nightly` base/Go-proxy/harness images and rolling `nightly` prerelease binaries plus `SHA256SUMS`. |
-| Push a `vX.Y.Z` tag | `release.yml` | After approval/full suite and required nonpublishing Rust candidate build: `vX.Y.Z` + `latest` base/Go-proxy; harness agent-version, dated, + `latest`; GitHub Release binaries + `SHA256SUMS`. |
+| Pull request | `ci.yml` | Tests and builds changed components; same-repository proxy inputs publish proxy PR tags, and base/harness inputs publish base and harness PR tags. |
+| Push to `master` | `nightly.yml` | Full suite; `nightly` base/proxy/harness images and rolling `nightly` prerelease binaries plus `SHA256SUMS`. |
+| Push a `vX.Y.Z` tag | `release.yml` | After approval/full suite: `vX.Y.Z` + `latest` base/proxy; harness agent-version, dated, + `latest`; GitHub Release binaries + `SHA256SUMS`. |
 | Daily cron / dispatch | `harness-images.yml` | Rebuilds harnesses from published base; republishes changed agent versions unless forced. |
 
 ## Image tags
@@ -377,5 +377,5 @@ published agent version is intentionally skipped.
 | Image | Tags |
 | --- | --- |
 | `vhrn-base` | `vX.Y.Z`, `latest` (release) · `nightly`, `sha-<sha>`, `nightly-<date>-<sha>` (master) · `pr-<n>`, `pr-<n>-<sha>` (same-repository base/harness-input PR) |
-| `vhrn-proxy` | `vX.Y.Z`, `latest` (release) · `nightly`, `sha-<sha>`, `nightly-<date>-<sha>` (master) · `pr-<n>`, `pr-<n>-<sha>` (same-repository Go-proxy-input PR) |
+| `vhrn-proxy` | `vX.Y.Z`, `latest` (release) · `nightly`, `sha-<sha>`, `nightly-<date>-<sha>` (master) · `pr-<n>`, `pr-<n>-<sha>` (same-repository proxy-input PR) |
 | `vhrn-<harness>` | `<agent-version>`, `<agent-version>-<date>`, `latest` (release / refresh) · `nightly`, `nightly-<date>-<sha>` (master) · `pr-<n>`, `pr-<n>-<sha>` (same-repository base/harness-input PR) |

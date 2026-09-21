@@ -4,7 +4,7 @@
 
 This file is the authoritative record of completed Phase 1 and the boundary later phases must
 preserve. It is not an active implementation assignment. Read [`plan.md`](plan.md) and repository
-[`AGENTS.md`](../../../AGENTS.md) before changing any delivered Phase 1 boundary in a later phase.
+[`AGENTS.md`](../../../../AGENTS.md) before changing any delivered Phase 1 boundary in a later phase.
 
 ## Objective
 

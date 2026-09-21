@@ -1,7 +1,7 @@
 # Rust proxy contract coverage ledger
 
 This is the active ownership ledger for the frozen
-[consumer contract](../../proxy/consumer-contract.md). Each requirement group has exactly one
+[consumer contract](../../../proxy/consumer-contract.md). Each requirement group has exactly one
 owning phase. Ownership changes require an explicit planning decision; implementation evidence
 belongs in the owning phase file.
 

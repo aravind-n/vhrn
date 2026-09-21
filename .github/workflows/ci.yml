@@ -18,13 +18,11 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       cli: ${{ steps.filter.outputs.cli }}
-      proxy_rs: ${{ steps.filter.outputs.proxy_rs }}
-      proxy_go: ${{ steps.filter.outputs.proxy_go }}
+      proxy: ${{ steps.filter.outputs.proxy }}
       scripts: ${{ steps.filter.outputs.scripts }}
-      test_selected: ${{ steps.filter.outputs.cli == 'true' || steps.filter.outputs.proxy_rs == 'true' || steps.filter.outputs.proxy_go == 'true' || steps.filter.outputs.scripts == 'true' }}
+      test_selected: ${{ steps.filter.outputs.cli == 'true' || steps.filter.outputs.proxy == 'true' || steps.filter.outputs.scripts == 'true' }}
       build_cli: ${{ steps.filter.outputs.build_cli }}
-      build_proxy_go: ${{ steps.filter.outputs.build_proxy_go }}
-      build_proxy_rs: ${{ steps.filter.outputs.build_proxy_rs }}
+      build_proxy: ${{ steps.filter.outputs.build_proxy }}
       build_harness_images: ${{ steps.filter.outputs.build_harness_images }}
       workflows: ${{ steps.filter.outputs.workflows }}
     steps:
@@ -39,13 +37,10 @@ jobs:
               - 'Cargo.lock'
               - 'Cross.toml'
               - 'shared/testdata/**'
-            proxy_rs:
-              - 'proxy-rs/**'
+            proxy:
+              - 'proxy/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
-              - 'shared/testdata/**'
-            proxy_go:
-              - 'proxy/**'
               - 'shared/testdata/**'
             scripts:
               - 'pages/**'
@@ -55,22 +50,14 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'Cross.toml'
-              - 'proxy-rs/Cargo.toml'
+              - 'proxy/Cargo.toml'
               - '.github/workflows/_build-binaries.yml'
-            build_proxy_go:
-              - 'proxy/Dockerfile'
-              - 'proxy/go.mod'
-              - 'proxy/main.go'
-              - 'proxy/egress/**'
-              - '.github/workflows/_build-proxy-go.yml'
-            build_proxy_rs:
-              - 'proxy-rs/Dockerfile'
-              - 'proxy-rs/Cargo.toml'
-              - 'proxy-rs/src/**'
+            build_proxy:
+              - 'proxy/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'cli/Cargo.toml'
-              - '.github/workflows/_build-proxy-rs.yml'
+              - '.github/workflows/_build-proxy.yml'
             build_harness_images:
               - 'image/base/Dockerfile'
               - 'image/base/entrypoint.sh'
@@ -86,8 +73,7 @@ jobs:
     uses: ./.github/workflows/_test.yml
     with:
       run_cli: ${{ needs.changes.outputs.cli == 'true' }}
-      run_proxy_rs: ${{ needs.changes.outputs.proxy_rs == 'true' }}
-      run_proxy_go: ${{ needs.changes.outputs.proxy_go == 'true' }}
+      run_proxy: ${{ needs.changes.outputs.proxy == 'true' }}
       run_scripts: ${{ needs.changes.outputs.scripts == 'true' }}
 
   build-cli:
@@ -105,7 +91,7 @@ jobs:
     with:
       version: pr-${{ github.event.number }}
 
-  build-proxy-go:
+  build-proxy:
     needs: [changes, test]
     if: >-
       ${{
@@ -114,28 +100,15 @@ jobs:
           needs.test.result == 'success' ||
           (needs.test.result == 'skipped' && needs.changes.outputs.test_selected != 'true')
         ) &&
-        needs.changes.outputs.build_proxy_go == 'true'
+        needs.changes.outputs.build_proxy == 'true'
       }}
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/_build-proxy-go.yml
+    uses: ./.github/workflows/_build-proxy.yml
     with:
       flavor: pr
       push: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
-
-  build-proxy-rs:
-    needs: [changes, test]
-    if: >-
-      ${{
-        always() &&
-        (
-          needs.test.result == 'success' ||
-          (needs.test.result == 'skipped' && needs.changes.outputs.test_selected != 'true')
-        ) &&
-        needs.changes.outputs.build_proxy_rs == 'true'
-      }}
-    uses: ./.github/workflows/_build-proxy-rs.yml
 
   build-harness-images:
     needs: [changes, test]
@@ -177,8 +150,7 @@ jobs:
       - changes
       - test
       - build-cli
-      - build-proxy-go
-      - build-proxy-rs
+      - build-proxy
       - build-harness-images
       - actionlint
     if: always()
@@ -191,10 +163,8 @@ jobs:
           TEST_RESULT: ${{ needs.test.result }}
           BUILD_CLI_SELECTED: ${{ needs.changes.outputs.build_cli }}
           BUILD_CLI_RESULT: ${{ needs['build-cli'].result }}
-          BUILD_PROXY_GO_SELECTED: ${{ needs.changes.outputs.build_proxy_go }}
-          BUILD_PROXY_GO_RESULT: ${{ needs['build-proxy-go'].result }}
-          BUILD_PROXY_RS_SELECTED: ${{ needs.changes.outputs.build_proxy_rs }}
-          BUILD_PROXY_RS_RESULT: ${{ needs['build-proxy-rs'].result }}
+          BUILD_PROXY_SELECTED: ${{ needs.changes.outputs.build_proxy }}
+          BUILD_PROXY_RESULT: ${{ needs['build-proxy'].result }}
           BUILD_HARNESS_IMAGES_SELECTED: ${{ needs.changes.outputs.build_harness_images }}
           BUILD_HARNESS_IMAGES_RESULT: ${{ needs['build-harness-images'].result }}
           ACTIONLINT_SELECTED: ${{ needs.changes.outputs.workflows }}
@@ -226,8 +196,7 @@ jobs:
           require_success changes "$CHANGES_RESULT"
           require_optional test "$TEST_SELECTED" "$TEST_RESULT"
           require_optional build-cli "$BUILD_CLI_SELECTED" "$BUILD_CLI_RESULT"
-          require_optional build-proxy-go "$BUILD_PROXY_GO_SELECTED" "$BUILD_PROXY_GO_RESULT"
-          require_optional build-proxy-rs "$BUILD_PROXY_RS_SELECTED" "$BUILD_PROXY_RS_RESULT"
+          require_optional build-proxy "$BUILD_PROXY_SELECTED" "$BUILD_PROXY_RESULT"
           require_optional build-harness-images \
             "$BUILD_HARNESS_IMAGES_SELECTED" "$BUILD_HARNESS_IMAGES_RESULT"
           require_optional actionlint "$ACTIONLINT_SELECTED" "$ACTIONLINT_RESULT"
