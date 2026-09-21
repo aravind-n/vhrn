@@ -1,6 +1,7 @@
 # Reusable: build the base and harness images multi-arch and optionally publish them to
 # ghcr. Harness images use the base built in the same run by digest. With build_base
-# false, the daily refresh uses the existing published latest base.
+# false, the daily refresh uses the existing published latest base. Release callers stage
+# images here and promote them separately.
 name: build-harness-images
 
 on:
@@ -21,6 +22,18 @@ on:
         description: skip the harness push when its agent version tag already exists
         type: boolean
         default: false
+      staging:
+        description: push only the supplied temporary staging tags
+        type: boolean
+        default: false
+      staging_tag:
+        description: temporary staging tag used when staging is true
+        type: string
+        default: ''
+    outputs:
+      staging_tag:
+        description: temporary tag pushed by the base and harness staging build
+        value: ${{ jobs.base.outputs.staging_tag }}
 
 permissions:
   contents: read
@@ -35,6 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       digest: ${{ steps.build.outputs.digest }}
+      staging_tag: ${{ inputs.staging_tag }}
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-qemu-action@v4
@@ -45,16 +59,26 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      - name: Validate staging tag
+        if: ${{ inputs.staging }}
+        env:
+          STAGING_TAG: ${{ inputs.staging_tag }}
+        run: |
+          [[ "$STAGING_TAG" =~ ^staging-[0-9]+-[0-9]+$ ]] || {
+            echo "::error::invalid staging tag: $STAGING_TAG"
+            exit 1
+          }
       - id: meta
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/vhrn-base
+          flavor: |
+            latest=false
           tags: |
             type=raw,value=ci,enable=${{ inputs.flavor == 'ci' }}
             type=ref,event=pr,enable=${{ inputs.flavor == 'pr' }}
             type=sha,prefix=pr-${{ github.event.number }}-,format=short,enable=${{ inputs.flavor == 'pr' }}
-            type=ref,event=tag,enable=${{ inputs.flavor == 'release' }}
-            type=raw,value=latest,enable=${{ inputs.flavor == 'release' }}
+            type=raw,value=${{ inputs.staging_tag }},enable=${{ inputs.staging }}
       - id: build
         uses: docker/build-push-action@v7
         with:
@@ -151,21 +175,23 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/vhrn-${{ matrix.harness }}
-          # Harness tags are the agent's version, not vhrn's vX.Y.Z. The canonical
-          # <version> / <version>-<date> tags publish on release and the refresh cron
-          # (flavor release) ONLY — never CI or a PR, so the cron's skip-if-exists check
-          # stays accurate and an unreviewed build can't claim a version tag. latest tracks
-          # the newest agent; PRs get pr-<n>.
+          flavor: |
+            latest=false
+          # Harness tags are the agent's version, not vhrn's vX.Y.Z. A staging release
+          # pushes only its temporary tag; promotion creates stable tags later. The daily
+          # refresh keeps publishing <version>, <version>-<date>, and latest directly.
           tags: |
             type=ref,event=pr,enable=${{ inputs.flavor == 'pr' }}
             type=sha,prefix=pr-${{ github.event.number }}-,format=short,enable=${{ inputs.flavor == 'pr' }}
-            type=raw,value=${{ steps.probe.outputs.version }},enable=${{ inputs.flavor == 'release' }}
-            type=raw,value=${{ steps.probe.outputs.version }}-${{ steps.date.outputs.date }},enable=${{ inputs.flavor == 'release' }}
-            type=raw,value=latest,enable=${{ inputs.flavor == 'release' }}
+            type=raw,value=${{ inputs.staging_tag }},enable=${{ inputs.staging }}
+            type=raw,value=${{ steps.probe.outputs.version }},enable=${{ inputs.flavor == 'release' && !inputs.staging }}
+            type=raw,value=${{ steps.probe.outputs.version }}-${{ steps.date.outputs.date }},enable=${{ inputs.flavor == 'release' && !inputs.staging }}
+            type=raw,value=latest,enable=${{ inputs.flavor == 'release' && !inputs.staging }}
           # The label the host reads back via inspect — same probed value as the tag.
           labels: |
             org.opencontainers.image.version=${{ steps.probe.outputs.version }}
-      - if: ${{ steps.base.outputs.skip != 'true' && steps.exists.outputs.skip != 'true' }}
+      - id: build
+        if: ${{ steps.base.outputs.skip != 'true' && steps.exists.outputs.skip != 'true' }}
         uses: docker/build-push-action@v7
         with:
           context: image/${{ matrix.harness }}
@@ -175,6 +201,27 @@ jobs:
             BASE=${{ steps.base.outputs.ref }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+      - name: Record staged harness version
+        if: ${{ inputs.staging && steps.base.outputs.skip != 'true' && steps.exists.outputs.skip != 'true' }}
+        env:
+          HARNESS: ${{ matrix.harness }}
+          VERSION: ${{ steps.probe.outputs.version }}
+          DATE: ${{ steps.date.outputs.date }}
+          STAGING_TAG: ${{ inputs.staging_tag }}
+        run: |
+          mkdir -p release-input
+          {
+            echo "harness=$HARNESS"
+            echo "version=$VERSION"
+            echo "date=$DATE"
+            echo "staging_tag=$STAGING_TAG"
+          } > "release-input/$HARNESS"
+      - if: ${{ inputs.staging && steps.base.outputs.skip != 'true' && steps.exists.outputs.skip != 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: harness-release-input-${{ matrix.harness }}
+          path: release-input/${{ matrix.harness }}
+          if-no-files-found: error
 
   # A non-publishing call cannot consume the multi-platform base by registry digest.
   # Build it locally once, then build every harness against that exact candidate.
