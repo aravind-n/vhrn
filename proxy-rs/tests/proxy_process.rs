@@ -49,6 +49,7 @@ struct Proxy {
 struct LocalFixture {
     policies: [PathBuf; 3],
     granted_layer: usize,
+    token: PathBuf,
 }
 
 struct StartupFixture {
@@ -108,7 +109,7 @@ impl StartupFixture {
 }
 
 impl LocalFixture {
-    fn new(policies: [PathBuf; 3], granted_layer: usize) -> Self {
+    fn new(policies: [PathBuf; 3], granted_layer: usize, token: PathBuf) -> Self {
         assert!(
             granted_layer < policies.len(),
             "local grant layer must exist"
@@ -116,6 +117,7 @@ impl LocalFixture {
         Self {
             policies,
             granted_layer,
+            token,
         }
     }
 }
@@ -261,7 +263,11 @@ impl Proxy {
             let token = temp.path().join("token");
             std::fs::write(&token, TOKEN).expect("token");
             Some((
-                LocalFixture::new(paths.try_into().expect("three local policies"), grant),
+                LocalFixture::new(
+                    paths.try_into().expect("three local policies"),
+                    grant,
+                    token.clone(),
+                ),
                 broker,
                 token,
             ))
@@ -1476,6 +1482,87 @@ async fn local_startup_exchange_and_partial_configuration_are_process_checked() 
 }
 
 #[tokio::test]
+async fn local_policy_is_rechecked_before_every_broker_connection() {
+    scenario(async {
+        let broker = Broker::bind().await;
+        let authority = "localhost:8131";
+        let mut proxy = Proxy::start_local(&broker, authority).await;
+        let fixture = proxy.local.as_ref().expect("local fixture").clone();
+        let granted = &fixture.policies[fixture.granted_layer];
+        std::fs::write(&proxy.policy, "localhost\n").expect("matching public policy");
+
+        for (name, mode, local_contents) in [
+            ("revoked", "enforce\n", Some("")),
+            ("report", "report\n", Some("")),
+            ("open", "open\n", Some("")),
+            ("invalid", "enforce\n", Some("bad authority\n")),
+            ("missing", "enforce\n", None),
+        ] {
+            std::fs::write(&proxy.mode, mode).expect("replace mode");
+            match local_contents {
+                Some(contents) => atomic_replace(granted, contents.as_bytes()),
+                None => std::fs::remove_file(granted).expect("remove local policy"),
+            }
+            let response = proxy
+                .request(&format!(
+                    "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+                ))
+                .await;
+            assert_eq!(status(&response), 403, "{name}");
+            assert!(
+                timeout(Duration::from_millis(150), broker.listener.accept())
+                    .await
+                    .is_err(),
+                "{name} local decision must not reach the broker"
+            );
+        }
+
+        atomic_replace(granted, format!("{authority}\n").as_bytes());
+        std::fs::write(&fixture.token, "b".repeat(64)).expect("replace mounted token");
+        let request = tokio::spawn({
+            let address = proxy.address;
+            async move {
+                request(
+                    address,
+                    format!(
+                        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+            }
+        });
+        let (mut peer, _) = accept(&broker.listener).await;
+        assert_eq!(
+            String::from_utf8(read_line(&mut peer).await).expect("CONNECT frame"),
+            format!("VHRN-BROKER/1 CONNECT {TOKEN} {authority}\n")
+        );
+        peer.write_all(b"ERR\n").await.expect("reject repaired grant");
+        let response = request.await.expect("request task");
+        assert_eq!(status(&response), 502);
+        assert!(!response.contains(TOKEN));
+        assert!(!response.contains(&broker.address().to_string()));
+        assert!(
+            !std::fs::read_to_string(&proxy.log)
+                .unwrap_or_default()
+                .contains(TOKEN)
+        );
+        let _ = proxy
+            .child
+            .terminate_and_wait("local policy recheck cleanup")
+            .await;
+        assert!(!proxy.child.raw_diagnostics().contains(TOKEN));
+        assert!(
+            !proxy
+                .child
+                .raw_diagnostics()
+                .contains(&broker.address().to_string())
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn local_http_forwards_and_streams_through_authenticated_broker() {
     scenario(async {
     let broker = Broker::bind().await;
@@ -1610,7 +1697,12 @@ async fn local_http_client_disconnect_closes_broker_origin_work() {
 #[tokio::test]
 async fn local_broker_short_failures_are_redacted_and_do_not_upgrade() {
     scenario(async {
-    for response in [b"ERR\n".as_slice(), b"O".as_slice(), b"TOOLONG".as_slice()] {
+    for response in [
+        b"".as_slice(),
+        b"ERR\n".as_slice(),
+        b"O".as_slice(),
+        b"TOOLONG".as_slice(),
+    ] {
         let broker = Broker::bind().await;
         let authority = "localhost:8126";
         let proxy = Proxy::start_local(&broker, authority).await;
@@ -1672,8 +1764,12 @@ async fn local_broker_timeout_is_bounded_and_redacted() {
             .expect("broker timeout deadline")
             .expect("timeout response");
         let response = String::from_utf8(response).expect("timeout text");
-        assert_eq!(status(&response), 502);
+        assert_eq!(status(&response), 504);
         assert!(!response.contains(TOKEN));
+        assert!(!response.contains(&broker.address().to_string()));
+        let log = std::fs::read_to_string(&proxy.log).unwrap_or_default();
+        assert!(!log.contains(TOKEN));
+        assert!(!log.contains(&broker.address().to_string()));
         let mut end = [0_u8; 1];
         assert_eq!(
             timeout(DEADLINE, peer.read(&mut end))

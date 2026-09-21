@@ -34,8 +34,11 @@ Edit only:
 
 - `proxy-rs/src/connect/broker.rs`, `proxy-rs/src/connect/broker/protocol.rs`, and broker test
   seams;
-- the raw local-stream portion of `proxy-rs/src/connect/broker/http.rs`; HTTP forwarding behavior
-  remains Phase 9-owned;
+- the raw local-stream and typed broker-error propagation portions of
+  `proxy-rs/src/connect/broker/http.rs`; HTTP forwarding semantics remain Phase 9-owned;
+- the broker-readiness cancellation call site in `proxy-rs/src/lib.rs`;
+- the broker-only cancellation and safe response-classification call sites in
+  `proxy-rs/src/server/router.rs`;
 - broker fixtures and broker-focused candidate tests;
 - detailed implementation, validation, and review evidence in this file;
 - [`plan.md`](plan.md) only for status transitions permitted by the master plan.
@@ -111,3 +114,71 @@ protocol types, change the host wire contract, alter public dialing, or edit pac
 The token and exact frames remain secret and bounded; readiness and CONNECT use fresh authenticated
 connections; only exact live local grants reach the broker; post-response bytes survive; failures
 are typed and redacted; no direct loopback route exists; tests pass; and rereview is clean.
+
+## Implementation evidence
+
+- `BrokerToken` accepts only 64 lowercase hexadecimal octets, owns one boxed startup value shared
+  through the connector, and redacts both `Debug` and `Display`. The token table covers valid lower
+  hex, empty, 63/65-octet, uppercase, non-hex, LF, CR, and non-ASCII inputs. A process test replaces
+  the token file after readiness and proves the next CONNECT still uses the startup token.
+- `BrokerProtocol` creates a fresh transport for READY and every CONNECT. Exact frame tests cover
+  `localhost:80`, `127.255.255.255:81`, and `[::1]:82`; every emitted frame is checked byte-for-byte
+  and against the 256-octet bound. The configured numeric or hostname endpoint is the dialer's only
+  input; the canonical local authority appears only in the authenticated frame.
+- Response parsing uses one four-octet buffer and accepts only `OK\n`. The broker fixture covers
+  READY and CONNECT success, `ERR\n`, EOF, timeout, `OK extra\n`, `OK\r\n`, and overlong text.
+  Fragmented `O`, `K`, `\n` succeeds, while a coalesced payload is preserved through the bounded
+  prefix and raw stream.
+- READY has one cumulative three-second dial/write/read budget. CONNECT has one cumulative
+  thirteen-second budget matching the host's three-second frame work plus ten-second loopback dial.
+  Typed redacted errors distinguish rejection, transport I/O, deadline, cancellation, and later
+  origin failure. Unit tests cancel stalled dial, write, and CONNECT-response reads and observe
+  pending-work or socket closure; the process timeout returns `504` and closes the broker socket.
+- The live-policy process spy proves revoked, report-mode, open-mode, invalid, and missing local
+  policy never connect to the broker even with a matching public entry. An atomic repair is observed
+  on the next request. Existing persistent-local-HTTP coverage proves a later request is denied
+  before reuse after revocation, while established tunnels survive policy replacement.
+- Token/error/stream panic formatting, HTTP error bodies, denial logs, and process diagnostics are
+  checked for absence of the token and broker address. Source searches show direct TCP dialing in
+  the broker module is confined to the configured `BrokerEndpoint`; local target authorities are
+  never passed to `TcpStream::connect` or `lookup_host`.
+
+## Compatibility evidence
+
+- The frozen consumer contract hash was rechecked as
+  `f3499ff66aa9e15d3f7788153b3f109dc7b020956a6d306eda5e103e806075ed`.
+- Read-only comparison with `cli/src/broker.rs` confirms the independent implementations agree on
+  64-byte lowercase-hex tokens, exact READY/CONNECT frames, canonical authorities, the 256-octet
+  request cap, exact `OK\n`/`ERR\n` responses, the three-second handshake deadline, and the
+  cumulative ten-second loopback dial. No CLI protocol types are imported or shared.
+- Read-only comparison with `cli/src/run.rs` confirms the endpoint remains the Apple default-network
+  gateway or Docker/Colima `host.docker.internal`, with the token mounted read-only at
+  `/etc/vhrn-broker/token`. No CLI or host-broker source was modified. Live engine execution was not
+  performed in this unit/process-test phase.
+
+## Validation evidence
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy -p vhrn-proxy --all-targets --locked -- -D warnings` — passed.
+- `cargo test -p vhrn-proxy --locked connect::broker` — passed 17 focused tests.
+- `cargo test -p vhrn-proxy --locked --test proxy_process` — passed 23 process tests.
+- `cargo test -p vhrn-proxy --locked` — passed 134 library tests and 23 process tests; doc tests
+  contained no cases and passed.
+- `git diff --check` — passed. Redaction and dial-route searches were recorded during the audit.
+
+## Independent review evidence
+
+- The required `rust_reviewer` review on 2026-09-20 found no correctness, security, compatibility,
+  or test-quality defect, but initially raised one P2 scope finding. The required cancellation
+  plumbing and `502`/`504` classification changed production call sites in `proxy-rs/src/lib.rs`
+  and `proxy-rs/src/server/router.rs`, while the editable-path list at that point named only broker
+  files and test seams. The typed error propagation in `connect/broker/http.rs` also reached the
+  boundary of the HTTP path whose forwarding behavior remains Phase 9-owned.
+- The user explicitly authorized the narrow Phase 8 integration scope on 2026-09-20. The editable
+  paths now name only the readiness cancellation call site, broker-only router cancellation and
+  response classification, and typed broker-error propagation without taking ownership of Phase 9
+  forwarding semantics.
+- The same `rust_reviewer` then inspected the complete authorized diff and reran or confirmed all
+  required validation. Rereview was clean with no actionable findings or material test gaps. The
+  reviewer confirmed the integration edits stay within the authorized limits and preserve Phase 9
+  forwarding semantics.

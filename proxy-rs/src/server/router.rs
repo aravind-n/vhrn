@@ -18,7 +18,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
 use crate::{
     config::Config,
     connect::{
-        broker::BrokerConnector,
+        broker::{BrokerConnector, BrokerError},
         public::{PublicConnectError, PublicConnector},
     },
     diagnostics::{AuditResult, AuditService, DenialDestination, Health, HealthService, report},
@@ -275,12 +275,12 @@ pub(crate) async fn connect_http1(
             Err(error) => Err(public_failure(error, &public, context).await),
         },
         AuthorizedRoute::LocalConnect(target) => match &context.local {
-            Some(connector) => match connector.connect(target.canonical_authority()).await {
+            Some(connector) => match connector
+                .connect(target.canonical_authority(), &context.shutdown)
+                .await
+            {
                 Ok(stream) => Ok(Box::new(stream)),
-                Err(error) => {
-                    report(&error);
-                    Err(ProxyFailure::BadGateway)
-                }
+                Err(error) => Err(broker_failure(error)),
             },
             None => Err(ProxyFailure::LocalDenied(
                 target.canonical_authority().to_string(),
@@ -380,15 +380,15 @@ async fn handle_connect<B>(
             }
         }
         Ok(AuthorizedRoute::LocalConnect(target)) => match &context.local {
-            Some(connector) => match connector.connect(target.canonical_authority()).await {
+            Some(connector) => match connector
+                .connect(target.canonical_authority(), &context.shutdown)
+                .await
+            {
                 Ok(value) => {
                     spawn_tunnel(request, value, context.shutdown.clone(), tunnels.clone()).await;
                     fixed(StatusCode::OK, None, "")
                 }
-                Err(error) => {
-                    report(&error);
-                    failure(ProxyFailure::BadGateway, false)
-                }
+                Err(error) => failure(broker_failure(error), false),
             },
             None => failure(
                 ProxyFailure::LocalDenied(target.canonical_authority().to_string()),
@@ -546,12 +546,12 @@ async fn dispatch(
             Err(error) => failure(public_failure(error, &public, &context).await, head),
         },
         AuthorizedRoute::LocalHttp(target) => match &context.local {
-            Some(connector) => match connector.http(target.canonical_authority(), request).await {
+            Some(connector) => match connector
+                .http(target.canonical_authority(), request, &context.shutdown)
+                .await
+            {
                 Ok(value) => origin(value, head),
-                Err(error) => {
-                    report(&error);
-                    failure(ProxyFailure::BadGateway, head)
-                }
+                Err(error) => failure(broker_failure(error), head),
             },
             None => failure(
                 ProxyFailure::LocalDenied(target.canonical_authority().to_string()),
@@ -562,6 +562,17 @@ async fn dispatch(
         | AuthorizedRoute::Asterisk
         | AuthorizedRoute::PublicConnect(_)
         | AuthorizedRoute::LocalConnect(_) => failure(ProxyFailure::BadRequest, head),
+    }
+}
+
+fn broker_failure(error: BrokerError) -> ProxyFailure {
+    report(&error);
+    match error {
+        BrokerError::DeadlineExceeded => ProxyFailure::GatewayTimeout,
+        BrokerError::Cancelled => ProxyFailure::ServiceUnavailable,
+        BrokerError::Rejected | BrokerError::Unavailable | BrokerError::OriginFailure => {
+            ProxyFailure::BadGateway
+        }
     }
 }
 
@@ -743,6 +754,25 @@ mod tests {
         task::{Context, Poll},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn broker_failures_map_to_safe_response_classes() {
+        for error in [BrokerError::Rejected, BrokerError::Unavailable] {
+            assert_eq!(broker_failure(error), ProxyFailure::BadGateway);
+        }
+        assert_eq!(
+            broker_failure(BrokerError::DeadlineExceeded),
+            ProxyFailure::GatewayTimeout
+        );
+        assert_eq!(
+            broker_failure(BrokerError::Cancelled),
+            ProxyFailure::ServiceUnavailable
+        );
+        assert_eq!(
+            broker_failure(BrokerError::OriginFailure),
+            ProxyFailure::BadGateway
+        );
+    }
 
     struct PanicOnPoll(Arc<AtomicUsize>);
 

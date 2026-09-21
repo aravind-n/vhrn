@@ -1,68 +1,136 @@
 //! Authenticated host-broker capability protocol.
 
+use std::fmt;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, lookup_host};
 use tokio::time::timeout;
 
+use crate::Shutdown;
 use crate::config::BrokerEndpoint;
 use crate::domain::target::LoopbackAuthority;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const CONNECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(13);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(13);
+const MAX_FRAME_BYTES: usize = 256;
 const MAX_RESPONSE_BYTES: usize = 4;
+const REDACTED_TOKEN: &str = "BrokerToken([REDACTED])";
 
 /// Capability token carried only in the authenticated broker frame.
-#[derive(Clone)]
-pub(crate) struct BrokerToken(pub(super) String);
+pub(crate) struct BrokerToken(Box<str>);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BrokerTokenError;
 
-impl std::fmt::Display for BrokerTokenError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for BrokerTokenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("invalid broker token format")
     }
 }
 
 impl std::error::Error for BrokerTokenError {}
 
-impl std::fmt::Debug for BrokerToken {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("BrokerToken([REDACTED])")
+impl fmt::Debug for BrokerToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(REDACTED_TOKEN)
     }
 }
 
-impl BrokerToken {
-    pub(crate) fn expose(&self) -> &str {
-        &self.0
+impl fmt::Display for BrokerToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(REDACTED_TOKEN)
     }
 }
 
 impl std::str::FromStr for BrokerToken {
     type Err = BrokerTokenError;
 
-    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         (value.len() == 64
             && value
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
-        .then_some(Self(value.to_owned()))
+        .then(|| Self(value.into()))
         .ok_or(BrokerTokenError)
     }
+}
+
+/// Safe response classification for every broker transport failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BrokerError {
+    Rejected,
+    Unavailable,
+    DeadlineExceeded,
+    Cancelled,
+    OriginFailure,
+}
+
+impl fmt::Display for BrokerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Rejected => "broker rejected exchange",
+            Self::Unavailable => "broker transport unavailable",
+            Self::DeadlineExceeded => "broker exchange deadline exceeded",
+            Self::Cancelled => "broker exchange cancelled",
+            Self::OriginFailure => "local origin exchange failed",
+        })
+    }
+}
+
+impl std::error::Error for BrokerError {}
+
+type BrokerDialFuture = Pin<Box<dyn Future<Output = io::Result<BrokerIo>> + Send>>;
+
+trait BrokerDialer: Send + Sync + 'static {
+    fn dial(&self, endpoint: BrokerEndpoint) -> BrokerDialFuture;
+}
+
+struct SystemBrokerDialer;
+
+impl BrokerDialer for SystemBrokerDialer {
+    fn dial(&self, endpoint: BrokerEndpoint) -> BrokerDialFuture {
+        Box::pin(async move {
+            match endpoint {
+                BrokerEndpoint::Socket(address) => {
+                    TcpStream::connect(address).await.map(BrokerIo::Tcp)
+                }
+                BrokerEndpoint::Host { host, port } => {
+                    let mut last_error = None;
+                    for address in lookup_host((host.as_str(), port)).await? {
+                        match TcpStream::connect(address).await {
+                            Ok(stream) => return Ok(BrokerIo::Tcp(stream)),
+                            Err(error) => last_error = Some(error),
+                        }
+                    }
+                    Err(last_error.unwrap_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::AddrNotAvailable,
+                            "broker hostname resolved empty",
+                        )
+                    }))
+                }
+            }
+        })
+    }
+}
+
+struct BrokerProtocolInner {
+    endpoint: BrokerEndpoint,
+    token: BrokerToken,
+    dialer: Arc<dyn BrokerDialer>,
 }
 
 /// Authenticated broker protocol exchange state.
 #[derive(Clone)]
 pub(crate) struct BrokerProtocol {
-    endpoint: BrokerEndpoint,
-    token: BrokerToken,
+    inner: Arc<BrokerProtocolInner>,
     deadlines: Deadlines,
 }
 
@@ -70,7 +138,6 @@ pub(crate) struct BrokerProtocol {
 pub(crate) struct Deadlines {
     pub(crate) ready: Duration,
     pub(crate) connect: Duration,
-    pub(crate) handshake: Duration,
 }
 
 impl Default for Deadlines {
@@ -78,98 +145,119 @@ impl Default for Deadlines {
         Self {
             ready: READY_TIMEOUT,
             connect: CONNECT_TIMEOUT,
-            handshake: CONNECT_HANDSHAKE_TIMEOUT,
         }
     }
 }
 
 impl BrokerProtocol {
     pub(crate) fn new(endpoint: impl Into<BrokerEndpoint>, token: BrokerToken) -> Self {
-        Self {
-            endpoint: endpoint.into(),
+        Self::from_parts(
+            endpoint.into(),
             token,
-            deadlines: Deadlines::default(),
-        }
+            Arc::new(SystemBrokerDialer),
+            Deadlines::default(),
+        )
     }
 
     /// Completes the startup exchange before the proxy can accept traffic.
-    pub(crate) async fn ready(&self) -> Result<()> {
-        let result = timeout(self.deadlines.ready, async {
-            let mut stream = self.dial().await.context("dial broker endpoint")?;
-            let frame = format!("VHRN-BROKER/1 READY {}\n", self.token.expose());
-            stream
-                .write_all(frame.as_bytes())
-                .await
-                .context("write READY frame")?;
-            read_response(&mut stream)
-                .await
-                .context("read broker response")
-                .and_then(|prefix| {
-                    prefix
-                        .is_none()
-                        .then_some(())
-                        .ok_or_else(|| anyhow::anyhow!("broker rejected exchange"))
-                })
-        })
-        .await;
-        match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(error.context("broker readiness failed")),
-            Err(_) => bail!("broker readiness timeout"),
+    pub(crate) async fn ready(&self, cancellation: &Shutdown) -> Result<(), BrokerError> {
+        let (_, prefix) = self
+            .exchange(self.ready_frame(), self.deadlines.ready, cancellation)
+            .await?;
+        if prefix.is_empty() {
+            Ok(())
+        } else {
+            Err(BrokerError::Rejected)
         }
     }
 
     /// Opens an authenticated broker stream for one already-validated authority.
-    pub(crate) async fn connect(&self, authority: &LoopbackAuthority) -> Result<BrokerStream> {
-        let stream = timeout(self.deadlines.connect, self.dial())
-            .await
-            .map_err(|_| anyhow::anyhow!("broker connection timeout"))?
-            .context("dial broker endpoint")?;
-        let frame = format!(
-            "VHRN-BROKER/1 CONNECT {} {}\n",
-            self.token.expose(),
-            authority
-        );
-        let result = timeout(self.deadlines.handshake, async move {
-            let mut stream = stream;
+    pub(crate) async fn connect(
+        &self,
+        authority: &LoopbackAuthority,
+        cancellation: &Shutdown,
+    ) -> Result<BrokerStream, BrokerError> {
+        let (stream, prefix) = self
+            .exchange(
+                self.connect_frame(authority),
+                self.deadlines.connect,
+                cancellation,
+            )
+            .await?;
+        Ok(BrokerStream { stream, prefix })
+    }
+
+    async fn exchange(
+        &self,
+        frame: Vec<u8>,
+        budget: Duration,
+        cancellation: &Shutdown,
+    ) -> Result<(BrokerIo, Bytes), BrokerError> {
+        let exchange = async {
+            let mut stream = self
+                .inner
+                .dialer
+                .dial(self.inner.endpoint.clone())
+                .await
+                .map_err(|_| BrokerError::Unavailable)?;
             stream
-                .write_all(frame.as_bytes())
+                .write_all(&frame)
                 .await
-                .context("write CONNECT frame")?;
-            let prefix = read_response(&mut stream)
-                .await
-                .context("read broker response")?;
-            Ok::<_, anyhow::Error>(BrokerStream {
-                stream: BrokerIo::Tcp(stream),
-                prefix,
-            })
-        })
-        .await;
-        match result {
-            Ok(Ok(stream)) => Ok(stream),
-            Ok(Err(error)) => Err(error.context("broker rejected exchange")),
-            Err(_) => bail!("broker connection timeout"),
+                .map_err(|_| BrokerError::Unavailable)?;
+            let prefix = read_response(&mut stream).await?;
+            Ok((stream, prefix))
+        };
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(BrokerError::Cancelled),
+            result = timeout(budget, exchange) => {
+                result.map_err(|_| BrokerError::DeadlineExceeded)?
+            },
         }
     }
 
-    async fn dial(&self) -> io::Result<TcpStream> {
-        match &self.endpoint {
-            BrokerEndpoint::Socket(address) => TcpStream::connect(address).await,
-            BrokerEndpoint::Host { host, port } => {
-                let mut last_error = None;
-                for address in lookup_host((host.as_str(), *port)).await? {
-                    match TcpStream::connect(address).await {
-                        Ok(stream) => return Ok(stream),
-                        Err(error) => last_error = Some(error),
-                    }
-                }
-                Err(last_error.unwrap_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::AddrNotAvailable,
-                        "broker hostname resolved empty",
-                    )
-                }))
-            }
+    fn ready_frame(&self) -> Vec<u8> {
+        self.frame(b"VHRN-BROKER/1 READY ", None)
+    }
+
+    fn connect_frame(&self, authority: &LoopbackAuthority) -> Vec<u8> {
+        self.frame(
+            b"VHRN-BROKER/1 CONNECT ",
+            Some(authority.to_string().as_bytes()),
+        )
+    }
+
+    fn frame(&self, prefix: &[u8], authority: Option<&[u8]>) -> Vec<u8> {
+        let authority_len = authority.map_or(0, |value| value.len() + 1);
+        let mut frame =
+            Vec::with_capacity(prefix.len() + self.inner.token.0.len() + authority_len + 1);
+        frame.extend_from_slice(prefix);
+        frame.extend_from_slice(self.inner.token.0.as_bytes());
+        if let Some(authority) = authority {
+            frame.push(b' ');
+            frame.extend_from_slice(authority);
+        }
+        frame.push(b'\n');
+        assert!(
+            frame.len() <= MAX_FRAME_BYTES,
+            "broker frame exceeds protocol bound"
+        );
+        frame
+    }
+
+    fn from_parts(
+        endpoint: BrokerEndpoint,
+        token: BrokerToken,
+        dialer: Arc<dyn BrokerDialer>,
+        deadlines: Deadlines,
+    ) -> Self {
+        Self {
+            inner: Arc::new(BrokerProtocolInner {
+                endpoint,
+                token,
+                dialer,
+            }),
+            deadlines,
         }
     }
 
@@ -179,38 +267,51 @@ impl BrokerProtocol {
         token: BrokerToken,
         deadlines: Deadlines,
     ) -> Self {
-        Self {
-            endpoint: endpoint.into(),
+        Self::from_parts(
+            endpoint.into(),
             token,
+            Arc::new(SystemBrokerDialer),
             deadlines,
-        }
+        )
+    }
+
+    #[cfg(test)]
+    fn with_dialer(
+        token: BrokerToken,
+        dialer: Arc<dyn BrokerDialer>,
+        deadlines: Deadlines,
+    ) -> Self {
+        Self::from_parts(
+            "127.0.0.1:1"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into(),
+            token,
+            dialer,
+            deadlines,
+        )
     }
 }
 
-async fn read_response(stream: &mut TcpStream) -> Result<Option<u8>> {
+async fn read_response(stream: &mut BrokerIo) -> Result<Bytes, BrokerError> {
     let mut bytes = [0; MAX_RESPONSE_BYTES];
     let mut len = 0;
-    while len < bytes.len() {
+    loop {
         let read = stream
             .read(&mut bytes[len..])
             .await
-            .context("read broker response")?;
+            .map_err(|_| BrokerError::Unavailable)?;
         if read == 0 {
-            bail!("broker rejected exchange");
+            return Err(BrokerError::Rejected);
         }
         len += read;
-        if bytes[..len].starts_with(b"OK\n") {
-            return Ok(success_prefix(&bytes[..len]));
+        if len >= 3 && bytes[..3] == *b"OK\n" {
+            return Ok(Bytes::copy_from_slice(&bytes[3..len]));
         }
-        if bytes[..len] == *b"ERR\n" || bytes[..len] == *b"NO\n" {
-            bail!("broker rejected exchange");
+        if !b"OK\n".starts_with(&bytes[..len]) || len == bytes.len() {
+            return Err(BrokerError::Rejected);
         }
     }
-    bail!("broker rejected exchange")
-}
-
-fn success_prefix(response: &[u8]) -> Option<u8> {
-    response.get(3).copied()
 }
 
 #[cfg(test)]
@@ -218,7 +319,6 @@ pub(crate) fn short_test_deadlines() -> Deadlines {
     Deadlines {
         ready: Duration::from_millis(100),
         connect: Duration::from_millis(100),
-        handshake: Duration::from_millis(100),
     }
 }
 
@@ -239,13 +339,17 @@ pub(crate) fn test_connect_frame(authority: &str) -> String {
 }
 
 /// A broker-owned stream with bytes co-read with the success response.
-#[derive(Debug)]
 pub(crate) struct BrokerStream {
     stream: BrokerIo,
-    pub(super) prefix: Option<u8>,
+    prefix: Bytes,
 }
 
-#[derive(Debug)]
+impl fmt::Debug for BrokerStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BrokerStream([REDACTED])")
+    }
+}
+
 enum BrokerIo {
     Tcp(TcpStream),
     #[cfg(test)]
@@ -257,7 +361,51 @@ impl BrokerStream {
     pub(crate) fn test_with_stream(stream: tokio::io::DuplexStream) -> Self {
         Self {
             stream: BrokerIo::Duplex(stream),
-            prefix: None,
+            prefix: Bytes::new(),
+        }
+    }
+}
+
+impl AsyncRead for BrokerIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match &mut *self {
+            Self::Tcp(stream) => Pin::new(stream).poll_read(cx, buffer),
+            #[cfg(test)]
+            Self::Duplex(stream) => Pin::new(stream).poll_read(cx, buffer),
+        }
+    }
+}
+
+impl AsyncWrite for BrokerIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match &mut *self {
+            Self::Tcp(stream) => Pin::new(stream).poll_write(cx, bytes),
+            #[cfg(test)]
+            Self::Duplex(stream) => Pin::new(stream).poll_write(cx, bytes),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut *self {
+            Self::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(test)]
+            Self::Duplex(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut *self {
+            Self::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            #[cfg(test)]
+            Self::Duplex(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
@@ -271,15 +419,13 @@ impl AsyncRead for BrokerStream {
         if buffer.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        if let Some(byte) = self.prefix.take() {
-            buffer.put_slice(&[byte]);
+        if !self.prefix.is_empty() {
+            let count = buffer.remaining().min(self.prefix.len());
+            buffer.put_slice(&self.prefix[..count]);
+            self.prefix.advance(count);
             return Poll::Ready(Ok(()));
         }
-        match &mut self.stream {
-            BrokerIo::Tcp(stream) => Pin::new(stream).poll_read(cx, buffer),
-            #[cfg(test)]
-            BrokerIo::Duplex(stream) => Pin::new(stream).poll_read(cx, buffer),
-        }
+        Pin::new(&mut self.stream).poll_read(cx, buffer)
     }
 }
 
@@ -289,38 +435,27 @@ impl AsyncWrite for BrokerStream {
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match &mut self.stream {
-            BrokerIo::Tcp(stream) => Pin::new(stream).poll_write(cx, bytes),
-            #[cfg(test)]
-            BrokerIo::Duplex(stream) => Pin::new(stream).poll_write(cx, bytes),
-        }
+        Pin::new(&mut self.stream).poll_write(cx, bytes)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match &mut self.stream {
-            BrokerIo::Tcp(stream) => Pin::new(stream).poll_flush(cx),
-            #[cfg(test)]
-            BrokerIo::Duplex(stream) => Pin::new(stream).poll_flush(cx),
-        }
+        Pin::new(&mut self.stream).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match &mut self.stream {
-            BrokerIo::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
-            #[cfg(test)]
-            BrokerIo::Duplex(stream) => Pin::new(stream).poll_shutdown(cx),
-        }
+        Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::future::pending;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::Notify;
-    use tokio::time::{Duration, timeout};
 
     use super::*;
 
@@ -328,155 +463,146 @@ mod tests {
         "a".repeat(64).parse().unwrap()
     }
 
-    #[test]
-    fn success_prefix_requires_a_co_read_byte() {
-        assert_eq!(success_prefix(b"OK\n"), None);
-        assert_eq!(success_prefix(b"OK\np"), Some(b'p'));
+    fn cancellation() -> Shutdown {
+        Shutdown::new()
     }
 
     async fn listener() -> TcpListener {
         TcpListener::bind("127.0.0.1:0").await.unwrap()
     }
 
+    #[test]
+    fn token_format_is_exact_and_all_formatting_is_redacted() {
+        for (name, value, valid) in [
+            ("lower hex", "0123456789abcdef".repeat(4), true),
+            ("empty", String::new(), false),
+            ("short", "a".repeat(63), false),
+            ("long", "a".repeat(65), false),
+            ("uppercase", "A".repeat(64), false),
+            ("non-hex", format!("{}g", "a".repeat(63)), false),
+            ("newline", format!("{}\n", "a".repeat(64)), false),
+            ("carriage return", format!("{}\r", "a".repeat(64)), false),
+            ("non-ASCII", format!("{}é", "a".repeat(62)), false),
+        ] {
+            assert_eq!(value.parse::<BrokerToken>().is_ok(), valid, "{name}");
+        }
+
+        let secret = "a".repeat(64);
+        let token = secret.parse::<BrokerToken>().unwrap();
+        for rendered in [format!("{token}"), format!("{token:?}")] {
+            assert_eq!(rendered, REDACTED_TOKEN);
+            assert!(!rendered.contains(&secret));
+        }
+        let panic =
+            std::panic::catch_unwind(|| panic!("{token:?}")).expect_err("redacted panic payload");
+        let payload = panic
+            .downcast_ref::<String>()
+            .expect("string panic payload");
+        assert!(!payload.contains(&secret));
+    }
+
     #[tokio::test]
-    async fn hostname_endpoint_resolves_for_ready_and_connect() {
+    async fn readiness_and_every_connect_use_fresh_exact_frames() {
+        let listener = listener().await;
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut frames = Vec::new();
+            for length in [85, 100, 106, 96] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut frame = vec![0; length];
+                stream.read_exact(&mut frame).await.unwrap();
+                stream.write_all(b"OK\n").await.unwrap();
+                frames.push(frame);
+            }
+            frames
+        });
+        let protocol = BrokerProtocol::new(address, token());
+        let cancellation = cancellation();
+        protocol.ready(&cancellation).await.unwrap();
+        for input in [
+            "LOCALHOST:00080",
+            "127.255.255.255:00081",
+            "[0:0:0:0:0:0:0:1]:00082",
+        ] {
+            let authority = LoopbackAuthority::parse(input).unwrap();
+            drop(protocol.connect(&authority, &cancellation).await.unwrap());
+        }
+        assert_eq!(
+            server.await.unwrap(),
+            [
+                format!("VHRN-BROKER/1 READY {}\n", "a".repeat(64)).into_bytes(),
+                format!("VHRN-BROKER/1 CONNECT {} localhost:80\n", "a".repeat(64)).into_bytes(),
+                format!(
+                    "VHRN-BROKER/1 CONNECT {} 127.255.255.255:81\n",
+                    "a".repeat(64)
+                )
+                .into_bytes(),
+                format!("VHRN-BROKER/1 CONNECT {} [::1]:82\n", "a".repeat(64)).into_bytes(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn hostname_endpoint_is_used_only_as_the_configured_broker_route() {
         let listener = listener().await;
         let endpoint = BrokerEndpoint::parse(&format!(
             "localhost:{}",
             listener.local_addr().unwrap().port()
         ))
         .unwrap();
-        let ready_server = tokio::spawn({
-            let listener = listener;
-            async move {
+        let server = tokio::spawn(async move {
+            for length in [85, 100] {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let mut frame = [0; 85];
+                let mut frame = vec![0; length];
                 stream.read_exact(&mut frame).await.unwrap();
-                stream.write_all(b"OK\n").await.unwrap();
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut frame = [0; 128];
-                let count = stream.read(&mut frame).await.unwrap();
-                assert_eq!(
-                    &frame[..count],
-                    format!("VHRN-BROKER/1 CONNECT {} localhost:80\n", "a".repeat(64)).as_bytes()
-                );
                 stream.write_all(b"OK\n").await.unwrap();
             }
         });
         let protocol = BrokerProtocol::with_deadlines(endpoint, token(), short_test_deadlines());
-        protocol.ready().await.unwrap();
+        let cancellation = cancellation();
+        protocol.ready(&cancellation).await.unwrap();
         drop(
             protocol
-                .connect(&LoopbackAuthority::parse("localhost:80").unwrap())
+                .connect(
+                    &LoopbackAuthority::parse("localhost:80").unwrap(),
+                    &cancellation,
+                )
                 .await
                 .unwrap(),
         );
-        ready_server.await.unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn ready_writes_exact_frame() {
-        let listener = listener().await;
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut frame = vec![0; 85];
-            stream.read_exact(&mut frame).await.unwrap();
-            stream.write_all(b"OK\n").await.unwrap();
-            frame
-        });
-        BrokerProtocol::new(address, token()).ready().await.unwrap();
-        assert_eq!(
-            server.await.unwrap(),
-            format!("VHRN-BROKER/1 READY {}\n", "a".repeat(64)).into_bytes()
-        );
-    }
-
-    #[tokio::test]
-    async fn connect_uses_canonical_authority_and_keeps_prefix() {
+    async fn fragmented_success_and_all_coalesced_payload_bytes_are_preserved() {
         let listener = listener().await;
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut frame = vec![0; 100];
-            let length = stream.read(&mut frame).await.unwrap();
-            stream.write_all(b"OK\np").await.unwrap();
-            frame[..length].to_vec()
+            stream.read_exact(&mut frame).await.unwrap();
+            stream.write_all(b"O").await.unwrap();
+            tokio::task::yield_now().await;
+            stream.write_all(b"K").await.unwrap();
+            tokio::task::yield_now().await;
+            stream.write_all(b"\npayload").await.unwrap();
         });
-        let authority = LoopbackAuthority::parse("LOCALHOST:00080").unwrap();
         let mut stream = BrokerProtocol::new(address, token())
-            .connect(&authority)
+            .connect(
+                &LoopbackAuthority::parse("localhost:80").unwrap(),
+                &cancellation(),
+            )
             .await
             .unwrap();
-        let mut first = [0];
-        stream.read_exact(&mut first).await.unwrap();
-        assert_eq!(first, *b"p");
-        assert_eq!(
-            String::from_utf8(server.await.unwrap()).unwrap(),
-            format!("VHRN-BROKER/1 CONNECT {} localhost:80\n", "a".repeat(64))
-        );
-    }
-
-    #[tokio::test]
-    async fn saved_response_bytes_complete_read_without_waiting_for_socket_data() {
-        let listener = listener().await;
-        let address = listener.local_addr().unwrap();
-        let (connected, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
-        let stream = connected.unwrap();
-        let (peer, _) = accepted.unwrap();
-        let (release, released) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let _peer = peer;
-            released.await.unwrap();
-        });
-        let mut stream = BrokerStream {
-            stream: BrokerIo::Tcp(stream),
-            prefix: Some(b'p'),
-        };
-        let mut bytes = [0; 8];
-        let count = timeout(Duration::from_millis(100), stream.read(&mut bytes))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(count, 1);
-        assert_eq!(&bytes[..count], b"p");
-        release.send(()).unwrap();
-        drop(stream);
+        let mut payload = [0; 7];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"payload");
+        assert_eq!(format!("{stream:?}"), "BrokerStream([REDACTED])");
         server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn connect_uses_each_canonical_loopback_spelling() {
-        for (input, canonical) in [
-            ("LOCALHOST:00080", "localhost:80"),
-            ("127.0.0.1:00081", "127.0.0.1:81"),
-            ("[0:0:0:0:0:0:0:1]:00082", "[::1]:82"),
-        ] {
-            let listener = listener().await;
-            let address = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut frame = [0; 256];
-                let count = stream.read(&mut frame).await.unwrap();
-                stream.write_all(b"OK\n").await.unwrap();
-                String::from_utf8(frame[..count].to_vec()).unwrap()
-            });
-            let authority = LoopbackAuthority::parse(input).unwrap();
-            drop(
-                BrokerProtocol::new(address, token())
-                    .connect(&authority)
-                    .await
-                    .unwrap(),
-            );
-            assert_eq!(
-                server.await.unwrap(),
-                format!("VHRN-BROKER/1 CONNECT {} {canonical}\n", "a".repeat(64))
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn broker_frame_fixture_drives_client_exchanges() {
+    async fn fixture_covers_bounded_response_outcomes() {
         for row in include_str!("../../../testdata/broker-frames.tsv")
             .lines()
             .filter(|row| !row.starts_with('#'))
@@ -489,104 +615,207 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let expected = wire
                 .replace("<token>", &"a".repeat(64))
+                .replace("\\r", "\r")
                 .replace("\\n", "\n");
-            let response = response.replace("\\n", "\n");
-            let payload = payload.replace("\\n", "\n");
+            let response = response.replace("\\r", "\r").replace("\\n", "\n");
+            let payload = payload.replace("\\r", "\r").replace("\\n", "\n");
             let server_payload = payload.clone();
+            let stalled = response == "timeout";
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut received = vec![0; expected.len()];
                 stream.read_exact(&mut received).await.unwrap();
                 assert_eq!(received, expected.as_bytes());
-                if response != "timeout" {
-                    stream.write_all(response.as_bytes()).await.unwrap();
-                    stream.write_all(server_payload.as_bytes()).await.unwrap();
+                match response.as_str() {
+                    "timeout" => std::future::pending::<()>().await,
+                    "eof" => {}
+                    _ => {
+                        let mut bytes = response.into_bytes();
+                        bytes.extend_from_slice(server_payload.as_bytes());
+                        let _ = stream.write_all(&bytes).await;
+                    }
                 }
             });
             let protocol = BrokerProtocol::with_deadlines(address, token(), short_test_deadlines());
+            let cancellation = cancellation();
             let result = match *kind {
-                "ready" => protocol.ready().await,
-                "connect" => match protocol
-                    .connect(&LoopbackAuthority::parse("localhost:80").unwrap())
-                    .await
-                {
-                    Ok(mut stream) => {
-                        let mut received = vec![0; payload.len()];
-                        stream.read_exact(&mut received).await.unwrap();
-                        assert_eq!(received, payload.as_bytes());
-                        Ok(())
+                "ready" => protocol.ready(&cancellation).await.map(|()| Vec::new()),
+                "connect" => {
+                    match protocol
+                        .connect(
+                            &LoopbackAuthority::parse("localhost:80").unwrap(),
+                            &cancellation,
+                        )
+                        .await
+                    {
+                        Ok(mut stream) => {
+                            let mut received = vec![0; payload.len()];
+                            stream
+                                .read_exact(&mut received)
+                                .await
+                                .map_err(|_| BrokerError::Unavailable)
+                                .map(|_| received)
+                        }
+                        Err(error) => Err(error),
                     }
-                    Err(error) => Err(error),
-                },
+                }
                 _ => panic!("unknown broker fixture exchange"),
             };
-            assert_eq!(result.is_ok(), matches!(*outcome, "ready" | "connected"));
-            server.await.unwrap();
+            match *outcome {
+                "ready" => assert_eq!(result.unwrap(), Vec::<u8>::new()),
+                "connected" => assert_eq!(result.unwrap(), payload.as_bytes()),
+                "rejected" => assert_eq!(result.unwrap_err(), BrokerError::Rejected),
+                "deadline" => assert_eq!(result.unwrap_err(), BrokerError::DeadlineExceeded),
+                _ => panic!("unknown broker fixture outcome"),
+            }
+            if stalled {
+                server.abort();
+                assert!(server.await.unwrap_err().is_cancelled());
+            } else {
+                server.await.unwrap();
+            }
+        }
+    }
+
+    struct OneStreamDialer(Mutex<Option<tokio::io::DuplexStream>>);
+
+    impl BrokerDialer for OneStreamDialer {
+        fn dial(&self, _: BrokerEndpoint) -> BrokerDialFuture {
+            let stream = self.0.lock().unwrap().take();
+            Box::pin(async move {
+                stream
+                    .map(BrokerIo::Duplex)
+                    .ok_or_else(|| io::Error::other("test stream already taken"))
+            })
+        }
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct PendingDialer {
+        entered: Arc<Notify>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl BrokerDialer for PendingDialer {
+        fn dial(&self, _: BrokerEndpoint) -> BrokerDialFuture {
+            let entered = self.entered.clone();
+            let dropped = self.dropped.clone();
+            Box::pin(async move {
+                let _guard = DropFlag(dropped);
+                entered.notify_one();
+                pending().await
+            })
         }
     }
 
     #[tokio::test]
-    async fn failures_and_timeouts_are_redacted() {
-        for response in [b"ERR\n".as_slice(), b"NO\n", b"O", b"TOOLONG"] {
-            let listener = listener().await;
-            let address = listener.local_addr().unwrap();
-            let response = response.to_vec();
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut frame = [0; 256];
-                let _ = stream.read(&mut frame).await.unwrap();
-                stream.write_all(&response).await.unwrap();
-            });
-            let error = BrokerProtocol::with_deadlines(address, token(), short_test_deadlines())
-                .connect(&LoopbackAuthority::parse("localhost:80").unwrap())
-                .await
-                .unwrap_err();
-            assert!(!error.to_string().contains(&"a".repeat(64)));
-            server.await.unwrap();
-        }
-        let listener = listener().await;
-        let address = listener.local_addr().unwrap();
-        let (release, released) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut frame = [0; 256];
-            let _ = stream.read(&mut frame).await.unwrap();
-            released.await.unwrap();
-        });
-        let result = BrokerProtocol::with_deadlines(address, token(), short_test_deadlines())
-            .ready()
-            .await;
-        assert!(result.is_err());
-        release.send(()).unwrap();
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn dropping_pending_exchange_closes_socket() {
-        let listener = listener().await;
-        let address = listener.local_addr().unwrap();
+    async fn cancellation_interrupts_dial_and_drops_pending_work() {
         let entered = Arc::new(Notify::new());
-        let server_entered = entered.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut frame = [0; 256];
-            let _ = stream.read(&mut frame).await.unwrap();
-            server_entered.notify_one();
-            let mut byte = [0];
-            timeout(Duration::from_millis(500), stream.read(&mut byte))
-                .await
-                .unwrap()
-                .unwrap()
-        });
-        let protocol = BrokerProtocol::with_deadlines(address, token(), short_test_deadlines());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let protocol = BrokerProtocol::with_dialer(
+            token(),
+            Arc::new(PendingDialer {
+                entered: entered.clone(),
+                dropped: dropped.clone(),
+            }),
+            short_test_deadlines(),
+        );
+        let cancellation = cancellation();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move { protocol.ready(&task_cancellation).await });
+        entered.notified().await;
+        cancellation.request();
+        assert_eq!(task.await.unwrap().unwrap_err(), BrokerError::Cancelled);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_write_and_closes_the_socket() {
+        let (stream, mut peer) = tokio::io::duplex(1);
+        let protocol = BrokerProtocol::with_dialer(
+            token(),
+            Arc::new(OneStreamDialer(Mutex::new(Some(stream)))),
+            short_test_deadlines(),
+        );
+        let cancellation = cancellation();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move { protocol.ready(&task_cancellation).await });
+        let mut first = [0];
+        peer.read_exact(&mut first).await.unwrap();
+        cancellation.request();
+        assert_eq!(task.await.unwrap().unwrap_err(), BrokerError::Cancelled);
+        let mut remainder = Vec::new();
+        peer.read_to_end(&mut remainder).await.unwrap();
+        assert!(remainder.len() < 84, "cancelled write sent a full frame");
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_read_and_closes_the_socket() {
+        let (stream, mut peer) = tokio::io::duplex(256);
+        let protocol = BrokerProtocol::with_dialer(
+            token(),
+            Arc::new(OneStreamDialer(Mutex::new(Some(stream)))),
+            short_test_deadlines(),
+        );
+        let cancellation = cancellation();
+        let task_cancellation = cancellation.clone();
         let task = tokio::spawn(async move {
-            let _ = protocol.ready().await;
+            protocol
+                .connect(
+                    &LoopbackAuthority::parse("localhost:80").unwrap(),
+                    &task_cancellation,
+                )
+                .await
         });
-        timeout(Duration::from_millis(500), entered.notified())
-            .await
-            .unwrap();
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert_eq!(server.await.unwrap(), 0);
+        let mut frame = [0; 100];
+        peer.read_exact(&mut frame).await.unwrap();
+        cancellation.request();
+        assert_eq!(task.await.unwrap().unwrap_err(), BrokerError::Cancelled);
+        let mut byte = [0];
+        assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn one_cumulative_deadline_closes_a_stalled_exchange() {
+        let (stream, mut peer) = tokio::io::duplex(256);
+        let protocol = BrokerProtocol::with_dialer(
+            token(),
+            Arc::new(OneStreamDialer(Mutex::new(Some(stream)))),
+            short_test_deadlines(),
+        );
+        let task = tokio::spawn(async move { protocol.ready(&cancellation()).await });
+        let mut frame = [0; 85];
+        peer.read_exact(&mut frame).await.unwrap();
+        assert_eq!(
+            task.await.unwrap().unwrap_err(),
+            BrokerError::DeadlineExceeded
+        );
+        let mut byte = [0];
+        assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn typed_errors_never_render_secret_or_endpoint() {
+        let secret = "a".repeat(64);
+        let endpoint = "192.168.64.1:54321";
+        for error in [
+            BrokerError::Rejected,
+            BrokerError::Unavailable,
+            BrokerError::DeadlineExceeded,
+            BrokerError::Cancelled,
+            BrokerError::OriginFailure,
+        ] {
+            for rendered in [format!("{error}"), format!("{error:?}")] {
+                assert!(!rendered.contains(&secret));
+                assert!(!rendered.contains(endpoint));
+            }
+        }
     }
 }

@@ -82,7 +82,7 @@ async fn bootstrap(config: Config, shutdown: Shutdown) -> anyhow::Result<Option<
         tokio::select! {
             biased;
             () = shutdown.cancelled() => return Ok(None),
-            result = connector.ready() => {
+            result = connector.ready(&shutdown) => {
                 result.map_err(|_| anyhow::anyhow!("startup_broker_readiness_failed"))?;
             }
         }
