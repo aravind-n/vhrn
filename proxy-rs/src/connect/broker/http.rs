@@ -6,41 +6,26 @@ use super::protocol::{short_test_deadlines, test_connect_authority, test_connect
 
 #[cfg(test)]
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Duration;
 
 use crate::config::BrokerEndpoint;
-use crate::connect::origin_body::{
-    BoundedOriginBody, OriginBodyLimits, OriginResponse, SharedOriginResponse,
-};
-use crate::domain::target::LoopbackAuthority;
-use crate::headers::sanitize_hop_by_hop;
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-#[cfg(test)]
-use hyper::StatusCode;
-use hyper::client::conn::http1;
-use hyper::{Request, Uri};
-use hyper_util::rt::TokioIo;
-use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use crate::connect::forward::{ForwardError, ForwardErrorKind, Forwarded, exchange, forward_error};
+use crate::connect::origin_body::{HttpOrigin, OriginLease, take_origin};
+use crate::domain::target::{LocalTarget, LoopbackAuthority};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::Shutdown;
 use crate::connect::pool::IdlePool;
 #[cfg(test)]
 use crate::connect::pool::{IDLE_POOL_CAPACITY, IDLE_POOL_LIFETIME, NonZeroDuration};
-
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+use crate::server::http1::{Http1Connection, RequestHead};
 
 /// Private connector for the broker capability.
 #[derive(Clone)]
 pub(crate) struct BrokerConnector {
     protocol: BrokerProtocol,
-    pool: IdlePool<BrokerKey, BrokerConnection>,
-    http_timeout: Duration,
-    response_limit: usize,
-    #[cfg(test)]
-    active_drivers: Arc<std::sync::atomic::AtomicUsize>,
+    pool: IdlePool<BrokerKey, HttpOrigin<BrokerStream>>,
     #[cfg(test)]
     test_connect_stream: Arc<std::sync::Mutex<Option<BrokerStream>>>,
 }
@@ -50,28 +35,11 @@ struct BrokerKey {
     authority: LoopbackAuthority,
 }
 
-struct BrokerConnection {
-    sender: http1::SendRequest<Full<Bytes>>,
-    driver: JoinHandle<()>,
-}
-
-fn broker_connection_reusable(connection: &BrokerConnection) -> bool {
-    !connection.driver.is_finished() && connection.sender.is_ready()
-}
-
-#[cfg(test)]
-struct DriverGuard(Arc<std::sync::atomic::AtomicUsize>);
-#[cfg(test)]
-impl Drop for DriverGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-impl Drop for BrokerConnection {
-    fn drop(&mut self) {
-        self.driver.abort();
-    }
+#[derive(Debug)]
+pub(crate) enum BrokerForwardError {
+    Connect(BrokerError),
+    Exchange(ForwardError),
+    Origin(BrokerError, ForwardError),
 }
 
 impl BrokerConnector {
@@ -79,10 +47,6 @@ impl BrokerConnector {
         Self {
             protocol: BrokerProtocol::new(endpoint, token),
             pool: IdlePool::new(),
-            http_timeout: HTTP_TIMEOUT,
-            response_limit: MAX_HTTP_RESPONSE_BYTES,
-            #[cfg(test)]
-            active_drivers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             test_connect_stream: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -124,40 +88,9 @@ impl BrokerConnector {
                 std::num::NonZeroUsize::new(capacity).expect("test capacity is nonzero"),
                 NonZeroDuration::new(lifetime).expect("test lifetime is nonzero"),
             ),
-            http_timeout: HTTP_TIMEOUT,
-            response_limit: MAX_HTTP_RESPONSE_BYTES,
-            active_drivers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             test_connect_stream: Arc::new(std::sync::Mutex::new(None)),
         }
     }
-
-    #[cfg(test)]
-    fn with_http_limits(
-        endpoint: impl Into<BrokerEndpoint>,
-        token: BrokerToken,
-        http_timeout: Duration,
-        response_limit: usize,
-    ) -> Self {
-        let mut connector =
-            Self::with_deadlines_and_pool(endpoint, token, IDLE_POOL_CAPACITY, IDLE_POOL_LIFETIME);
-        connector.http_timeout = http_timeout;
-        connector.response_limit = response_limit;
-        connector
-    }
-    #[cfg(test)]
-    pub(crate) fn pool_len(&self) -> usize {
-        self.pool.len()
-    }
-    #[cfg(test)]
-    pub(crate) fn active_drivers(&self) -> usize {
-        self.active_drivers
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-    #[cfg(test)]
-    fn clear_pool(&self) {
-        self.pool.clear();
-    }
-
     #[cfg(test)]
     pub(crate) fn test_with_connect_stream(stream: tokio::io::DuplexStream) -> Self {
         let connector = Self::with_deadlines_and_pool(
@@ -177,544 +110,138 @@ impl BrokerConnector {
     }
 }
 
-pub(crate) type BrokerResponse = SharedOriginResponse;
-
 impl BrokerConnector {
-    pub(crate) async fn http(
+    pub(crate) async fn forward<D>(
         &self,
-        authority: &LoopbackAuthority,
-        request: Request<Full<Bytes>>,
+        target: &LocalTarget,
+        head: &RequestHead,
+        downstream: &mut Http1Connection<D>,
         cancellation: &Shutdown,
-    ) -> Result<BrokerResponse, BrokerError> {
+    ) -> Result<Forwarded, BrokerForwardError>
+    where
+        D: AsyncRead + AsyncWrite + Unpin,
+    {
+        let authority = target.canonical_authority();
         let key = BrokerKey {
             authority: authority.clone(),
         };
-        let connection = self.pool.take_if_reusable(&key, broker_connection_reusable);
-        let mut connection = match connection {
-            Some(connection) => connection,
-            None => self.open_http(authority, cancellation).await?,
+        let origin = tokio::select! {
+            biased;
+            _ = downstream.wait_for_peer_close() => {
+                return Err(BrokerForwardError::Exchange(forward_error(
+                    ForwardErrorKind::ClientDisconnected,
+                    false,
+                )));
+            }
+            result = async {
+                match take_origin(&self.pool, &key) {
+                    Some(origin) => Ok(origin),
+                    None => self
+                        .connect(authority, cancellation)
+                        .await
+                        .map(HttpOrigin::new),
+                }
+            } => result.map_err(BrokerForwardError::Connect)?,
         };
-        let (mut parts, body) = request.into_parts();
-        sanitize_hop_by_hop(&mut parts.headers);
-        let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
-        parts.uri = path
-            .parse::<Uri>()
-            .map_err(|_| BrokerError::OriginFailure)?;
-        let response = timeout(
-            self.http_timeout,
-            connection
-                .sender
-                .send_request(Request::from_parts(parts, body)),
+        let lease = OriginLease::new(origin, key, self.pool.clone());
+        let canonical = authority.to_string();
+        let host = if target.explicit_port() {
+            canonical.as_str()
+        } else {
+            canonical
+                .rsplit_once(':')
+                .map_or(canonical.as_str(), |(host, _)| host)
+        };
+        exchange(
+            downstream,
+            head,
+            target.path_and_query(),
+            host,
+            lease,
+            cancellation,
         )
         .await
-        .map_err(|_| BrokerError::OriginFailure)?
-        .map_err(|_| BrokerError::OriginFailure)?;
-        let (parts, incoming) = response.into_parts();
-        Ok(OriginResponse {
-            status: parts.status,
-            headers: parts.headers,
-            body: BoundedOriginBody::new(
-                incoming,
-                connection,
-                key,
-                self.pool.clone(),
-                broker_connection_reusable,
-                OriginBodyLimits {
-                    origin: authority.to_string(),
-                    timeout: self.http_timeout,
-                    limit: self.response_limit,
-                },
-            )
-            .boxed_unsync(),
+        .map_err(|error| {
+            if error.kind == crate::connect::forward::ForwardErrorKind::BadGateway {
+                BrokerForwardError::Origin(BrokerError::OriginFailure, error)
+            } else {
+                BrokerForwardError::Exchange(error)
+            }
         })
-    }
-
-    async fn open_http(
-        &self,
-        authority: &LoopbackAuthority,
-        cancellation: &Shutdown,
-    ) -> Result<BrokerConnection, BrokerError> {
-        let stream = self.connect(authority, cancellation).await?;
-        let (sender, connection) =
-            timeout(self.http_timeout, http1::handshake(TokioIo::new(stream)))
-                .await
-                .map_err(|_| BrokerError::OriginFailure)?
-                .map_err(|_| BrokerError::OriginFailure)?;
-        #[cfg(test)]
-        let guard = {
-            self.active_drivers
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            DriverGuard(self.active_drivers.clone())
-        };
-        let driver = tokio::spawn(async move {
-            #[cfg(test)]
-            let _guard = guard;
-            let _ = connection.await;
-        });
-        Ok(BrokerConnection { sender, driver })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
+    use bytes::Bytes;
     use http_body_util::BodyExt;
+    use hyper::{HeaderMap, Method, StatusCode, Version, header};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-    use tokio::sync::Notify;
-    use tokio::time::{Duration, timeout};
 
     use super::*;
-    use tokio::net::TcpStream;
-
-    fn token() -> BrokerToken {
-        "a".repeat(64).parse().unwrap()
-    }
-    async fn listener() -> TcpListener {
-        TcpListener::bind("127.0.0.1:0").await.unwrap()
-    }
-
-    async fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        let mut chunk = [0; 256];
-        loop {
-            let read = timeout(Duration::from_millis(500), stream.read(&mut chunk))
-                .await
-                .unwrap()
-                .unwrap();
-            assert_ne!(read, 0, "origin closed before completing request");
-            bytes.extend_from_slice(&chunk[..read]);
-            assert!(bytes.len() <= 16 * 1024, "request exceeds test bound");
-            let Some(headers_end) = bytes.windows(4).position(|value| value == b"\r\n\r\n") else {
-                continue;
-            };
-            let headers = std::str::from_utf8(&bytes[..headers_end]).unwrap();
-            let length = headers
-                .lines()
-                .find_map(|line| line.strip_prefix("content-length: "))
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(0);
-            if bytes.len() >= headers_end + 4 + length {
-                return bytes;
-            }
-        }
-    }
-
-    async fn wait_for_no_drivers(connector: &BrokerConnector) {
-        timeout(Duration::from_millis(500), async {
-            while connector.active_drivers() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-    }
-
-    fn local_request() -> Request<Full<Bytes>> {
-        Request::builder()
-            .uri("http://localhost:80/")
-            .body(Full::new(Bytes::new()))
-            .unwrap()
-    }
-
-    fn authority_request(authority: &LoopbackAuthority, path: &str) -> Request<Full<Bytes>> {
-        Request::builder()
-            .uri(format!("http://{authority}{path}"))
-            .header("host", authority.to_string())
-            .body(Full::new(Bytes::new()))
-            .unwrap()
-    }
-
-    async fn accept_broker(listener: &TcpListener) -> TcpStream {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut frame = vec![0; 100];
-        stream.read_exact(&mut frame).await.unwrap();
-        stream.write_all(b"OK\n").await.unwrap();
-        let _ = read_http_request(&mut stream).await;
-        stream
-    }
+    use crate::domain::target::{Target, classify};
+    use crate::server::http1::{BodyFraming, Http1Connection, RequestHead};
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn bounded_idle_pool_retires_broker_drivers_and_reaps_without_checkout() {
-        let listener = listener().await;
-        let address = listener.local_addr().unwrap();
-        let release = Arc::new(Notify::new());
-        let server_release = release.clone();
-        let server = tokio::spawn(async move {
-            let mut handlers = Vec::new();
-            for _ in 0..5 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let release = server_release.clone();
-                handlers.push(tokio::spawn(async move {
-                    let mut frame = vec![0; 100];
-                    timeout(Duration::from_millis(200), stream.read_exact(&mut frame))
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    let frame = String::from_utf8(frame).unwrap();
-                    let authority = test_connect_authority(&frame);
-                    assert!((80..85).any(|port| authority == format!("localhost:{port}")));
-                    let port = authority.strip_prefix("localhost:").unwrap();
-                    stream.write_all(b"OK\n").await.unwrap();
-                    for attempt in 0..if port == "81" { 2 } else { 1 } {
-                        let request =
-                            String::from_utf8(read_http_request(&mut stream).await).unwrap();
-                        assert!(
-                            request
-                                .starts_with(&format!("GET /churn/{port}/{attempt} HTTP/1.1\r\n"))
-                        );
-                        assert!(request.contains(&format!("host: {authority}\r\n")));
-                        stream
-                            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                            .await
-                            .unwrap();
-                    }
-                    release.notified().await;
-                }));
-            }
-            server_release.notified().await;
-            for handler in handlers {
-                handler.await.unwrap();
-            }
-        });
-        let connector =
-            BrokerConnector::with_deadlines_and_pool(address, token(), 2, Duration::from_secs(5));
-        let authorities = (80..85)
-            .map(|port| LoopbackAuthority::parse(&format!("localhost:{port}")).unwrap())
-            .collect::<Vec<_>>();
-        for authority in authorities.iter().take(3) {
-            let port = authority.to_string().rsplit(':').next().unwrap().to_owned();
-            let response = connector
-                .http(
-                    authority,
-                    authority_request(authority, &format!("/churn/{port}/0")),
-                    &Shutdown::new(),
-                )
-                .await
-                .unwrap();
-            response.body.collect().await.unwrap();
-        }
-        assert!(connector.pool_len() <= 2);
-        let response = connector
-            .http(
-                &authorities[1],
-                authority_request(&authorities[1], "/churn/81/1"),
-                &Shutdown::new(),
-            )
-            .await
-            .unwrap();
-        response.body.collect().await.unwrap();
-        assert_eq!(connector.pool_len(), 2);
-        let response = connector
-            .http(
-                &authorities[3],
-                authority_request(&authorities[3], "/churn/83/0"),
-                &Shutdown::new(),
-            )
-            .await
-            .unwrap();
-        response.body.collect().await.unwrap();
-        assert!(connector.pool_len() <= 2);
-        let response = connector
-            .http(
-                &authorities[4],
-                authority_request(&authorities[4], "/churn/84/0"),
-                &Shutdown::new(),
-            )
-            .await
-            .unwrap();
-        response.body.collect().await.unwrap();
-        assert_eq!(connector.pool_len(), 2);
-        release.notify_waiters();
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn broker_idle_pool_expires_without_a_later_request() {
-        let listener = listener().await;
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut frame = vec![0; 100];
-            stream.read_exact(&mut frame).await.unwrap();
-            assert_eq!(
-                String::from_utf8(frame).unwrap(),
-                test_connect_frame("localhost:80")
-            );
-            stream.write_all(b"OK\n").await.unwrap();
-            let _ = read_http_request(&mut stream).await;
-            stream
-                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                .await
-                .unwrap();
-            let mut byte = [0];
-            timeout(Duration::from_millis(500), stream.read(&mut byte))
-                .await
-                .unwrap()
-                .unwrap()
-        });
-        let connector = BrokerConnector::with_deadlines_and_pool(
-            address,
-            token(),
-            2,
-            Duration::from_millis(20),
+    async fn broker_http_uses_the_shared_streaming_forwarder() {
+        assert_eq!(
+            test_connect_authority(&test_connect_frame("localhost:80")),
+            "localhost:80"
         );
-        let authority = LoopbackAuthority::parse("localhost:80").unwrap();
-        let response = connector
-            .http(&authority, local_request(), &Shutdown::new())
-            .await
-            .unwrap();
-        response.body.collect().await.unwrap();
-        wait_for_no_drivers(&connector).await;
-        assert_eq!(connector.pool_len(), 0);
-        assert_eq!(server.await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn local_http_streams_reuses_and_forwards_exactly() {
-        let listener = Arc::new(listener().await);
-        let address = listener.local_addr().unwrap();
-        let (release, released) = tokio::sync::oneshot::channel();
-        let server_listener = listener.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = server_listener.accept().await.unwrap();
-            let mut frame = vec![0; 100];
-            stream.read_exact(&mut frame).await.unwrap();
-            assert_eq!(
-                String::from_utf8(frame).unwrap(),
-                test_connect_frame("localhost:80")
-            );
-            stream.write_all(b"OK\n").await.unwrap();
-            let request = read_http_request(&mut stream).await;
-            let request = String::from_utf8_lossy(&request);
-            assert!(request.starts_with("POST /path?q=one HTTP/1.1\r\n"));
-            assert!(request.contains("host: localhost:80"));
-            assert!(!request.to_ascii_lowercase().contains("connection:"));
-            assert!(!request.contains("x-remove:"));
-            assert!(request.contains("x-ordinary: kept"));
-            assert!(!request.contains("proxy-connection"));
-            assert!(!request.contains("proxy-authorization"));
-            assert!(request.ends_with("exact body"));
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n")
-                .await
-                .unwrap();
-            released.await.unwrap();
-            stream.write_all(b"6\r\nsecond\r\n0\r\n\r\n").await.unwrap();
-            let request = read_http_request(&mut stream).await;
-            assert!(request.starts_with(b"GET /again HTTP/1.1\r\n"));
-            stream
-                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                .await
-                .unwrap();
-            let mut byte = [0];
-            assert_eq!(
-                timeout(Duration::from_millis(500), stream.read(&mut byte))
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                0
-            );
-        });
-        let connector =
-            BrokerConnector::with_http_limits(address, token(), Duration::from_millis(200), 1024);
-        let authority = LoopbackAuthority::parse("localhost:80").unwrap();
-        let request = Request::builder()
-            .method("POST")
-            .uri("http://localhost:80/path?q=one")
-            .header("host", "localhost:80")
-            .header("connection", "X-Remove")
-            .header("x-remove", "removed")
-            .header("x-ordinary", "kept")
-            .header("proxy-connection", "close")
-            .header("proxy-authorization", "ignored")
-            .body(Full::new(Bytes::from_static(b"exact body")))
-            .unwrap();
-        let mut response = connector
-            .http(&authority, request, &Shutdown::new())
-            .await
-            .unwrap();
-        let first = timeout(Duration::from_millis(100), response.body.frame())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap()
-            .into_data()
-            .unwrap();
-        assert_eq!(first, "first");
-        release.send(()).unwrap();
-        assert_eq!(response.body.collect().await.unwrap().to_bytes(), "second");
-        assert_eq!(connector.pool_len(), 1);
-        assert_eq!(connector.active_drivers(), 1);
-        let second = Request::builder()
-            .uri("http://localhost:80/again")
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-        let second = connector
-            .http(&authority, second, &Shutdown::new())
-            .await
-            .unwrap();
-        assert_eq!(second.status, StatusCode::NO_CONTENT);
-        assert!(second.body.collect().await.unwrap().to_bytes().is_empty());
-        assert_eq!(connector.pool_len(), 1);
-        assert_eq!(connector.active_drivers(), 1);
-        assert!(
-            timeout(Duration::from_millis(100), listener.accept())
-                .await
-                .is_err()
-        );
-        connector.clear_pool();
-        server.await.unwrap();
-        for _ in 0..8 {
-            if connector.active_drivers() == 0 {
-                break;
+        let (proxy_origin, mut origin) = tokio::io::duplex(4096);
+        let connector = BrokerConnector::test_with_connect_stream(proxy_origin);
+        let target = match classify(&Method::POST, b"http://localhost:80/local") {
+            Target::LocalHttp(target) => target,
+            other => panic!("unexpected target: {other:?}"),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "conflict.invalid".parse().unwrap());
+        headers.insert(header::CONTENT_LENGTH, "4".parse().unwrap());
+        let head = RequestHead {
+            method: Method::POST,
+            raw_target: b"http://localhost:80/local".to_vec(),
+            version: Version::HTTP_11,
+            headers,
+            framing: BodyFraming::ContentLength(4),
+            close: false,
+            upgrade: false,
+            expect: false,
+        };
+        let (mut client, downstream) = tokio::io::duplex(4096);
+        client.write_all(b"data").await.unwrap();
+        let mut downstream = Http1Connection::new(downstream);
+        let origin_task = tokio::spawn(async move {
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 256];
+            loop {
+                let read = origin.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|value| value == b"\r\n\r\n")
+                    && request.ends_with(b"data")
+                {
+                    break;
+                }
             }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(connector.active_drivers(), 0);
-    }
-
-    #[tokio::test]
-    async fn local_body_drop_discards_connection() {
-        let listener = listener().await;
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let mut stream = accept_broker(&listener).await;
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("POST /local HTTP/1.1\r\n"));
+            assert!(request.contains("host: localhost:80\r\n"));
+            assert!(!request.contains("conflict.invalid"));
+            origin
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                 .await
                 .unwrap();
-            let mut byte = [0];
-            assert_eq!(
-                timeout(Duration::from_millis(500), stream.read(&mut byte))
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                0
-            );
         });
-        let connector =
-            BrokerConnector::with_http_limits(address, token(), Duration::from_millis(100), 16);
-        let authority = LoopbackAuthority::parse("localhost:80").unwrap();
         let response = connector
-            .http(&authority, local_request(), &Shutdown::new())
+            .forward(&target, &head, &mut downstream, &Shutdown::new())
             .await
-            .unwrap();
-        drop(response);
-        assert_eq!(connector.pool_len(), 0);
-        server.await.unwrap();
-        wait_for_no_drivers(&connector).await;
-    }
-
-    #[tokio::test]
-    async fn local_body_truncation_is_terminal_and_discards_connection() {
-        let listener = listener().await;
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let mut stream = accept_broker(&listener).await;
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab")
-                .await
-                .unwrap();
-            stream.shutdown().await.unwrap();
-            let mut byte = [0];
-            assert_eq!(
-                timeout(Duration::from_millis(500), stream.read(&mut byte))
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                0
-            );
-        });
-        let connector =
-            BrokerConnector::with_http_limits(address, token(), Duration::from_millis(100), 16);
-        let authority = LoopbackAuthority::parse("localhost:80").unwrap();
-        let mut response = connector
-            .http(&authority, local_request(), &Shutdown::new())
-            .await
-            .unwrap();
-        assert!(
-            response
-                .body
-                .frame()
-                .await
-                .unwrap()
-                .unwrap()
-                .into_data()
-                .is_ok()
+            .unwrap()
+            .response;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.body.collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"ok")
         );
-        assert!(response.body.frame().await.unwrap().is_err());
-        assert!(response.body.frame().await.is_none());
-        assert_eq!(connector.pool_len(), 0);
-        server.await.unwrap();
-        wait_for_no_drivers(&connector).await;
-    }
-
-    #[tokio::test]
-    async fn local_body_timeout_is_terminal_and_discards_connection() {
-        let listener = listener().await;
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let mut stream = accept_broker(&listener).await;
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n")
-                .await
-                .unwrap();
-            let mut byte = [0];
-            assert_eq!(
-                timeout(Duration::from_millis(500), stream.read(&mut byte))
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                0
-            );
-        });
-        let connector =
-            BrokerConnector::with_http_limits(address, token(), Duration::from_millis(20), 16);
-        let authority = LoopbackAuthority::parse("localhost:80").unwrap();
-        let mut response = connector
-            .http(&authority, local_request(), &Shutdown::new())
-            .await
-            .unwrap();
-        assert!(response.body.frame().await.unwrap().is_err());
-        assert!(response.body.frame().await.is_none());
-        assert_eq!(connector.pool_len(), 0);
-        server.await.unwrap();
-        wait_for_no_drivers(&connector).await;
-    }
-
-    #[tokio::test]
-    async fn local_body_limit_is_terminal_and_discards_connection() {
-        let listener = listener().await;
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let mut stream = accept_broker(&listener).await;
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc")
-                .await
-                .unwrap();
-            let mut byte = [0];
-            assert_eq!(
-                timeout(Duration::from_millis(500), stream.read(&mut byte))
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                0
-            );
-        });
-        let connector =
-            BrokerConnector::with_http_limits(address, token(), Duration::from_millis(100), 2);
-        let authority = LoopbackAuthority::parse("localhost:80").unwrap();
-        let mut response = connector
-            .http(&authority, local_request(), &Shutdown::new())
-            .await
-            .unwrap();
-        assert!(response.body.frame().await.unwrap().is_err());
-        assert!(response.body.frame().await.is_none());
-        assert_eq!(connector.pool_len(), 0);
-        server.await.unwrap();
-        wait_for_no_drivers(&connector).await;
+        origin_task.await.unwrap();
     }
 }

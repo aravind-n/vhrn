@@ -15,6 +15,7 @@ bytes = "1.12.1"
 http-body-util = "0.1.3"
 hyper = { version = "1.8.1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
+mio = { version = "1.2.3", features = ["os-ext", "os-poll"] }
 tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]

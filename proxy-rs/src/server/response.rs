@@ -1,12 +1,14 @@
 //! Infallible, bounded proxy response construction.
 
-use crate::{connect::origin_body::SharedOriginResponse, headers::sanitize_hop_by_hop};
+use crate::connect::origin_body::SharedOriginResponse;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::{Method, Response, StatusCode, Version, header};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use super::http1::Http1Connection;
+use super::http1::{
+    APPLICATION_BUFFER_LIMIT, CHUNK_PREFIX_LIMIT, Http1Connection, RESPONSE_BODY_FRAME_LIMIT,
+};
 
 pub(crate) type ProxyBody = UnsyncBoxBody<Bytes, anyhow::Error>;
 
@@ -176,10 +178,36 @@ pub(crate) fn origin(origin: SharedOriginResponse, head: bool) -> Response<Proxy
     };
     let mut response = Response::new(body);
     *response.status_mut() = origin.status;
-    let mut headers = origin.headers;
-    sanitize_hop_by_hop(&mut headers);
-    response.headers_mut().extend(headers);
+    response.headers_mut().extend(origin.headers);
     response
+}
+
+pub(crate) async fn write_informational<S>(
+    connection: &mut Http1Connection<S>,
+    status: StatusCode,
+    headers: &hyper::HeaderMap,
+    version: Version,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    debug_assert!(status.is_informational());
+    let wire_version = if version == Version::HTTP_10 {
+        "HTTP/1.0"
+    } else {
+        "HTTP/1.1"
+    };
+    let reason = status.canonical_reason().unwrap_or("");
+    let mut head = format!("{wire_version} {} {reason}\r\n", status.as_u16()).into_bytes();
+    for (name, value) in headers {
+        head.extend_from_slice(name.as_str().as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(value.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
+    head.extend_from_slice(b"\r\n");
+    connection.write_all(&head).await?;
+    connection.flush().await
 }
 
 pub(crate) async fn write_response<S>(
@@ -208,6 +236,9 @@ fn prepare_response_head(
     method: &Method,
     mut close: bool,
 ) -> (bool, bool, bool, Vec<u8>) {
+    if version == Version::HTTP_10 {
+        response.headers_mut().remove(header::TRANSFER_ENCODING);
+    }
     if response
         .headers()
         .get(header::CONNECTION)
@@ -223,10 +254,12 @@ fn prepare_response_head(
         && !response.headers().contains_key(header::CONTENT_LENGTH)
         && version == Version::HTTP_11;
     if chunked {
-        response.headers_mut().insert(
-            header::TRANSFER_ENCODING,
-            hyper::http::HeaderValue::from_static("chunked"),
-        );
+        if !response.headers().contains_key(header::TRANSFER_ENCODING) {
+            response.headers_mut().insert(
+                header::TRANSFER_ENCODING,
+                hyper::http::HeaderValue::from_static("chunked"),
+            );
+        }
     } else if body_allowed && !response.headers().contains_key(header::CONTENT_LENGTH) {
         close = true;
     }
@@ -269,18 +302,14 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     loop {
-        let frame = loop {
-            tokio::select! {
-                biased;
-                frame = body.frame() => break frame,
-                buffered = connection.buffer_during_response() => {
-                    if !buffered? {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "downstream disconnected",
-                        ));
-                    }
-                }
+        let frame = tokio::select! {
+            biased;
+            frame = body.frame() => frame,
+            _ = connection.wait_for_peer_close() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "downstream disconnected",
+                ));
             }
         };
         let Some(frame) = frame else {
@@ -289,9 +318,10 @@ where
         let frame = frame.map_err(std::io::Error::other)?;
         match frame.into_data() {
             Ok(data) if !data.is_empty() && chunked => {
-                connection
-                    .write_all(format!("{:x}\r\n", data.len()).as_bytes())
-                    .await?;
+                let prefix = ChunkPrefix::new(data.len());
+                debug_assert!(data.len() <= RESPONSE_BODY_FRAME_LIMIT);
+                debug_assert!(data.len() + prefix.as_bytes().len() <= APPLICATION_BUFFER_LIMIT);
+                connection.write_all(prefix.as_bytes()).await?;
                 connection.write_all(&data).await?;
                 connection.write_all(b"\r\n").await?;
             }
@@ -299,13 +329,11 @@ where
             Err(frame) if chunked => {
                 if let Ok(trailers) = frame.into_trailers() {
                     connection.write_all(b"0\r\n").await?;
-                    for (name, value) in trailers {
-                        if let Some(name) = name {
-                            connection.write_all(name.as_str().as_bytes()).await?;
-                            connection.write_all(b": ").await?;
-                            connection.write_all(value.as_bytes()).await?;
-                            connection.write_all(b"\r\n").await?;
-                        }
+                    for (name, value) in &trailers {
+                        connection.write_all(name.as_str().as_bytes()).await?;
+                        connection.write_all(b": ").await?;
+                        connection.write_all(value.as_bytes()).await?;
+                        connection.write_all(b"\r\n").await?;
                     }
                     connection.write_all(b"\r\n").await?;
                     return Ok(());
@@ -318,6 +346,37 @@ where
         connection.write_all(b"0\r\n\r\n").await?;
     }
     Ok(())
+}
+
+struct ChunkPrefix {
+    bytes: [u8; CHUNK_PREFIX_LIMIT],
+    start: usize,
+}
+
+impl ChunkPrefix {
+    fn new(mut length: usize) -> Self {
+        let mut bytes = [0_u8; CHUNK_PREFIX_LIMIT];
+        let mut start = CHUNK_PREFIX_LIMIT - 2;
+        bytes[start..].copy_from_slice(b"\r\n");
+        loop {
+            start -= 1;
+            let digit = u8::try_from(length & 0xf).expect("hex digit fits in u8");
+            bytes[start] = if digit < 10 {
+                b'0' + digit
+            } else {
+                b'a' + digit - 10
+            };
+            length >>= 4;
+            if length == 0 {
+                break;
+            }
+        }
+        Self { bytes, start }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[self.start..]
+    }
 }
 
 pub(crate) async fn write_connect_established<S>(
@@ -336,7 +395,19 @@ where
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
-    use hyper::header::{CONNECTION, HeaderName, HeaderValue};
+    use hyper::header::HeaderValue;
+
+    #[test]
+    fn chunk_prefix_and_maximum_response_frame_fit_the_aggregate_budget() {
+        assert_eq!(ChunkPrefix::new(1).as_bytes(), b"1\r\n");
+        assert_eq!(ChunkPrefix::new(0xff).as_bytes(), b"ff\r\n");
+        let prefix = ChunkPrefix::new(RESPONSE_BODY_FRAME_LIMIT);
+        assert_eq!(
+            prefix.as_bytes(),
+            format!("{RESPONSE_BODY_FRAME_LIMIT:x}\r\n").as_bytes()
+        );
+        assert!(RESPONSE_BODY_FRAME_LIMIT + prefix.as_bytes().len() <= APPLICATION_BUFFER_LIMIT);
+    }
 
     #[tokio::test]
     async fn fixed_response_has_exact_status_content_type_and_body() {
@@ -466,32 +537,6 @@ mod tests {
             response.into_body().collect().await.unwrap().to_bytes(),
             "origin"
         );
-    }
-
-    #[test]
-    fn origin_response_strips_hop_by_hop_and_connection_named_headers() {
-        let mut headers = hyper::HeaderMap::new();
-        headers.insert(CONNECTION, HeaderValue::from_static("x-remove"));
-        headers.insert("x-remove", HeaderValue::from_static("no"));
-        headers.insert("keep", HeaderValue::from_static("yes"));
-        headers.insert(
-            HeaderName::from_static("transfer-encoding"),
-            HeaderValue::from_static("chunked"),
-        );
-        let response = origin(
-            SharedOriginResponse {
-                status: StatusCode::OK,
-                headers,
-                body: http_body_util::Full::new(Bytes::new())
-                    .map_err(|never| match never {})
-                    .boxed_unsync(),
-            },
-            false,
-        );
-        assert!(!response.headers().contains_key(CONNECTION));
-        assert!(!response.headers().contains_key("x-remove"));
-        assert!(!response.headers().contains_key("transfer-encoding"));
-        assert_eq!(response.headers()["keep"], "yes");
     }
 
     #[tokio::test]

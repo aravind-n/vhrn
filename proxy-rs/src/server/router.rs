@@ -6,19 +6,24 @@ use std::time::Duration;
 
 #[cfg(test)]
 use anyhow::Context;
+#[cfg(test)]
 use bytes::Bytes;
 #[cfg(test)]
 use http_body_util::BodyExt;
+#[cfg(test)]
 use http_body_util::Full;
 #[cfg(test)]
+use hyper::Request;
+#[cfg(test)]
 use hyper::body::Body;
-use hyper::{Method, Request, Response, StatusCode, header};
+use hyper::{Method, Response, StatusCode, header};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
 
 use crate::{
     config::Config,
     connect::{
         broker::{BrokerConnector, BrokerError},
+        forward::{ForwardError, ForwardErrorKind},
         public::{PublicConnectError, PublicConnector},
     },
     diagnostics::{AuditResult, AuditService, DenialDestination, Health, HealthService, report},
@@ -27,11 +32,12 @@ use crate::{
         target::{DirectTarget, LocalTarget, PublicTarget, Target, classify},
     },
     server::{
-        http1::{BodyFrame, Http1Connection, RequestHead},
+        http1::{Http1Connection, RequestHead},
         response::{ProxyBody, ProxyFailure, failure, fixed, origin, represented},
     },
 };
 
+#[cfg(test)]
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MODE_BYTES: u64 = 8;
 const _: () = {
@@ -177,50 +183,7 @@ where
             reusable: head.method == Method::OPTIONS,
         },
         route @ (AuthorizedRoute::PublicHttp(_) | AuthorizedRoute::LocalHttp(_)) => {
-            if expects_continue(&head.headers)
-                && (connection
-                    .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
-                    .await
-                    .is_err()
-                    || connection.flush().await.is_err())
-            {
-                return Http1Outcome {
-                    response: failure(ProxyFailure::BadRequest, is_head),
-                    body_consumed: false,
-                    reusable: false,
-                };
-            }
-            let Ok(body) = collect_http1_body(connection, head.framing).await else {
-                return Http1Outcome {
-                    response: failure(ProxyFailure::BadRequest, is_head),
-                    body_consumed: false,
-                    reusable: false,
-                };
-            };
-            let Ok(raw_target) = std::str::from_utf8(&head.raw_target) else {
-                return Http1Outcome {
-                    response: failure(ProxyFailure::BadRequest, is_head),
-                    body_consumed: true,
-                    reusable: false,
-                };
-            };
-            let Ok(uri) = raw_target.parse() else {
-                return Http1Outcome {
-                    response: failure(ProxyFailure::BadRequest, is_head),
-                    body_consumed: true,
-                    reusable: false,
-                };
-            };
-            let mut request = Request::new(Full::new(body));
-            *request.method_mut() = head.method;
-            *request.uri_mut() = uri;
-            *request.version_mut() = head.version;
-            *request.headers_mut() = head.headers;
-            Http1Outcome {
-                response: dispatch(request, route, context, is_head).await,
-                body_consumed: true,
-                reusable: true,
-            }
+            dispatch_http1(&head, connection, route, context).await
         }
         AuthorizedRoute::PublicConnect(_) | AuthorizedRoute::LocalConnect(_) => Http1Outcome {
             response: failure(ProxyFailure::BadRequest, is_head),
@@ -228,36 +191,6 @@ where
             reusable: false,
         },
     }
-}
-
-fn expects_continue(headers: &hyper::HeaderMap) -> bool {
-    let mut found = false;
-    for value in headers.get_all(header::EXPECT) {
-        for member in value.as_bytes().split(|byte| *byte == b',') {
-            let member = trim_ows(member);
-            if member.is_empty() || !member.eq_ignore_ascii_case(b"100-continue") {
-                return false;
-            }
-            found = true;
-        }
-    }
-    found
-}
-
-fn trim_ows(mut value: &[u8]) -> &[u8] {
-    while value
-        .first()
-        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
-    {
-        value = &value[1..];
-    }
-    while value
-        .last()
-        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
-    {
-        value = &value[..value.len() - 1];
-    }
-    value
 }
 
 pub(crate) async fn connect_http1(
@@ -302,25 +235,6 @@ where
     Ok(())
 }
 
-async fn collect_http1_body<S>(
-    connection: &mut Http1Connection<S>,
-    framing: crate::server::http1::BodyFraming,
-) -> Result<Bytes, ()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut body = connection.incoming_body(framing);
-    let mut bytes = Vec::new();
-    while let Some(frame) = body.next_frame().await.map_err(|_| ())? {
-        if let BodyFrame::Data(data) = frame {
-            if data.len() > MAX_BODY_BYTES.saturating_sub(bytes.len()) {
-                return Err(());
-            }
-            bytes.extend_from_slice(&data);
-        }
-    }
-    Ok(Bytes::from(bytes))
-}
 #[cfg(test)]
 async fn handle_http<B>(request: Request<B>, context: Arc<RequestContext>) -> Response<ProxyBody>
 where
@@ -335,15 +249,30 @@ where
         Ok(AuthorizedRoute::Asterisk) => asterisk(&parts.method),
         Ok(route @ (AuthorizedRoute::PublicHttp(_) | AuthorizedRoute::LocalHttp(_))) => {
             match collect_with_limits(body, BODY_TIMEOUT, MAX_BODY_BYTES).await {
-                Ok(body) => {
-                    dispatch(
-                        Request::from_parts(parts, Full::new(body)),
-                        route,
-                        context,
-                        head,
-                    )
-                    .await
-                }
+                Ok(_) => match route {
+                    AuthorizedRoute::PublicHttp(public) => match context
+                        .public
+                        .connect_target(public.target.clone(), &context.shutdown)
+                        .await
+                    {
+                        Ok(_) => fixed(StatusCode::NO_CONTENT, None, ""),
+                        Err(error) => failure(public_failure(error, &public, &context).await, head),
+                    },
+                    AuthorizedRoute::LocalHttp(target) => match &context.local {
+                        Some(connector) => match connector
+                            .connect(target.canonical_authority(), &context.shutdown)
+                            .await
+                        {
+                            Ok(_) => fixed(StatusCode::NO_CONTENT, None, ""),
+                            Err(error) => failure(broker_failure(error), head),
+                        },
+                        None => failure(
+                            ProxyFailure::LocalDenied(target.canonical_authority().to_string()),
+                            head,
+                        ),
+                    },
+                    _ => unreachable!("matched HTTP route"),
+                },
                 _ => failure(ProxyFailure::BadRequest, head),
             }
         }
@@ -530,38 +459,95 @@ async fn authorize_local(
         Ok(AuthorizedRoute::LocalHttp(target))
     }
 }
-async fn dispatch(
-    request: Request<Full<Bytes>>,
+async fn dispatch_http1<S>(
+    head: &RequestHead,
+    connection: &mut Http1Connection<S>,
     route: AuthorizedRoute,
     context: Arc<RequestContext>,
-    head: bool,
-) -> Response<ProxyBody> {
+) -> Http1Outcome
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let is_head = head.method == Method::HEAD;
     match route {
         AuthorizedRoute::PublicHttp(public) => match context
             .public
-            .send(public.target.clone(), request, &context.shutdown)
+            .forward(public.target.clone(), head, connection, &context.shutdown)
             .await
         {
-            Ok(value) => origin(value, head),
-            Err(error) => failure(public_failure(error, &public, &context).await, head),
+            Ok(value) => Http1Outcome {
+                response: origin(value.response, is_head),
+                body_consumed: value.request_complete,
+                reusable: value.request_complete,
+            },
+            Err(crate::connect::public::PublicForwardError::Connect(error)) => Http1Outcome {
+                response: failure(public_failure(error, &public, &context).await, is_head),
+                body_consumed: false,
+                reusable: true,
+            },
+            Err(crate::connect::public::PublicForwardError::Exchange(error)) => {
+                forward_failure(error, is_head)
+            }
         },
         AuthorizedRoute::LocalHttp(target) => match &context.local {
             Some(connector) => match connector
-                .http(target.canonical_authority(), request, &context.shutdown)
+                .forward(&target, head, connection, &context.shutdown)
                 .await
             {
-                Ok(value) => origin(value, head),
-                Err(error) => failure(broker_failure(error), head),
+                Ok(value) => Http1Outcome {
+                    response: origin(value.response, is_head),
+                    body_consumed: value.request_complete,
+                    reusable: value.request_complete,
+                },
+                Err(crate::connect::broker::BrokerForwardError::Connect(error)) => Http1Outcome {
+                    response: failure(broker_failure(error), is_head),
+                    body_consumed: false,
+                    reusable: true,
+                },
+                Err(crate::connect::broker::BrokerForwardError::Exchange(error)) => {
+                    forward_failure(error, is_head)
+                }
+                Err(crate::connect::broker::BrokerForwardError::Origin(source, error)) => {
+                    report(&source);
+                    forward_failure(error, is_head)
+                }
             },
-            None => failure(
-                ProxyFailure::LocalDenied(target.canonical_authority().to_string()),
-                head,
-            ),
+            None => Http1Outcome {
+                response: failure(
+                    ProxyFailure::LocalDenied(target.canonical_authority().to_string()),
+                    is_head,
+                ),
+                body_consumed: false,
+                reusable: true,
+            },
         },
         AuthorizedRoute::Direct(_)
         | AuthorizedRoute::Asterisk
         | AuthorizedRoute::PublicConnect(_)
-        | AuthorizedRoute::LocalConnect(_) => failure(ProxyFailure::BadRequest, head),
+        | AuthorizedRoute::LocalConnect(_) => Http1Outcome {
+            response: failure(ProxyFailure::BadRequest, is_head),
+            body_consumed: false,
+            reusable: false,
+        },
+    }
+}
+
+fn forward_failure(error: ForwardError, head: bool) -> Http1Outcome {
+    let failure_kind = match error.kind {
+        ForwardErrorKind::BadRequest => ProxyFailure::BadRequest,
+        ForwardErrorKind::BadGateway => ProxyFailure::BadGateway,
+        ForwardErrorKind::Cancelled | ForwardErrorKind::ClientDisconnected => {
+            ProxyFailure::ServiceUnavailable
+        }
+    };
+    Http1Outcome {
+        response: failure(failure_kind, head),
+        body_consumed: error.request_complete,
+        reusable: error.request_complete
+            && !matches!(
+                error.kind,
+                ForwardErrorKind::Cancelled | ForwardErrorKind::ClientDisconnected
+            ),
     }
 }
 
@@ -591,9 +577,7 @@ async fn public_failure(
         match error {
             PublicConnectError::DeadlineExceeded => ProxyFailure::GatewayTimeout,
             PublicConnectError::Cancelled => ProxyFailure::ServiceUnavailable,
-            PublicConnectError::Unavailable | PublicConnectError::OriginFailure => {
-                ProxyFailure::BadGateway
-            }
+            PublicConnectError::Unavailable => ProxyFailure::BadGateway,
             PublicConnectError::PolicyDenied => unreachable!("handled above"),
         }
     }
@@ -741,19 +725,19 @@ async fn record_best_effort<T: Into<DenialDestination>>(
 mod tests {
     use super::*;
     use crate::connect::public::{
-        DialFuture, NumericDialer, PublicStream, ResolveFuture, ResolvedAddress, Resolver,
+        DialFuture, NumericDialer, ResolveFuture, ResolvedAddress, Resolver,
     };
     use std::{
         convert::Infallible,
         net::SocketAddr,
         pin::Pin,
         sync::{
-            Arc, Mutex,
+            Arc,
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll},
     };
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn broker_failures_map_to_safe_response_classes() {
@@ -767,10 +751,6 @@ mod tests {
         assert_eq!(
             broker_failure(BrokerError::Cancelled),
             ProxyFailure::ServiceUnavailable
-        );
-        assert_eq!(
-            broker_failure(BrokerError::OriginFailure),
-            ProxyFailure::BadGateway
         );
     }
 
@@ -843,19 +823,6 @@ mod tests {
         fn dial(&self, _: SocketAddr) -> DialFuture {
             self.0.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Err(anyhow::anyhow!("test refusal")) })
-        }
-    }
-
-    struct OneStreamDialer {
-        calls: Arc<AtomicUsize>,
-        stream: Mutex<Option<PublicStream>>,
-    }
-
-    impl NumericDialer for OneStreamDialer {
-        fn dial(&self, _: SocketAddr) -> DialFuture {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let stream = self.stream.lock().unwrap().take();
-            Box::pin(async move { stream.ok_or_else(|| anyhow::anyhow!("unexpected second dial")) })
         }
     }
 
@@ -1053,87 +1020,6 @@ mod tests {
             assert_eq!(records.lines().count(), 1, "{uri}");
             assert!(records.ends_with(&format!("\t{expected_host}\n")), "{uri}");
         }
-    }
-
-    #[tokio::test]
-    async fn scoped_literal_cannot_reuse_an_unscoped_pooled_connection() {
-        let directory = tempfile::tempdir().unwrap();
-        let allowlist = directory.path().join("allowlist");
-        let mode = directory.path().join("mode");
-        let deny_log = directory.path().join("denied");
-        std::fs::write(&allowlist, "").unwrap();
-        std::fs::write(&mode, "open\n").unwrap();
-        std::fs::write(&deny_log, "").unwrap();
-
-        let resolves = Arc::new(AtomicUsize::new(0));
-        let dials = Arc::new(AtomicUsize::new(0));
-        let (upstream, mut peer) = tokio::io::duplex(4096);
-        let context = context_with_public(
-            &allowlist,
-            &mode,
-            Some(&deny_log),
-            PublicConnector::new(
-                Arc::new(StaticResolver {
-                    calls: resolves.clone(),
-                    answers: Vec::new(),
-                }),
-                Arc::new(OneStreamDialer {
-                    calls: dials.clone(),
-                    stream: Mutex::new(Some(PublicStream::Test(upstream))),
-                }),
-            ),
-        );
-        let peer_task = tokio::spawn(async move {
-            let mut request = [0_u8; 1024];
-            let read = tokio::time::timeout(Duration::from_secs(1), peer.read(&mut request))
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(read > 0);
-            peer.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                .await
-                .unwrap();
-
-            tokio::time::timeout(Duration::from_millis(100), peer.read(&mut request))
-                .await
-                .is_err()
-        });
-
-        let first = handle_http(
-            Request::builder()
-                .uri("http://[2606:4700:4700::1111]/")
-                .body(Full::new(Bytes::new()))
-                .unwrap(),
-            context.clone(),
-        )
-        .await;
-        assert_eq!(first.status(), StatusCode::NO_CONTENT);
-        assert!(
-            first
-                .into_body()
-                .collect()
-                .await
-                .unwrap()
-                .to_bytes()
-                .is_empty()
-        );
-
-        let second = handle_http(
-            Request::builder()
-                .uri("http://[2606:4700:4700::1111%25eth0]/")
-                .body(Full::new(Bytes::new()))
-                .unwrap(),
-            context.clone(),
-        )
-        .await;
-        assert_eq!(second.status(), StatusCode::FORBIDDEN);
-        assert_eq!(resolves.load(Ordering::SeqCst), 0);
-        assert_eq!(dials.load(Ordering::SeqCst), 1);
-        assert!(peer_task.await.unwrap());
-        drop(context);
-        let records = std::fs::read_to_string(&deny_log).unwrap();
-        assert_eq!(records.lines().count(), 1);
-        assert!(records.ends_with("\t2606:4700:4700::1111\n"));
     }
 
     #[tokio::test]

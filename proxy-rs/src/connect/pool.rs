@@ -133,11 +133,6 @@ where
         self.lock().entries.len()
     }
     #[cfg(test)]
-    pub(crate) fn clear(&self) {
-        self.lock().entries.clear();
-        self.owner.state.changed.notify_one();
-    }
-    #[cfg(test)]
     fn poison_for_test(&self) {
         let state = self.owner.state.clone();
         let _ = std::panic::catch_unwind(move || {
