@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-21
+
+### Changed
+
+- The egress proxy is now implemented in Rust, replacing the previous Go implementation.
+  Its user-facing egress-policy behavior and CLI interface are unchanged.
+
+### Removed
+
+- Nightly CLI releases and `nightly` container-image tags are no longer published. Use a
+  stable release (`VHRN_VERSION=vX.Y.Z`) or a versioned harness image tag instead.
+
 ## [0.5.1] - 2026-09-17
 
 ### Changed
@@ -255,7 +267,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `toolchains.tools` derived image rebuilds when its harness image updates (the base image
   identity is folded into the toolchain hash), so `vhrn update` no longer keeps the old agent.
 
-[unreleased]: https://github.com/aravind-n/vhrn/compare/v0.5.1...HEAD
+[unreleased]: https://github.com/aravind-n/vhrn/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/aravind-n/vhrn/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/aravind-n/vhrn/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/aravind-n/vhrn/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/aravind-n/vhrn/compare/v0.4.0...v0.4.1
