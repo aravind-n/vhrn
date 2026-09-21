@@ -512,7 +512,7 @@ where
     async fn advance(mut self) -> (Option<Self>, Result<Option<Frame<Bytes>>>) {
         let result = tokio::select! {
             biased;
-            () = self.shutdown.cancelled() => {
+            () = self.shutdown.forced() => {
                 return (None, Err(anyhow::anyhow!("origin response cancelled")));
             }
             result = self.decoder.next_frame(

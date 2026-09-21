@@ -17,6 +17,7 @@ pub(crate) struct Bootstrap {
     pub(crate) health: std::sync::Arc<diagnostics::HealthService>,
     pub(crate) public: connect::public::PublicConnector,
     pub(crate) local: Option<connect::broker::BrokerConnector>,
+    pub(crate) resources: shutdown::ProcessResources,
     pub(crate) shutdown: Shutdown,
 }
 
@@ -36,6 +37,7 @@ async fn bootstrap(config: Config, shutdown: Shutdown) -> anyhow::Result<Option<
     if shutdown.is_requested() {
         return Ok(None);
     }
+    let resources = shutdown::ProcessResources::production();
     let public_policy = domain::policy::PolicyReader::load_public_strict(
         config.allowlists.as_slice(),
         &config.mode_file,
@@ -78,7 +80,11 @@ async fn bootstrap(config: Config, shutdown: Shutdown) -> anyhow::Result<Option<
         None
     };
     let local = if let (Some(value), Some(token)) = (&config.local, token) {
-        let connector = connect::broker::BrokerConnector::new(value.broker_addr.clone(), token);
+        let connector = connect::broker::BrokerConnector::new(
+            value.broker_addr.clone(),
+            token,
+            resources.clone(),
+        );
         tokio::select! {
             biased;
             () = shutdown.cancelled() => return Ok(None),
@@ -105,8 +111,9 @@ async fn bootstrap(config: Config, shutdown: Shutdown) -> anyhow::Result<Option<
         config,
         audit,
         health,
-        public: connect::public::PublicConnector::system(),
+        public: connect::public::PublicConnector::system(resources.clone()),
         local,
+        resources,
         shutdown,
     }))
 }

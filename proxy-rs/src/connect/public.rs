@@ -21,6 +21,7 @@ use crate::connect::origin_body::{HttpOrigin, OriginLease, take_origin};
 use crate::connect::pool::IdlePool;
 use crate::domain::target::{PublicHost, PublicTarget};
 use crate::server::http1::{Http1Connection, RequestHead};
+use crate::shutdown::{ManagedIo, ProcessResources};
 
 use self::registry::{ipv4_is_global, ipv6_is_global};
 
@@ -161,6 +162,7 @@ pub(crate) enum PublicConnectError {
     Unavailable,
     DeadlineExceeded,
     Cancelled,
+    Exhausted,
 }
 
 #[derive(Debug)]
@@ -182,6 +184,7 @@ impl fmt::Display for PublicConnectError {
             Self::Unavailable => "public destination unavailable",
             Self::DeadlineExceeded => "public connection deadline exceeded",
             Self::Cancelled => "public connection cancelled",
+            Self::Exhausted => "public connection capacity exhausted",
         })
     }
 }
@@ -259,23 +262,30 @@ impl ValidatedAnswers {
 pub(crate) struct PublicConnector {
     resolver: Arc<dyn Resolver>,
     dialer: Arc<dyn NumericDialer>,
-    pool: IdlePool<OriginKey, HttpOrigin<PublicStream>>,
+    pool: IdlePool<OriginKey, HttpOrigin<ManagedIo<PublicStream>>>,
+    resources: ProcessResources,
     #[cfg(test)]
     public_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl PublicConnector {
-    pub(crate) fn system() -> Self {
+    pub(crate) fn system(resources: ProcessResources) -> Self {
         Self::from_parts(
             Arc::new(SystemResolver),
             Arc::new(SystemDialer),
             IdlePool::new(),
+            resources,
         )
     }
 
     #[cfg(test)]
     pub(crate) fn new(resolver: Arc<dyn Resolver>, dialer: Arc<dyn NumericDialer>) -> Self {
-        Self::from_parts(resolver, dialer, IdlePool::new())
+        Self::from_parts(
+            resolver,
+            dialer,
+            IdlePool::new(),
+            ProcessResources::testing(256, 256),
+        )
     }
 
     #[cfg(test)]
@@ -308,12 +318,14 @@ impl PublicConnector {
     fn from_parts(
         resolver: Arc<dyn Resolver>,
         dialer: Arc<dyn NumericDialer>,
-        pool: IdlePool<OriginKey, HttpOrigin<PublicStream>>,
+        pool: IdlePool<OriginKey, HttpOrigin<ManagedIo<PublicStream>>>,
+        resources: ProcessResources,
     ) -> Self {
         Self {
             resolver,
             dialer,
             pool,
+            resources,
             #[cfg(test)]
             public_calls: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -370,22 +382,27 @@ impl PublicConnector {
         &self,
         target: PublicTarget,
         cancellation: &Shutdown,
-    ) -> std::result::Result<PublicStream, PublicConnectError> {
-        Self::open_with_budget(
+    ) -> std::result::Result<ManagedIo<PublicStream>, PublicConnectError> {
+        let permit = self
+            .resources
+            .try_upstream()
+            .ok_or(PublicConnectError::Exhausted)?;
+        let stream = Self::open_with_budget(
             self.resolver.clone(),
             self.dialer.clone(),
             target,
             cancellation,
             CONNECT_DEADLINE,
         )
-        .await
+        .await?;
+        Ok(self.resources.manage_upstream(stream, permit))
     }
 
     pub(crate) async fn connect_target(
         &self,
         target: PublicTarget,
         cancellation: &Shutdown,
-    ) -> std::result::Result<PublicStream, PublicConnectError> {
+    ) -> std::result::Result<ManagedIo<PublicStream>, PublicConnectError> {
         self.open_target(target, cancellation).await
     }
 
@@ -393,7 +410,8 @@ impl PublicConnector {
         &self,
         target: &PublicTarget,
         cancellation: &Shutdown,
-    ) -> std::result::Result<OriginLease<OriginKey, PublicStream>, PublicConnectError> {
+    ) -> std::result::Result<OriginLease<OriginKey, ManagedIo<PublicStream>>, PublicConnectError>
+    {
         let key = OriginKey::from_target(target);
         let origin = match take_origin(&self.pool, &key) {
             Some(origin) => origin,
@@ -443,8 +461,16 @@ impl PublicConnector {
     async fn open(
         &self,
         target: PublicTarget,
-    ) -> std::result::Result<PublicStream, PublicConnectError> {
+    ) -> std::result::Result<ManagedIo<PublicStream>, PublicConnectError> {
         self.open_target(target, &Shutdown::new()).await
+    }
+
+    pub(crate) fn prune_pool(&self) {
+        self.pool.prune();
+    }
+
+    pub(crate) fn close_pool(&self) {
+        self.pool.close();
     }
 
     #[cfg(test)]
@@ -514,6 +540,64 @@ mod tests {
         fn dial(&self, _: SocketAddr) -> DialFuture {
             Box::pin(std::future::pending())
         }
+    }
+
+    #[tokio::test]
+    async fn upstream_capacity_rejects_before_dns_then_releases_for_reacquisition() {
+        let resources = ProcessResources::testing(8, 1);
+        let held = resources.manage_upstream((), resources.try_upstream().unwrap());
+        let resolver = Arc::new(FakeResolver::new(vec![Ok(parse_addresses("8.8.8.8"))]));
+        let connector = PublicConnector::from_parts(
+            resolver.clone(),
+            Arc::new(FakeDialer::success()),
+            IdlePool::new(),
+            resources.clone(),
+        );
+
+        assert_eq!(
+            connector
+                .open(public_target("http://allowed.example/"))
+                .await
+                .unwrap_err(),
+            PublicConnectError::Exhausted
+        );
+        assert!(resolver.calls.lock().unwrap().is_empty());
+        drop(held);
+
+        let stream = connector
+            .open(public_target("http://allowed.example/"))
+            .await
+            .unwrap();
+        assert_eq!(resources.upstream_counts(), (1, 1));
+        drop(stream);
+        assert_eq!(resources.upstream_counts(), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn cancelled_resolution_releases_its_upstream_permit() {
+        let resources = ProcessResources::testing(8, 1);
+        let connector = Arc::new(PublicConnector::from_parts(
+            Arc::new(PendingResolver),
+            Arc::new(PendingDialer),
+            IdlePool::new(),
+            resources.clone(),
+        ));
+        let shutdown = Shutdown::new();
+        let task_connector = connector.clone();
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            task_connector
+                .open_target(public_target("http://allowed.example/"), &task_shutdown)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(resources.upstream_counts(), (1, 1));
+        shutdown.request();
+        assert_eq!(
+            task.await.unwrap().unwrap_err(),
+            PublicConnectError::Cancelled
+        );
+        assert_eq!(resources.upstream_counts(), (0, 1));
     }
     struct QueueDialer {
         calls: Mutex<Vec<SocketAddr>>,

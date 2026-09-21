@@ -115,6 +115,20 @@ impl RequestContext {
         self.authorization_spy = Some(spy);
         self
     }
+
+    pub(crate) fn prune_idle(&self) {
+        self.public.prune_pool();
+        if let Some(local) = &self.local {
+            local.prune_pool();
+        }
+    }
+
+    pub(crate) fn close_idle(&self) {
+        self.public.close_pool();
+        if let Some(local) = &self.local {
+            local.close_pool();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -161,7 +175,11 @@ where
 {
     let is_head = head.method == Method::HEAD;
     let target = classify(&head.method, &head.raw_target);
-    let route = match authorize(target, &context).await {
+    let route = match tokio::select! {
+        biased;
+        () = context.shutdown.cancelled() => Err(ProxyFailure::ServiceUnavailable),
+        result = authorize(target, &context) => result,
+    } {
         Ok(route) => route,
         Err(error) => {
             let reusable = matches!(
@@ -202,7 +220,12 @@ pub(crate) async fn connect_http1(
     context: &RequestContext,
 ) -> Result<ConnectedUpstream, ProxyFailure> {
     let target = classify(&head.method, &head.raw_target);
-    match authorize(target, context).await? {
+    let route = tokio::select! {
+        biased;
+        () = context.shutdown.cancelled() => Err(ProxyFailure::ServiceUnavailable),
+        result = authorize(target, context) => result,
+    }?;
+    match route {
         AuthorizedRoute::PublicConnect(public) => match context
             .public
             .connect_target(public.target.clone(), &context.shutdown)
@@ -239,13 +262,22 @@ pub(crate) async fn connect_http1(
 pub(crate) async fn drain_http1_body<S>(
     connection: &mut Http1Connection<S>,
     framing: crate::server::http1::BodyFraming,
+    shutdown: &crate::Shutdown,
 ) -> Result<(), ()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut body = connection.incoming_body(framing);
-    while body.next_frame().await.map_err(|_| ())?.is_some() {}
-    Ok(())
+    loop {
+        let frame = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return Err(()),
+            frame = body.next_frame() => frame.map_err(|_| ())?,
+        };
+        if frame.is_none() {
+            return Ok(());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -573,7 +605,7 @@ fn broker_failure(error: BrokerError) -> ProxyFailure {
     report(&error);
     match error {
         BrokerError::DeadlineExceeded => ProxyFailure::GatewayTimeout,
-        BrokerError::Cancelled => ProxyFailure::ServiceUnavailable,
+        BrokerError::Cancelled | BrokerError::Exhausted => ProxyFailure::ServiceUnavailable,
         BrokerError::Rejected | BrokerError::Unavailable | BrokerError::OriginFailure => {
             ProxyFailure::BadGateway
         }
@@ -594,7 +626,9 @@ async fn public_failure(
         report(&error);
         match error {
             PublicConnectError::DeadlineExceeded => ProxyFailure::GatewayTimeout,
-            PublicConnectError::Cancelled => ProxyFailure::ServiceUnavailable,
+            PublicConnectError::Cancelled | PublicConnectError::Exhausted => {
+                ProxyFailure::ServiceUnavailable
+            }
             PublicConnectError::Unavailable => ProxyFailure::BadGateway,
             PublicConnectError::PolicyDenied => unreachable!("handled above"),
         }
@@ -770,6 +804,10 @@ mod tests {
             broker_failure(BrokerError::Cancelled),
             ProxyFailure::ServiceUnavailable
         );
+        assert_eq!(
+            broker_failure(BrokerError::Exhausted),
+            ProxyFailure::ServiceUnavailable
+        );
     }
 
     struct PanicOnPoll(Arc<AtomicUsize>);
@@ -865,7 +903,12 @@ mod tests {
         mode: &std::path::Path,
         deny_log: Option<&std::path::Path>,
     ) -> Arc<RequestContext> {
-        context_with_public(allowlist, mode, deny_log, PublicConnector::system())
+        context_with_public(
+            allowlist,
+            mode,
+            deny_log,
+            PublicConnector::system(crate::shutdown::ProcessResources::testing(256, 256)),
+        )
     }
 
     fn context_with_public(

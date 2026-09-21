@@ -106,3 +106,120 @@ or production selection.
 Every connection and task has a bounded owner; client/upstream caps are enforced while supporting
 128 clients; overload is prompt; shutdown is health-visible, two-stage, and exactly five seconds;
 all joins are observed; exit codes are correct; validation passes; and rereview is clean.
+
+## Implementation evidence
+
+Completed on 2026-09-20 within the Phase 11 editable paths.
+
+- `ProcessResources` is created once during bootstrap and shared by the supervisor and the public
+  and broker connectors. Non-waiting semaphores cap accepted clients and aggregate upstream work at
+  256 each. A client `SocketLease` owns its permit and socket registration; every upstream stream is
+  a `ManagedIo` that owns its permit and registration through handshake, active HTTP, CONNECT, and
+  idle-pool states.
+- Public and broker paths acquire the shared upstream permit before DNS/dial or broker dial work.
+  Failed resolution, failed and cancelled broker handshakes, downstream cancellation, pool
+  replacement, eviction, expiry, and shutdown all release their RAII-owned permits. Each connector
+  pool is capped at 64 entries, the shared 256 permit cap remains authoritative across both pools,
+  and `close` drops idle entries and rejects late returns.
+- One `Supervisor` owns the listener, context and pools, process resources, and a single client
+  `JoinSet`. It creates exactly one task for each admitted client and does not create a detached
+  tunnel or pool-reaper task. Periodic pool pruning occurs in the supervisor loop. Every join result
+  is classified; a panic or unexpected join failure starts cleanup and returns an error.
+- Client overload uses a bounded closing 503 when the accepted socket is immediately writable and
+  otherwise closes promptly without spawning another task. Upstream exhaustion maps to a closing
+  HTTP 503 before DNS or dial work. The listener-path tests exercise both behaviors with small
+  deterministic limits.
+- The downstream peer-close monitor uses one process-wide poll registry rather than one poll file
+  descriptor per connection. Its state is bounded by admitted connections, and registrations are
+  removed before their sockets are dropped.
+- `Shutdown` has independent drain and force notifications and records the first drain instant.
+  The first SIGINT/SIGTERM stops acceptance, makes health unhealthy, cancels pending work, and
+  closes both idle pools. A second signal forces immediately. Otherwise the supervisor derives the
+  force deadline from the original request instant, closes every tracked resource at five seconds,
+  aborts remaining tasks, and observes all joins.
+- Normal HTTP and CONNECT response commitment races the drain notification until the first response
+  byte. Once committed, only force can interrupt remaining response or tunnel bytes. A known-drain
+  HTTP request gets one scheduler-bounded opportunity to commit the bounded closing 503; if the
+  downstream stays backpressured, it closes without committing the origin response or a partial
+  rejection.
+
+## Resource-count and lifecycle evidence
+
+- `production_admission_rejects_the_two_hundred_fifty_seventh_connection` observed 256 simultaneous
+  client ownership records and a peak of 256, rejected the 257th without waiting, then reacquired a
+  permit after release.
+- `production_upstream_admission_never_exceeds_two_hundred_fifty_six` observed 256 simultaneous
+  upstream permits and a peak of 256, rejected the 257th, and returned to zero after release.
+- `process_supports_one_hundred_twenty_eight_established_clients` held 128 real established clients
+  with partial request heads while an additional health request returned 200. Because the
+  supervisor creates one task per admitted client and no child tunnel tasks, this also observed 128
+  simultaneous supervised client tasks. The structural task maximum is 256, enforced before task
+  creation by the client permit; the focused overload test observed a one-task limit remain at one
+  while the next client received a complete 503 or prompt close.
+- `pooled_upstream_permits_survive_idle_and_release_on_eviction_and_close` reached its two-permit
+  test maximum, proved an idle connection retains its permit, and proved deterministic eviction and
+  shutdown close release permits. `shutdown_close_drops_entries_and_refuses_late_returns` proves a
+  closed pool cannot be repopulated.
+- Public cancellation and broker rejection/cancellation tests prove resolution, dial, handshake,
+  and failure paths release permits. `forced_registry_close_interrupts_tracked_socket_io` proves a
+  registered stream observes forced closure and unregisters on drop.
+- Existing fixed ingress/body/tunnel buffers, the 64-answer DNS limit, bounded diagnostic records,
+  the two 64-entry idle pools, the 256-entry client join set, and the absence of detached driver or
+  tunnel tasks keep all concurrent queues and allocations bounded.
+
+## Shutdown, exit, and idempotence evidence
+
+- Paused-time `active_task_can_finish_at_four_point_nine_nine_nine_seconds` and
+  `active_http_exchange_completes_at_four_point_nine_nine_nine_seconds` prove admitted work and a
+  committed HTTP stream survive drain and finish at 4.999 seconds without drain cancellation.
+- `pending_task_is_forced_and_observed_at_exactly_five_seconds` advances two seconds after the first
+  drain request, repeats the request, and still forces at exactly five seconds from the original
+  instant. It observes the abort and returns tracked socket count to zero.
+  `idle_tunnel_is_closed_at_the_five_second_force_deadline` proves both tunnel ends close at that
+  exact deadline.
+- `draining_before_connect_response_commit_emits_no_success` and
+  `draining_before_http_response_commit_emits_no_origin_response` use backpressured output to prove
+  a racing uncommitted success/origin response emits no bytes. The writable counterpart,
+  `writable_http_race_emits_closing_503_during_drain`, proves a safely writable race receives 503
+  plus `Connection: close`.
+- The black-box SIGTERM tunnel test removes all policy and token mounts during drain, transfers
+  active bytes, observes forced closure no earlier than five seconds and before six seconds, and
+  observes a zero exit. `second_sigterm_forces_idempotent_shutdown_and_exits_zero` sends the second
+  signal after 100 ms, observes both tunnel ends close before five seconds, and observes a zero exit.
+- Startup/listener failure process tests continue to exit nonzero with bounded redacted diagnostics.
+  `supervisor_task_panic_cleans_up_and_returns_failure` injects a task panic through
+  `Supervisor::run`, proves shutdown and cleanup occur, and proves the supervisor returns the error
+  propagated by the process entry point. Drain tests account for successful, failed, panicked, and
+  aborted joins and leave their `JoinSet`s empty.
+
+## Validation evidence
+
+The final post-fix validation run passed every required command:
+
+1. `cargo fmt --all -- --check` — passed.
+2. `cargo clippy -p vhrn-proxy --all-targets --locked -- -D warnings` — passed with no warnings.
+3. `cargo test -p vhrn-proxy --locked connect::pool` — 8 passed, 0 failed.
+4. `cargo test -p vhrn-proxy --locked server::listener` — 21 passed, 0 failed.
+5. `cargo test -p vhrn-proxy --locked --test proxy_process` — 26 passed, 0 failed.
+6. `cargo test -p vhrn-proxy --locked` — 177 unit tests and 26 process tests passed; doc tests
+   passed with no failures.
+
+`git diff --check` also passed. Loopback-dependent tests ran outside the restricted socket sandbox.
+
+## Independent review evidence
+
+- The requested `rust_reviewer` agent independently reviewed resource exhaustion, cancellation,
+  task ownership, shutdown timing, exit behavior, and the focused/process tests without inspecting
+  current or historical Go source, tests, module files, diffs, history, or Go-derived explanations.
+- The initial review found two P1 issues: response commitment did not race drain before its first
+  byte, and the five-second deadline began after teardown rather than at the first shutdown request.
+  The implementation added drain-aware commitment with forced-only active writes, blocked-write
+  CONNECT/HTTP races, first-request deadline storage, a cleanup-delay timing trace, and a tighter
+  wall-clock process bound. The review's test gaps were also closed with real serving-path overload,
+  HTTP-boundary upstream exhaustion, and supervisor-panic cleanup tests.
+- The first rereview found one remaining P1: the known-drain HTTP path constructed a 503 but closed
+  before polling an otherwise writable downstream. The prompt rejection writer and deterministic
+  writable-race test fixed that behavior while retaining the backpressured close proof.
+- The final rereview reported no actionable findings, no material test gaps, and no material
+  residual risks. It independently passed `git diff --check`, formatting, clippy, the 8 pool tests,
+  the 21 listener tests, and the full 177-unit/26-process suite. The rereview is clean.

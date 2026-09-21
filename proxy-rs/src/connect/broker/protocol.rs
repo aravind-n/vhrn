@@ -16,6 +16,7 @@ use tokio::time::timeout;
 use crate::Shutdown;
 use crate::config::BrokerEndpoint;
 use crate::domain::target::LoopbackAuthority;
+use crate::shutdown::{ManagedIo, ProcessResources};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(13);
@@ -70,6 +71,7 @@ pub(crate) enum BrokerError {
     DeadlineExceeded,
     Cancelled,
     OriginFailure,
+    Exhausted,
 }
 
 impl fmt::Display for BrokerError {
@@ -80,6 +82,7 @@ impl fmt::Display for BrokerError {
             Self::DeadlineExceeded => "broker exchange deadline exceeded",
             Self::Cancelled => "broker exchange cancelled",
             Self::OriginFailure => "local origin exchange failed",
+            Self::Exhausted => "broker connection capacity exhausted",
         })
     }
 }
@@ -125,6 +128,7 @@ struct BrokerProtocolInner {
     endpoint: BrokerEndpoint,
     token: BrokerToken,
     dialer: Arc<dyn BrokerDialer>,
+    resources: ProcessResources,
 }
 
 /// Authenticated broker protocol exchange state.
@@ -150,12 +154,17 @@ impl Default for Deadlines {
 }
 
 impl BrokerProtocol {
-    pub(crate) fn new(endpoint: impl Into<BrokerEndpoint>, token: BrokerToken) -> Self {
+    pub(crate) fn new(
+        endpoint: impl Into<BrokerEndpoint>,
+        token: BrokerToken,
+        resources: ProcessResources,
+    ) -> Self {
         Self::from_parts(
             endpoint.into(),
             token,
             Arc::new(SystemBrokerDialer),
             Deadlines::default(),
+            resources,
         )
     }
 
@@ -192,14 +201,20 @@ impl BrokerProtocol {
         frame: Vec<u8>,
         budget: Duration,
         cancellation: &Shutdown,
-    ) -> Result<(BrokerIo, Bytes), BrokerError> {
+    ) -> Result<(ManagedIo<BrokerIo>, Bytes), BrokerError> {
+        let permit = self
+            .inner
+            .resources
+            .try_upstream()
+            .ok_or(BrokerError::Exhausted)?;
         let exchange = async {
-            let mut stream = self
+            let stream = self
                 .inner
                 .dialer
                 .dial(self.inner.endpoint.clone())
                 .await
                 .map_err(|_| BrokerError::Unavailable)?;
+            let mut stream = self.inner.resources.manage_upstream(stream, permit);
             stream
                 .write_all(&frame)
                 .await
@@ -250,12 +265,14 @@ impl BrokerProtocol {
         token: BrokerToken,
         dialer: Arc<dyn BrokerDialer>,
         deadlines: Deadlines,
+        resources: ProcessResources,
     ) -> Self {
         Self {
             inner: Arc::new(BrokerProtocolInner {
                 endpoint,
                 token,
                 dialer,
+                resources,
             }),
             deadlines,
         }
@@ -272,6 +289,7 @@ impl BrokerProtocol {
             token,
             Arc::new(SystemBrokerDialer),
             deadlines,
+            ProcessResources::testing(256, 256),
         )
     }
 
@@ -281,6 +299,21 @@ impl BrokerProtocol {
         dialer: Arc<dyn BrokerDialer>,
         deadlines: Deadlines,
     ) -> Self {
+        Self::with_dialer_and_resources(
+            token,
+            dialer,
+            deadlines,
+            ProcessResources::testing(256, 256),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_dialer_and_resources(
+        token: BrokerToken,
+        dialer: Arc<dyn BrokerDialer>,
+        deadlines: Deadlines,
+        resources: ProcessResources,
+    ) -> Self {
         Self::from_parts(
             "127.0.0.1:1"
                 .parse::<std::net::SocketAddr>()
@@ -289,11 +322,15 @@ impl BrokerProtocol {
             token,
             dialer,
             deadlines,
+            resources,
         )
     }
 }
 
-async fn read_response(stream: &mut BrokerIo) -> Result<Bytes, BrokerError> {
+async fn read_response<S>(stream: &mut S) -> Result<Bytes, BrokerError>
+where
+    S: AsyncRead + Unpin,
+{
     let mut bytes = [0; MAX_RESPONSE_BYTES];
     let mut len = 0;
     loop {
@@ -340,7 +377,7 @@ pub(crate) fn test_connect_frame(authority: &str) -> String {
 
 /// A broker-owned stream with bytes co-read with the success response.
 pub(crate) struct BrokerStream {
-    stream: BrokerIo,
+    stream: ManagedIo<BrokerIo>,
     prefix: Bytes,
 }
 
@@ -366,8 +403,10 @@ enum BrokerIo {
 #[cfg(test)]
 impl BrokerStream {
     pub(crate) fn test_with_stream(stream: tokio::io::DuplexStream) -> Self {
+        let resources = ProcessResources::testing(256, 256);
+        let permit = resources.try_upstream().expect("test upstream permit");
         Self {
-            stream: BrokerIo::Duplex(stream),
+            stream: resources.manage_upstream(BrokerIo::Duplex(stream), permit),
             prefix: Bytes::new(),
         }
     }
@@ -523,7 +562,7 @@ mod tests {
             }
             frames
         });
-        let protocol = BrokerProtocol::new(address, token());
+        let protocol = BrokerProtocol::new(address, token(), ProcessResources::testing(256, 256));
         let cancellation = cancellation();
         protocol.ready(&cancellation).await.unwrap();
         for input in [
@@ -594,7 +633,7 @@ mod tests {
             tokio::task::yield_now().await;
             stream.write_all(b"\npayload").await.unwrap();
         });
-        let mut stream = BrokerProtocol::new(address, token())
+        let mut stream = BrokerProtocol::new(address, token(), ProcessResources::testing(256, 256))
             .connect(
                 &LoopbackAuthority::parse("localhost:80").unwrap(),
                 &cancellation(),
@@ -710,6 +749,26 @@ mod tests {
         dropped: Arc<AtomicBool>,
     }
 
+    #[tokio::test]
+    async fn rejected_handshake_releases_the_shared_upstream_permit() {
+        let resources = ProcessResources::testing(8, 1);
+        let (stream, mut peer) = tokio::io::duplex(256);
+        peer.write_all(b"ERR\n").await.unwrap();
+        let protocol = BrokerProtocol::with_dialer_and_resources(
+            token(),
+            Arc::new(OneStreamDialer(Mutex::new(Some(stream)))),
+            short_test_deadlines(),
+            resources.clone(),
+        );
+
+        assert_eq!(
+            protocol.ready(&cancellation()).await.unwrap_err(),
+            BrokerError::Rejected
+        );
+        assert_eq!(resources.upstream_counts(), (0, 1));
+        assert!(resources.try_upstream().is_some());
+    }
+
     impl BrokerDialer for PendingDialer {
         fn dial(&self, _: BrokerEndpoint) -> BrokerDialFuture {
             let entered = self.entered.clone();
@@ -818,6 +877,7 @@ mod tests {
             BrokerError::DeadlineExceeded,
             BrokerError::Cancelled,
             BrokerError::OriginFailure,
+            BrokerError::Exhausted,
         ] {
             for rendered in [format!("{error}"), format!("{error:?}")] {
                 assert!(!rendered.contains(&secret));
